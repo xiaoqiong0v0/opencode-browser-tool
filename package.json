@@ -1,0 +1,52 @@
+{
+  "name": "@xiaoqiong0v0/opencode-browser-tool",
+  "version": "1.0.3",
+  "description": "opencode 浏览器工具插件：WebView2 外壳渲染 + 零注入视觉元素选取面板",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc && npm run build:panel",
+    "build:panel": "esbuild src/panel/panel.ts --bundle --minify --outfile=dist/panel/panel.js --format=iife --target=es2020 --platform=browser --loader:.css=text",
+    "dev": "tsc --watch",
+    "test": "npm run build && tsx test/integration.test.ts",
+    "open": "npm run build && tsx test/open.ts",
+    "open:long": "npm run build && tsx test/open-long.ts"
+  },
+  "keywords": [
+    "opencode",
+    "browser",
+    "webview2",
+    "plugin"
+  ],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "files": [
+    "dist",
+    "bin"
+  ],
+  "dependencies": {
+    "@xiaoqiong0v0/opencode-plugin-logger": "^1.0.2",
+    "adm-zip": "^0.6.0",
+    "playwright": "^1.61.1"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "^1.18.4"
+  },
+  "devDependencies": {
+    "@types/adm-zip": "^0.5.8",
+    "@types/node": "^26.1.1",
+    "esbuild": "^0.28.1",
+    "tsx": "^4.23.1",
+    "typescript": "^7.0.2"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xiaoqiong0v0/opencode-browser-tool.git"
+  },
+  "volta": {
+    "node": "24.16.0"
+  }
+}

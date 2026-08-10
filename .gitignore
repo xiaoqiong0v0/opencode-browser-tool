@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.tmp/
+*.log
+.DS_Store
+.env
+.pw-browsers/
+.opencode/
+rust/target/
+

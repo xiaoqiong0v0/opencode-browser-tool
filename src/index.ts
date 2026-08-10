@@ -1,0 +1,584 @@
+import { readFileSync, existsSync, mkdirSync, writeFileSync, rmSync } from "fs";
+import { resolve, dirname, join } from "path";
+import { fileURLToPath } from "url";
+import { homedir } from "os";
+import { loadConfig, getConfig, getBrowsersDir } from "./config/index.js";
+import { registerLocale, t, getPanelStrings } from "./i18n/index.js";
+import en from "./i18n/en.js";
+import zh from "./i18n/zh.js";
+import { startService, service } from "./client.js";
+import { HttpBridge } from "./bridge/http-server.js";
+import { devices } from "playwright";
+import type { Plugin } from "@opencode-ai/plugin";
+import createLogger from "@xiaoqiong0v0/opencode-plugin-logger";
+
+const log = createLogger("playwright-tool");
+const _t = (k: string) => t(k);
+const _tf = (key: string, vars?: Record<string, string>) => {
+  let s = t(key);
+  if (vars) for (const [vk, vv] of Object.entries(vars)) s = s.replace(`{${vk}}`, vv);
+  return s;
+};
+const _exec = (fn: (a: any) => Promise<any>) => async (a: any, ctx?: any) => {
+  return fn({ ...a, _sessionId: ctx?.sessionID || "" });
+};
+
+export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
+  registerLocale("en", en);
+  registerLocale("zh", zh);
+  loadConfig(worktree);
+  const config = getConfig();
+
+  try {
+    log.loaded();
+    await startService(config.nodePath || "", getBrowsersDir(), config.sessionIsolation, config.browserType);
+
+    const panelJs = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "panel/panel.js"), "utf-8");
+    const baseStrings = getPanelStrings(config.panelLang);
+
+    const httpBridge = new HttpBridge(0);
+    const bridgePort = await httpBridge.start();
+    const bridge = (path: string) => `http://127.0.0.1:${bridgePort}${path}`;
+
+    httpBridge.onScreenshot(async (rect) => {
+      const r = await service.screenshot(rect ? { clip: rect } : {});
+      return r.__buffer;
+    });
+
+    httpBridge.onSent((records) => {
+      try {
+        for (const r of records) {
+          if (r.type === "screenshot" && r.sessionId) {
+            const fp = join(cacheDir(r.sessionId), `${r.id}.png`);
+            if (existsSync(fp)) rmSync(fp);
+          }
+        }
+      } catch (e: any) {
+        log.error("onSent error", e);
+      }
+    });
+    httpBridge.onMessage(async (data) => {
+      const sessions = await client.session.list();
+      if (sessions?.data?.length) {
+        await client.session.prompt({
+          path: { id: sessions.data[0].id },
+          body: { noReply: false, parts: [{ type: "text", text: formatPickData(data) }] },
+        });
+      }
+    });
+
+    await service.panelConfig({
+      script: `window.__PW_CONFIG__ = ${JSON.stringify({ port: bridgePort, strings: baseStrings, sessionId: "" })};\n${panelJs}`,
+    });
+
+    return {
+      event: async ({ event }) => {
+        if (event.type === "session.deleted") {
+          const sid = (event as any).data?.sessionID;
+          if (sid) { clearSessionCache(sid); try { await service.closeSession({ _sessionId: sid }); } catch {} }
+        }
+      },
+      tool: filterDisabled(
+        {
+          pw_navigate: {
+            description: _t("tool.navigate.desc"),
+            args: {
+              url: { type: "string", description: _t("tool.navigate.arg.url") },
+              headless: { type: "boolean", description: _t("tool.navigate.arg.headless") },
+              browserType: {
+                type: "string",
+                description: "Browser engine: chromium, firefox, webkit (optional, keep current if omitted)",
+              },
+            },
+            execute: _exec(async (a) => {
+              const r = await service.navigate(a);
+              if (r.installError) return `Installation failed: ${r.error}. Call pw_navigate again to retry.`;
+              return r.installing
+                ? _tf("msg.browser.installing", { browser: r.installing, progress: r.progress || "" })
+                : _tf("msg.navigate.done", { url: r.url });
+            }),
+          },
+          pw_click: {
+            description: _t("tool.click.desc"),
+            args: { selector: { type: "string", description: _t("tool.click.arg.selector") } },
+            execute: _exec(async (a) => {
+              await service.click(a);
+              return "Clicked";
+            }),
+          },
+          pw_fill: {
+            description: _t("tool.fill.desc"),
+            args: {
+              selector: { type: "string", description: _t("tool.fill.arg.selector") },
+              value: { type: "string", description: _t("tool.fill.arg.value") },
+            },
+            execute: _exec(async (a) => {
+              await service.fill(a);
+              return "Filled";
+            }),
+          },
+          pw_clear: {
+            description: _t("tool.clear.desc"),
+            args: { selector: { type: "string", description: _t("tool.clear.arg.selector") } },
+            execute: _exec(async (a) => {
+              await service.clear(a);
+              return "Cleared";
+            }),
+          },
+          pw_select: {
+            description: _t("tool.select.desc"),
+            args: {
+              selector: { type: "string", description: _t("tool.select.arg.selector") },
+              value: { type: "string", description: _t("tool.select.arg.value") },
+            },
+            execute: _exec(async (a) => {
+              await service.select(a);
+              return "Selected";
+            }),
+          },
+          pw_hover: {
+            description: _t("tool.hover.desc"),
+            args: { selector: { type: "string", description: _t("tool.hover.arg.selector") } },
+            execute: _exec(async (a) => {
+              await service.hover(a);
+              return "Hovered";
+            }),
+          },
+          pw_drag: {
+            description: _t("tool.drag.desc"),
+            args: {
+              sourceSelector: { type: "string", description: _t("tool.drag.arg.sourceSelector") },
+              targetSelector: { type: "string", description: _t("tool.drag.arg.targetSelector") },
+            },
+            execute: _exec(async (a) => {
+              await service.drag(a);
+              return "Dragged";
+            }),
+          },
+          pw_press_key: {
+            description: _t("tool.press_key.desc"),
+            args: {
+              key: { type: "string", description: _t("tool.press_key.arg.key") },
+              selector: { type: "string", description: _t("tool.press_key.arg.selector") },
+            },
+            execute: _exec(async (a) => {
+              await service.pressKey(a);
+              return _tf("msg.press_key.done", { key: a.key });
+            }),
+          },
+          pw_upload_file: {
+            description: _t("tool.upload_file.desc"),
+            args: {
+              selector: { type: "string", description: _t("tool.upload_file.arg.selector") },
+              filePath: { type: "string", description: _t("tool.upload_file.arg.filePath") },
+            },
+            execute: _exec(async (a) => {
+              await service.uploadFile(a);
+              return "Uploaded";
+            }),
+          },
+          pw_screenshot: {
+            description: _t("tool.screenshot.desc"),
+            args: { selector: { type: "string", description: _t("tool.screenshot.arg.selector") } },
+            execute: _exec(async (a) => {
+              const r = await service.screenshot(a);
+              return {
+                output: `Screenshot taken${a.selector ? ` (element: ${a.selector})` : " (full page)"}`,
+                attachments: [{ type: "file" as const, mime: "image/png", url: `data:image/png;base64,${r.__buffer}` }],
+              };
+            }),
+          },
+          pw_evaluate: {
+            description: _t("tool.evaluate.desc"),
+            args: { script: { type: "string", description: _t("tool.evaluate.arg.script") } },
+            execute: _exec(async (a) => {
+              const r = await service.evaluate(a);
+              return JSON.stringify(r, null, 2);
+            }),
+          },
+          pw_get_visible_text: {
+            description: _t("tool.get_visible_text.desc"),
+            args: { selector: { type: "string", description: _t("tool.get_visible_text.arg.selector") } },
+            execute: _exec(async (a) => {
+              const r = await service.visibleText(a);
+              return r || "(no visible text)";
+            }),
+          },
+          pw_get_visible_html: {
+            description: _t("tool.get_visible_html.desc"),
+            args: {
+              selector: { type: "string", description: _t("tool.get_visible_html.arg.selector") },
+              removeScripts: { type: "boolean", description: _t("tool.get_visible_html.arg.removeScripts") },
+              removeComments: { type: "boolean", description: _t("tool.get_visible_html.arg.removeComments") },
+              maxLength: { type: "number", description: _t("tool.get_visible_html.arg.maxLength") },
+            },
+            execute: _exec(async (a) => await service.visibleHtml(a)),
+          },
+          pw_console_logs: {
+            description: _t("tool.console_logs.desc"),
+            args: {
+              type: { type: "string", description: _t("tool.console_logs.arg.type") },
+              search: { type: "string", description: _t("tool.console_logs.arg.search") },
+              limit: { type: "number", description: _t("tool.console_logs.arg.limit") },
+              clear: { type: "boolean", description: _t("tool.console_logs.arg.clear") },
+            },
+            execute: _exec(async (a) => {
+              const r = await service.consoleLogs(a);
+              return (r as string[]).join("\n") || "(no logs)";
+            }),
+          },
+          pw_go_back: {
+            description: _t("tool.go_back.desc"),
+            args: {},
+            execute: _exec(async () => {
+              const r = await service.goBack();
+              return `Went back, current URL: ${r.url}`;
+            }),
+          },
+          pw_go_forward: {
+            description: _t("tool.go_forward.desc"),
+            args: {},
+            execute: _exec(async () => {
+              const r = await service.goForward();
+              return `Went forward, current URL: ${r.url}`;
+            }),
+          },
+          pw_resize: {
+            description: _t("tool.resize.desc"),
+            args: {
+              width: { type: "number", description: _t("tool.resize.arg.width") },
+              height: { type: "number", description: _t("tool.resize.arg.height") },
+            },
+            execute: _exec(async (a) => {
+              await service.resize(a);
+              return "Resized";
+            }),
+          },
+          pw_reload: {
+            description: _t("tool.reload.desc"),
+            args: {},
+            execute: _exec(async () => {
+              const r = await service.reload();
+              return `Page reloaded: ${r.url}`;
+            }),
+          },
+          pw_close: {
+            description: _t("tool.close.desc"),
+            args: {},
+            execute: _exec(async () => {
+              await service.close();
+              return "Browser closed";
+            }),
+          },
+          pw_show_notification: {
+            description: _t("tool.show_notification.desc"),
+            args: {
+              message: { type: "string", description: _t("tool.show_notification.arg.message") },
+              type: { type: "string", description: _t("tool.show_notification.arg.type") },
+            },
+            execute: _exec(async (a) => {
+              await service.notify(a);
+              return "Notification shown";
+            }),
+          },
+          pw_scroll: {
+            description: _t("tool.scroll.desc"),
+            args: {
+              direction: { type: "string", description: _t("tool.scroll.arg.direction") },
+              amount: { type: "number", description: _t("tool.scroll.arg.amount") },
+            },
+            execute: _exec(async (a) => {
+              await service.scroll(a);
+              return _tf("msg.scroll.done", { dir: a.direction || "down", amount: String(a.amount || 300) });
+            }),
+          },
+          pw_wait_for_selector: {
+            description: _t("tool.wait_for_selector.desc"),
+            args: {
+              selector: { type: "string", description: _t("tool.wait_for_selector.arg.selector") },
+              timeout: { type: "number", description: _t("tool.wait_for_selector.arg.timeout") },
+            },
+            execute: _exec(async (a) => {
+              await service.waitForSelector(a);
+              return _t("msg.wait_selector.found");
+            }),
+          },
+          pw_click_and_switch_tab: {
+            description: _t("tool.click_and_switch_tab.desc"),
+            args: { selector: { type: "string", description: _t("tool.click_and_switch_tab.arg.selector") } },
+            execute: _exec(async (a) => {
+              const r = await service.clickSwitchTab(a);
+              return _tf(r.switched ? "msg.click_switch.done" : "msg.click_switch.clicked", {
+                url: r.url || "",
+                selector: a.selector,
+              });
+            }),
+          },
+          pw_iframe_click: {
+            description: _t("tool.iframe_click.desc"),
+            args: {
+              iframeSelector: { type: "string", description: _t("tool.iframe_click.arg.iframeSelector") },
+              selector: { type: "string", description: _t("tool.iframe_click.arg.selector") },
+            },
+            execute: _exec(async (a) => {
+              await service.iframeClick(a);
+              return "Clicked in iframe";
+            }),
+          },
+          pw_iframe_fill: {
+            description: _t("tool.iframe_fill.desc"),
+            args: {
+              iframeSelector: { type: "string", description: _t("tool.iframe_fill.arg.iframeSelector") },
+              selector: { type: "string", description: _t("tool.iframe_fill.arg.selector") },
+              value: { type: "string", description: _t("tool.iframe_fill.arg.value") },
+            },
+            execute: _exec(async (a) => {
+              await service.iframeFill(a);
+              return "Filled in iframe";
+            }),
+          },
+          pw_save_as_pdf: {
+            description: _t("tool.save_as_pdf.desc"),
+            args: {},
+            execute: _exec(async () => {
+              await service.pdf();
+              return "PDF saved";
+            }),
+          },
+          pw_get_browser_status: {
+            description: _t("tool.browser_status.desc"),
+            args: {},
+            execute: _exec(async () => {
+              const s = await service.status();
+              if (s.installing && Object.keys(s.installing).length > 0) {
+                const info = Object.entries(s.installing)
+                  .map(([b, p]) => `${b} (${p})`)
+                  .join(", ");
+                return _tf("msg.browser.installing", { browser: info, progress: "" });
+              }
+              if (!s.open) return _t("msg.browser.closed");
+              return _tf("msg.browser.open", { title: s.title, url: s.url, tabs: String(s.tabs) });
+            }),
+          },
+          pw_list_tabs: {
+            description: _t("tool.list_tabs.desc"),
+            args: {},
+            execute: _exec(async () => {
+              const pages = (await service.tabs()) as any[];
+              return `Tabs (${pages.length}):\n${pages.map((p, i) => `[${i}] ${p.url}`).join("\n")}`;
+            }),
+          },
+          pw_switch_tab: {
+            description: _t("tool.switch_tab.desc"),
+            args: { index: { type: "number", description: _t("tool.switch_tab.arg.index") } },
+            execute: _exec(async (a) => {
+              const r = await service.switchTab(a);
+              return _tf("msg.tab.switched", { idx: String(a.index), url: r.url });
+            }),
+          },
+          pw_new_tab: {
+            description: _t("tool.new_tab.desc"),
+            args: { url: { type: "string", description: _t("tool.new_tab.arg.url") } },
+            execute: _exec(async (a) => {
+              const r = await service.newTab(a);
+              return _tf("msg.tab.new", { url: r.url });
+            }),
+          },
+          pw_close_tab: {
+            description: _t("tool.close_tab.desc"),
+            args: { index: { type: "number", description: _t("tool.close_tab.arg.index") } },
+            execute: _exec(async (a) => {
+              await service.closeTab(a);
+              return a.index !== undefined
+                ? _tf("msg.tab.closed", { idx: String(a.index) })
+                : _t("msg.tab.closed_current");
+            }),
+          },
+          pw_get_element_state: {
+            description: _t("tool.element_state.desc"),
+            args: { selector: { type: "string", description: _t("tool.element_state.arg.selector") } },
+            execute: _exec(async (a) => {
+              const r: any = await service.elementState(a);
+              if (!r || !r.exists) return _tf("msg.element.not_found", { selector: a.selector });
+              return `Element <${r.tag}>: ${a.selector}\nVisible: ${r.visible}${r.text ? `\nText: ${r.text}` : ""}\nRect: ${r.rect.x},${r.rect.y} ${r.rect.w}x${r.rect.h}`;
+            }),
+          },
+          pw_scroll_to_element: {
+            description: _t("tool.scroll_to_element.desc"),
+            args: { selector: { type: "string", description: _t("tool.scroll_to_element.arg.selector") } },
+            execute: _exec(async (a) => {
+              await service.scrollToElement(a);
+              return "Scrolled to element";
+            }),
+          },
+          pw_get_dropdown_options: {
+            description: _t("tool.dropdown_options.desc"),
+            args: { selector: { type: "string", description: _t("tool.dropdown_options.arg.selector") } },
+            execute: _exec(async (a) => {
+              const r = (await service.dropdownOptions(a)) as any[];
+              if (!r) return _tf("msg.select.not_found", { selector: a.selector });
+              return r.map((o: any) => `${o.selected ? "* " : "  "}${o.value}: ${o.text}`).join("\n");
+            }),
+          },
+          pw_custom_user_agent: {
+            description: _t("tool.user_agent.desc"),
+            args: { userAgent: { type: "string", description: _t("tool.user_agent.arg.userAgent") } },
+            execute: _exec(async (a) => {
+              await service.userAgent(a);
+              return "User-Agent set";
+            }),
+          },
+          pw_select_user_agent: {
+            description: _t("tool.select_ua.desc"),
+            args: { device: { type: "string", description: _t("tool.select_ua.arg.device") } },
+            execute: _exec(async (a) => {
+              if (!a.device) {
+                const lines = ["Available device presets:", ""];
+                const cats: Record<string, string[]> = {
+                  Desktop: ["Desktop Chrome", "Desktop Edge", "Desktop Firefox", "Desktop Safari"],
+                  iPhone: Object.keys(devices).filter((k) => k.startsWith("iPhone")),
+                  iPad: Object.keys(devices).filter((k) => k.startsWith("iPad")),
+                  Pixel: Object.keys(devices).filter((k) => k.startsWith("Pixel")),
+                };
+                for (const [cat, names] of Object.entries(cats))
+                  lines.push(`  ${cat}: ${names.slice(0, 8).join(", ")}${names.length > 8 ? "..." : ""}`);
+                lines.push("", `Total: ${Object.keys(devices).length} devices`);
+                return lines.join("\n");
+              }
+              const device = devices[a.device];
+              if (!device) return `Device "${a.device}" not found`;
+              await service.userAgent({ userAgent: device.userAgent });
+              return `Device set: ${a.device}\nUserAgent: ${device.userAgent.slice(0, 80)}...`;
+            }),
+          },
+          pw_expect_response: {
+            description: _t("tool.expect_response.desc"),
+            args: { url: { type: "string", description: _t("tool.expect_response.arg.url") } },
+            execute: _exec(async (a) => {
+              await service.expectResponse({ urlPattern: a.url });
+              return `Now expecting response matching: ${a.url}. Use pw_assert_response with the same pattern to check.`;
+            }),
+          },
+          pw_assert_response: {
+            description: _t("tool.assert_response.desc"),
+            args: { id: { type: "string", description: _t("tool.assert_response.arg.id") } },
+            execute: _exec(async (a) => {
+              const r = await service.assertResponse({ id: a.id });
+              if (r.matched) return `Response matched: ${r.url} (${r.status})`;
+              return r.error || "No response yet";
+            }),
+          },
+          pw_get_accessibility_tree: {
+            description: _t("tool.accessibility_tree.desc"),
+            args: {
+              selector: { type: "string", description: _t("tool.accessibility_tree.arg.selector") },
+              maxDepth: { type: "number", description: _t("tool.accessibility_tree.arg.maxDepth") },
+            },
+            execute: _exec(async (a) => {
+              const s = await service.accessibility(a);
+              if (!s) return "(no accessibility info)";
+              return formatNode(s, 0, a.maxDepth ?? 8);
+            }),
+          },
+          pw_list_records: {
+            description: "List all records in Magic Panel (annotations and screenshots)",
+            args: {},
+            async execute(_a: any, ctx?: any) {
+              try {
+                const res = await fetch(bridge(`/records?sessionId=${ctx?.sessionID || ""}&all=true`));
+                const json = await res.json();
+                if (!json.success) return "No records";
+                const records = json.records as any[];
+                if (!records || records.length === 0) return "(no records)";
+                return records.map((r) => {
+                  const info = r.type === "screenshot" ? "📷" : `✏️ ${r.tag || ""}`;
+                  const status = r.sent ? _t("msg.record.sent") : "";
+                  return `[${r.id}]${status} ${info}: ${r.annotation || ""}${r.pageUrl ? ` (${r.pageUrl})` : ""}`;
+                }).join("\n");
+              } catch { return "(no records)"; }
+            },
+          },
+          pw_read_record_content: {
+            description: _t("tool.read_record.desc"),
+            args: { id: { type: "number", description: _t("tool.read_record.arg.id") } },
+          async execute(a: any, ctx?: any) {
+            const sid = ctx?.sessionID || "default";
+            const cachedPath = join(cacheDir(sid), `${a.id}.png`);
+            try {
+              const res = await fetch(bridge(`/record/${a.id}`));
+              const json = await res.json();
+              if (!json.success || !json.record) {
+                if (existsSync(cachedPath)) rmSync(cachedPath);
+                return `Record #${a.id} not found`;
+              }
+              const r = json.record;
+              if (r.type === "screenshot" && r.fullBase64) {
+                if (!existsSync(cachedPath)) mkdirSync(cacheDir(sid), { recursive: true });
+                writeFileSync(cachedPath, Buffer.from(r.fullBase64, "base64"));
+                return `${r.annotation || ""} (screenshot)\n缓存路径: ${cachedPath}`;
+              }
+              return `[${r.type}] ${r.annotation || ""} - ${r.pageUrl || ""}`;
+            } catch {
+              return `Record #${a.id} not found`;
+            }
+          },
+        },
+        },
+        config.disabledTools,
+      ),
+    };
+  } catch (err) {
+    log.error("Init failed", err as Error);
+    throw err;
+  }
+};
+
+function formatNode(node: any, depth: number, maxDepth: number): string {
+  if (depth > maxDepth) return "";
+  const indent = "│ ".repeat(depth);
+  const parts = [indent + node.role];
+  if (node.name) parts.push(`"${node.name}"`);
+  if (node.value !== undefined && node.value !== "") parts.push(`= ${node.value}`);
+  if (node.description) parts.push(`(${node.description})`);
+  const line = parts.join(" ");
+  if (node.children && node.children.length > 0) {
+    const children = node.children
+      .map((c: any) => formatNode(c, depth + 1, maxDepth))
+      .filter(Boolean)
+      .join("\n");
+    return children ? line + "\n" + children : line;
+  }
+  return line;
+}
+
+const CACHE_ROOT = join(homedir(), ".opencode", "plugins-cache", "playwright-tool");
+
+function cacheDir(sid: string): string {
+  return join(CACHE_ROOT, sid, "files");
+}
+
+function clearSessionCache(sid: string): void {
+  const dir = join(CACHE_ROOT, sid);
+  if (existsSync(dir)) try { rmSync(dir, { recursive: true, force: true }); } catch {}
+}
+
+function formatPickData(data: any): string {
+  const lines = [`User annotated via Magic Panel (page: ${data.pageUrl || ""}):`, ""];
+  for (const item of data.elements || []) {
+    const info = item.type === "screenshot" ? "📷" : `✏️ ${item.tag || ""}`;
+    lines.push(`- [${item.id}] ${info}: ${item.annotation || ""}`); lines.push("");
+  }
+  return lines.join("\n");
+}
+
+function filterDisabled(tools: Record<string, any>, disabled?: string[]): Record<string, any> {
+  if (!disabled || disabled.length === 0) return tools;
+  const result: Record<string, any> = {};
+  for (const [name, def] of Object.entries(tools)) {
+    if (!disabled.includes(name)) result[name] = def;
+  }
+  return result;
+}
+
+// Export default for npm loader
+export default opencodePlaywrightTool;
