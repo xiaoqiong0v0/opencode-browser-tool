@@ -69,7 +69,7 @@ const PAGE_BRIDGE_JS: &str = r##"
     }
     return parts.join(" > ");
   }
-  window.__pwPage={
+  window.__btPage={
     query:function(x,y){
       var el=document.elementFromPoint(x,y);
       if(!el||el===document.documentElement||el===document.body)return null;
@@ -89,7 +89,7 @@ const PAGE_BRIDGE_JS: &str = r##"
 pub fn create_ui(app: &AppHandle) -> tauri::Result<()> {
     // 主窗口(逻辑 1100x700:150% DPI 下物理 1650x1050,适配常见 1920x1080 屏幕)
     let window = WindowBuilder::new(app, "main")
-        .title("pw-shell")
+        .title("bt-shell")
         .inner_size(1100.0, 700.0)
         .build()?;
 

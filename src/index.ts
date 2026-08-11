@@ -42,7 +42,7 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
       },
       tool: filterDisabled(
         {
-          pw_navigate: {
+          bt_navigate: {
             description: _t("tool.navigate.desc"),
             args: {
               url: { type: "string", description: _t("tool.navigate.arg.url") },
@@ -54,13 +54,13 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
             },
             execute: _exec(async (a) => {
               const r = await service.navigate(a);
-              if (r.installError) return `Installation failed: ${r.error}. Call pw_navigate again to retry.`;
+              if (r.installError) return `Installation failed: ${r.error}. Call bt_navigate again to retry.`;
               return r.installing
                 ? _tf("msg.browser.installing", { browser: r.installing, progress: r.progress || "" })
                 : _tf("msg.navigate.done", { url: r.url });
             }),
           },
-          pw_click: {
+          bt_click: {
             description: _t("tool.click.desc"),
             args: { selector: { type: "string", description: _t("tool.click.arg.selector") } },
             execute: _exec(async (a) => {
@@ -68,7 +68,7 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
               return "Clicked";
             }),
           },
-          pw_fill: {
+          bt_fill: {
             description: _t("tool.fill.desc"),
             args: {
               selector: { type: "string", description: _t("tool.fill.arg.selector") },
@@ -79,7 +79,7 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
               return "Filled";
             }),
           },
-          pw_clear: {
+          bt_clear: {
             description: _t("tool.clear.desc"),
             args: { selector: { type: "string", description: _t("tool.clear.arg.selector") } },
             execute: _exec(async (a) => {
@@ -87,7 +87,7 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
               return "Cleared";
             }),
           },
-          pw_select: {
+          bt_select: {
             description: _t("tool.select.desc"),
             args: {
               selector: { type: "string", description: _t("tool.select.arg.selector") },
@@ -98,7 +98,7 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
               return "Selected";
             }),
           },
-          pw_hover: {
+          bt_hover: {
             description: _t("tool.hover.desc"),
             args: { selector: { type: "string", description: _t("tool.hover.arg.selector") } },
             execute: _exec(async (a) => {
@@ -106,7 +106,7 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
               return "Hovered";
             }),
           },
-          pw_drag: {
+          bt_drag: {
             description: _t("tool.drag.desc"),
             args: {
               sourceSelector: { type: "string", description: _t("tool.drag.arg.sourceSelector") },
@@ -117,7 +117,7 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
               return "Dragged";
             }),
           },
-          pw_press_key: {
+          bt_press_key: {
             description: _t("tool.press_key.desc"),
             args: {
               key: { type: "string", description: _t("tool.press_key.arg.key") },
@@ -128,7 +128,7 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
               return _tf("msg.press_key.done", { key: a.key });
             }),
           },
-          pw_upload_file: {
+          bt_upload_file: {
             description: _t("tool.upload_file.desc"),
             args: {
               selector: { type: "string", description: _t("tool.upload_file.arg.selector") },
@@ -139,7 +139,7 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
               return "Uploaded";
             }),
           },
-          pw_screenshot: {
+          bt_screenshot: {
             description: _t("tool.screenshot.desc"),
             args: { selector: { type: "string", description: _t("tool.screenshot.arg.selector") } },
             execute: _exec(async (a) => {
@@ -150,7 +150,7 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
               };
             }),
           },
-          pw_evaluate: {
+          bt_evaluate: {
             description: _t("tool.evaluate.desc"),
             args: { script: { type: "string", description: _t("tool.evaluate.arg.script") } },
             execute: _exec(async (a) => {
@@ -158,7 +158,7 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
               return JSON.stringify(r, null, 2);
             }),
           },
-          pw_get_visible_text: {
+          bt_get_visible_text: {
             description: _t("tool.get_visible_text.desc"),
             args: { selector: { type: "string", description: _t("tool.get_visible_text.arg.selector") } },
             execute: _exec(async (a) => {
@@ -166,7 +166,7 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
               return r || "(no visible text)";
             }),
           },
-          pw_get_visible_html: {
+          bt_get_visible_html: {
             description: _t("tool.get_visible_html.desc"),
             args: {
               selector: { type: "string", description: _t("tool.get_visible_html.arg.selector") },
@@ -176,7 +176,7 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
             },
             execute: _exec(async (a) => await service.visibleHtml(a)),
           },
-          pw_console_logs: {
+          bt_console_logs: {
             description: _t("tool.console_logs.desc"),
             args: {
               type: { type: "string", description: _t("tool.console_logs.arg.type") },
@@ -189,7 +189,7 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
               return (r as string[]).join("\n") || "(no logs)";
             }),
           },
-          pw_go_back: {
+          bt_go_back: {
             description: _t("tool.go_back.desc"),
             args: {},
             execute: _exec(async () => {
@@ -197,7 +197,7 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
               return `Went back, current URL: ${r.url}`;
             }),
           },
-          pw_go_forward: {
+          bt_go_forward: {
             description: _t("tool.go_forward.desc"),
             args: {},
             execute: _exec(async () => {
@@ -205,7 +205,7 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
               return `Went forward, current URL: ${r.url}`;
             }),
           },
-          pw_resize: {
+          bt_resize: {
             description: _t("tool.resize.desc"),
             args: {
               width: { type: "number", description: _t("tool.resize.arg.width") },
@@ -216,7 +216,7 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
               return "Resized";
             }),
           },
-          pw_reload: {
+          bt_reload: {
             description: _t("tool.reload.desc"),
             args: {},
             execute: _exec(async () => {
@@ -224,7 +224,7 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
               return `Page reloaded: ${r.url}`;
             }),
           },
-          pw_close: {
+          bt_close: {
             description: _t("tool.close.desc"),
             args: {},
             execute: _exec(async () => {
@@ -232,7 +232,7 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
               return "Browser closed";
             }),
           },
-          pw_show_notification: {
+          bt_show_notification: {
             description: _t("tool.show_notification.desc"),
             args: {
               message: { type: "string", description: _t("tool.show_notification.arg.message") },
@@ -243,7 +243,7 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
               return "Notification shown";
             }),
           },
-          pw_scroll: {
+          bt_scroll: {
             description: _t("tool.scroll.desc"),
             args: {
               direction: { type: "string", description: _t("tool.scroll.arg.direction") },
@@ -254,7 +254,7 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
               return _tf("msg.scroll.done", { dir: a.direction || "down", amount: String(a.amount || 300) });
             }),
           },
-          pw_wait_for_selector: {
+          bt_wait_for_selector: {
             description: _t("tool.wait_for_selector.desc"),
             args: {
               selector: { type: "string", description: _t("tool.wait_for_selector.arg.selector") },
@@ -265,7 +265,7 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
               return _t("msg.wait_selector.found");
             }),
           },
-          pw_click_and_switch_tab: {
+          bt_click_and_switch_tab: {
             description: _t("tool.click_and_switch_tab.desc"),
             args: { selector: { type: "string", description: _t("tool.click_and_switch_tab.arg.selector") } },
             execute: _exec(async (a) => {
@@ -276,7 +276,7 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
               });
             }),
           },
-          pw_iframe_click: {
+          bt_iframe_click: {
             description: _t("tool.iframe_click.desc"),
             args: {
               iframeSelector: { type: "string", description: _t("tool.iframe_click.arg.iframeSelector") },
@@ -287,7 +287,7 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
               return "Clicked in iframe";
             }),
           },
-          pw_iframe_fill: {
+          bt_iframe_fill: {
             description: _t("tool.iframe_fill.desc"),
             args: {
               iframeSelector: { type: "string", description: _t("tool.iframe_fill.arg.iframeSelector") },
@@ -299,7 +299,7 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
               return "Filled in iframe";
             }),
           },
-          pw_save_as_pdf: {
+          bt_save_as_pdf: {
             description: _t("tool.save_as_pdf.desc"),
             args: {},
             execute: _exec(async () => {
@@ -307,7 +307,7 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
               return "PDF saved";
             }),
           },
-          pw_get_browser_status: {
+          bt_get_browser_status: {
             description: _t("tool.browser_status.desc"),
             args: {},
             execute: _exec(async () => {
@@ -322,7 +322,7 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
               return _tf("msg.browser.open", { title: s.title, url: s.url, tabs: String(s.tabs) });
             }),
           },
-          pw_list_tabs: {
+          bt_list_tabs: {
             description: _t("tool.list_tabs.desc"),
             args: {},
             execute: _exec(async () => {
@@ -330,7 +330,7 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
               return `Tabs (${pages.length}):\n${pages.map((p, i) => `[${i}] ${p.url}`).join("\n")}`;
             }),
           },
-          pw_switch_tab: {
+          bt_switch_tab: {
             description: _t("tool.switch_tab.desc"),
             args: { index: { type: "number", description: _t("tool.switch_tab.arg.index") } },
             execute: _exec(async (a) => {
@@ -338,7 +338,7 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
               return _tf("msg.tab.switched", { idx: String(a.index), url: r.url });
             }),
           },
-          pw_new_tab: {
+          bt_new_tab: {
             description: _t("tool.new_tab.desc"),
             args: { url: { type: "string", description: _t("tool.new_tab.arg.url") } },
             execute: _exec(async (a) => {
@@ -346,7 +346,7 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
               return _tf("msg.tab.new", { url: r.url });
             }),
           },
-          pw_close_tab: {
+          bt_close_tab: {
             description: _t("tool.close_tab.desc"),
             args: { index: { type: "number", description: _t("tool.close_tab.arg.index") } },
             execute: _exec(async (a) => {
@@ -356,7 +356,7 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
                 : _t("msg.tab.closed_current");
             }),
           },
-          pw_get_element_state: {
+          bt_get_element_state: {
             description: _t("tool.element_state.desc"),
             args: { selector: { type: "string", description: _t("tool.element_state.arg.selector") } },
             execute: _exec(async (a) => {
@@ -365,7 +365,7 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
               return `Element <${r.tag}>: ${a.selector}\nVisible: ${r.visible}${r.text ? `\nText: ${r.text}` : ""}\nRect: ${r.rect.x},${r.rect.y} ${r.rect.w}x${r.rect.h}`;
             }),
           },
-          pw_scroll_to_element: {
+          bt_scroll_to_element: {
             description: _t("tool.scroll_to_element.desc"),
             args: { selector: { type: "string", description: _t("tool.scroll_to_element.arg.selector") } },
             execute: _exec(async (a) => {
@@ -373,7 +373,7 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
               return "Scrolled to element";
             }),
           },
-          pw_get_dropdown_options: {
+          bt_get_dropdown_options: {
             description: _t("tool.dropdown_options.desc"),
             args: { selector: { type: "string", description: _t("tool.dropdown_options.arg.selector") } },
             execute: _exec(async (a) => {
@@ -382,7 +382,7 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
               return r.map((o: any) => `${o.selected ? "* " : "  "}${o.value}: ${o.text}`).join("\n");
             }),
           },
-          pw_custom_user_agent: {
+          bt_custom_user_agent: {
             description: _t("tool.user_agent.desc"),
             args: { userAgent: { type: "string", description: _t("tool.user_agent.arg.userAgent") } },
             execute: _exec(async (a) => {
@@ -390,7 +390,7 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
               return "User-Agent set";
             }),
           },
-          pw_select_user_agent: {
+          bt_select_user_agent: {
             description: _t("tool.select_ua.desc"),
             args: { device: { type: "string", description: _t("tool.select_ua.arg.device") } },
             execute: _exec(async (a) => {
@@ -413,15 +413,15 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
               return `Device set: ${a.device}\nUserAgent: ${device.userAgent.slice(0, 80)}...`;
             }),
           },
-          pw_expect_response: {
+          bt_expect_response: {
             description: _t("tool.expect_response.desc"),
             args: { url: { type: "string", description: _t("tool.expect_response.arg.url") } },
             execute: _exec(async (a) => {
               await service.expectResponse({ urlPattern: a.url });
-              return `Now expecting response matching: ${a.url}. Use pw_assert_response with the same pattern to check.`;
+              return `Now expecting response matching: ${a.url}. Use bt_assert_response with the same pattern to check.`;
             }),
           },
-          pw_assert_response: {
+          bt_assert_response: {
             description: _t("tool.assert_response.desc"),
             args: { id: { type: "string", description: _t("tool.assert_response.arg.id") } },
             execute: _exec(async (a) => {
@@ -430,7 +430,7 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
               return r.error || "No response yet";
             }),
           },
-          pw_get_accessibility_tree: {
+          bt_get_accessibility_tree: {
             description: _t("tool.accessibility_tree.desc"),
             args: {
               selector: { type: "string", description: _t("tool.accessibility_tree.arg.selector") },
@@ -442,7 +442,7 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
               return formatNode(s, 0, a.maxDepth ?? 8);
             }),
           },
-          pw_list_records: {
+          bt_list_records: {
             description: "List all annotation records in the panel",
             args: {},
             async execute() {
@@ -456,7 +456,7 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
               } catch { return "(no records)"; }
             },
           },
-          pw_read_record_content: {
+          bt_read_record_content: {
             description: _t("tool.read_record.desc"),
             args: { id: { type: "number", description: _t("tool.read_record.arg.id") } },
           async execute(a: any) {

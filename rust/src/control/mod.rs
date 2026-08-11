@@ -150,7 +150,7 @@ pub fn wait_for_selector(
 
 /// 页面状态快照(标题/URL/视口)
 pub fn page_state(app: &AppHandle) -> ControlResult<Value> {
-    eval(app, "window.__pwPage ? __pwPage.state() : null")
+    eval(app, "window.__btPage ? __btPage.state() : null")
 }
 
 /// 查询元素信息(elementFromPoint + selector 生成)
@@ -158,6 +158,6 @@ pub fn page_state(app: &AppHandle) -> ControlResult<Value> {
 pub fn query_element(app: &AppHandle, x: i32, y: i32) -> ControlResult<Value> {
     eval(
         app,
-        &format!("window.__pwPage ? __pwPage.query({x},{y}) : null"),
+        &format!("window.__btPage ? __btPage.query({x},{y}) : null"),
     )
 }

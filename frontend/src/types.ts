@@ -27,7 +27,7 @@ export interface AnnotationRecord {
   note: string;
 }
 
-/** 覆盖层绘制命令(window.__pwOverlay.redraw) */
+/** 覆盖层绘制命令(window.__btOverlay.redraw) */
 export interface OverlayApi {
   redraw(rects: HighlightRect[], marks: AnnotationMark[]): void;
 }

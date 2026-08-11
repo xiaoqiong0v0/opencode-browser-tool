@@ -1,6 +1,6 @@
 // 页面桥:在页面 Webview 中暴露给 Rust eval 调用的工具函数
 // 零注入:脚本随 Webview 创建时注入,页面 DOM 无残留脚本
-// Rust 通过 webview.eval_with_callback("window.__pwPage.query(150,150)", cb) 调用
+// Rust 通过 webview.eval_with_callback("window.__btPage.query(150,150)", cb) 调用
 
 /** elementFromPoint + selector 生成(与 V3 annotate 逻辑一致) */
 function queryElement(x: number, y: number): unknown {
@@ -60,5 +60,5 @@ function pageState(): unknown {
 
 // 挂载到 window:Rust eval 调用
 const api = { query: queryElement, state: pageState, selector: buildSelector };
-(window as unknown as { __pwPage: typeof api }).__pwPage = api;
+(window as unknown as { __btPage: typeof api }).__btPage = api;
 console.log("[page-bridge] ready");

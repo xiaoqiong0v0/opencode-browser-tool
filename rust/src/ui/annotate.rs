@@ -34,7 +34,7 @@ impl Annotator {
         } else {
             overlay.hide().map_err(|e| format!("overlay hide failed: {e}"))?;
             // 退出时清空高亮
-            let _ = ui::eval_overlay(app, "window.__pwOverlay.redraw([], [])");
+            let _ = ui::eval_overlay(app, "window.__btOverlay.redraw([], [])");
         }
         Ok(on)
     }
@@ -49,7 +49,7 @@ impl Annotator {
         let x = ev.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
         let y = ev.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
         // 临时诊断
-        if std::env::var("PW_ANNOTATE_DEBUG").is_ok() {
+        if std::env::var("bt_ANNOTATE_DEBUG").is_ok() {
             println!("[annotate] input {typ} ({x},{y})");
             match crate::control::query_element(app, x, y) {
                 Ok(v) => println!("[annotate] query: {v}"),
@@ -71,7 +71,7 @@ impl Annotator {
                         let _ = ui::eval_overlay(
                             app,
                             &format!(
-                                "window.__pwOverlay.redraw([{{x:{},y:{},w:{},h:{},color:{}}}], window.__pwOverlay._marks || [])",
+                                "window.__btOverlay.redraw([{{x:{},y:{},w:{},h:{},color:{}}}], window.__btOverlay._marks || [])",
                                 rect.0, rect.1, rect.2, rect.3, HOVER_COLOR
                             ),
                         );
@@ -79,7 +79,7 @@ impl Annotator {
                     _ => {
                         let _ = ui::eval_overlay(
                             app,
-                            "window.__pwOverlay.redraw([], window.__pwOverlay._marks || [])",
+                            "window.__btOverlay.redraw([], window.__btOverlay._marks || [])",
                         );
                     }
                 }
@@ -115,7 +115,7 @@ impl Annotator {
                         let _ = ui::eval_overlay(
                             app,
                             &format!(
-                                "window.__pwOverlay._marks = {marks_js}; window.__pwOverlay.redraw([], {marks_js})"
+                                "window.__btOverlay._marks = {marks_js}; window.__btOverlay.redraw([], {marks_js})"
                             ),
                         );
                     }

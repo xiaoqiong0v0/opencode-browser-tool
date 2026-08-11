@@ -87,7 +87,7 @@ const en: LocaleStrings = {
 
     "tool.list_tabs.desc": "List all open tabs/pages in the current browser session",
     "tool.switch_tab.desc": "Switch to a specific tab by its index number",
-    "tool.switch_tab.arg.index": "Tab index number (use pw_list_tabs to see available tabs)",
+    "tool.switch_tab.arg.index": "Tab index number (use bt_list_tabs to see available tabs)",
     "tool.new_tab.desc": "Open a new blank tab or navigate to a URL in a new tab",
     "tool.new_tab.arg.url": "Optional URL to open in the new tab",
     "tool.close_tab.desc": "Close a tab by index, or close the current tab if no index given",
@@ -107,12 +107,12 @@ const en: LocaleStrings = {
     "tool.select_ua.arg.device": "Device name (omit to list available devices)",
 
     "tool.expect_response.desc":
-      "Start waiting for an HTTP response matching a URL pattern. Use pw_assert_response later to check the result.",
+      "Start waiting for an HTTP response matching a URL pattern. Use bt_assert_response later to check the result.",
     "tool.expect_response.arg.id": "Unique identifier to reference this expectation later",
     "tool.expect_response.arg.url": "URL pattern to match (can be a substring)",
     "tool.assert_response.desc":
-      "Check if a previously expected HTTP response has been received. Call this after pw_expect_response.",
-    "tool.assert_response.arg.id": "The id used in pw_expect_response",
+      "Check if a previously expected HTTP response has been received. Call this after bt_expect_response.",
+    "tool.assert_response.arg.id": "The id used in bt_expect_response",
 
     "tool.navigate.arg.headless": "Run browser in headless mode (no visible window). Default: false (headed)",
     "tool.show_notification.desc": "Show a notification on the browser page",
@@ -129,7 +129,7 @@ const en: LocaleStrings = {
     "tool.read_record.arg.id": "Record ID number",
 
     "msg.browser.open": "Browser is open\nTitle: {title}\nURL: {url}\nTabs: {tabs}",
-    "msg.browser.closed": "Browser is not open. Use pw_navigate to open a page.",
+    "msg.browser.closed": "Browser is not open. Use bt_navigate to open a page.",
     "msg.element.not_found": "Element not found: {selector}",
     "msg.select.not_found": "Select element not found: {selector}",
     "msg.navigate.done": "Navigated to: {url}",
@@ -146,7 +146,7 @@ const en: LocaleStrings = {
     "msg.click_switch.clicked": "Clicked: {selector}",
     "msg.wait_selector.found": "Element appeared",
     "msg.record.sent": " (sent)",
-    "msg.browser.installing": "Installing {browser} ({progress}). Please try pw_navigate again in a moment.",
+    "msg.browser.installing": "Installing {browser} ({progress}). Please try bt_navigate again in a moment.",
   },
 
   panel: {

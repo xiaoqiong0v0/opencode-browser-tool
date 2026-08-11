@@ -66,7 +66,7 @@ opencode 插件(client.ts) ← HTTP → Rust 服务(axum)
 - 前端 TS 工程化：`frontend/src/*.ts`（index 面板 / overlay 覆盖层 / page-bridge 页面桥）+ esbuild 打包到 `frontend/dist`，HTML 模板与 TS 分离
 - 控制协议关键点：`eval_with_callback` 会把 JS 返回值 JSON 序列化，JS 表达式直接返回对象，不要再包 JSON.stringify（否则双重编码）
 - 覆盖层：透明 Webview（`transparent(true)`），批注模式 show（拦截鼠标）+ 普通模式 hide（页面交互），鼠标事件 emit `overlay-input` → Rust 状态机
-- 页面桥：`initialization_script` 注入 `window.__pwPage`（query/state），导航后仍生效
+- 页面桥：`initialization_script` 注入 `window.__btPage`（query/state），导航后仍生效
 - 批注记录：Rust `UiState.records` 持有，`records-changed` 事件推送面板
 - HTTP 端口：client.ts 显式传 `--port`（release 模式 GUI 无控制台，不能解析 stdout），轮询就绪
 - 截图（Windows）：`with_webview` 拿 ICoreWebView2Controller → CoreWebView2() → CDP Page.captureScreenshot；必须与 tauri 使用相同 webview2-com 版本（0.38.2 / windows 0.61.3），否则类型不兼容；completed 回调签名 `(windows::core::Result<()>, String)` → `windows::core::Result<()>`
@@ -77,6 +77,6 @@ opencode 插件(client.ts) ← HTTP → Rust 服务(axum)
 
 - `rust/src/cdp/`、`rust/src/browsers/`：协议层保留（eval 作为跨平台主协议，CDP 作 Windows 增强）
 - `rust/src/service.rs`、`rust/src/http.rs`：HTTP 端点分发不变，浏览器管理替换为 Tauri Webview 管理
-- `src/client.ts`：spawn 目标从 pw-shell 二进制改为 tauri 产物，端口协议不变
+- `src/client.ts`：spawn 目标从 bt-shell 二进制改为 tauri 产物，端口协议不变
 - `src/panel/`：V3 面板代码迁移到面板 Webview
 - `src/bridge/http-server.ts`：记录管理逻辑保留（面板 Webview 内 fetch 改为 invoke 或保留 HTTP）

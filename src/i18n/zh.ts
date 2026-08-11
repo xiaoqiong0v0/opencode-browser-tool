@@ -86,7 +86,7 @@ const zh: LocaleStrings = {
 
     "tool.list_tabs.desc": "列出当前浏览器会话中的所有标签页",
     "tool.switch_tab.desc": "按索引切换到指定标签页",
-    "tool.switch_tab.arg.index": "标签页索引（用 pw_list_tabs 查看可用标签页）",
+    "tool.switch_tab.arg.index": "标签页索引（用 bt_list_tabs 查看可用标签页）",
     "tool.new_tab.desc": "新建空白标签页或在新的标签页中打开指定 URL",
     "tool.new_tab.arg.url": "可选，在新标签页中打开的 URL",
     "tool.close_tab.desc": "关闭指定索引的标签页，不传索引则关闭当前标签页",
@@ -105,11 +105,11 @@ const zh: LocaleStrings = {
       "从 Playwright 设备注册表中选择设备预设（207+ 种设备）。不传 device 参数可列出所有可用选项。",
     "tool.select_ua.arg.device": "设备名称（不传则列出可用设备）",
 
-    "tool.expect_response.desc": "开始等待匹配 URL 模式的 HTTP 响应。之后用 pw_assert_response 检查结果。",
+    "tool.expect_response.desc": "开始等待匹配 URL 模式的 HTTP 响应。之后用 bt_assert_response 检查结果。",
     "tool.expect_response.arg.id": "唯一标识符，用于后续检查",
     "tool.expect_response.arg.url": "要匹配的 URL 模式（支持子串匹配）",
-    "tool.assert_response.desc": "检查之前等待的 HTTP 响应是否已收到。需在 pw_expect_response 之后调用。",
-    "tool.assert_response.arg.id": "pw_expect_response 中使用的 id",
+    "tool.assert_response.desc": "检查之前等待的 HTTP 响应是否已收到。需在 bt_expect_response 之后调用。",
+    "tool.assert_response.arg.id": "bt_expect_response 中使用的 id",
 
     "tool.show_notification.desc": "在浏览器页面显示通知",
     "tool.show_notification.arg.message": "通知内容",
@@ -124,7 +124,7 @@ const zh: LocaleStrings = {
     "tool.read_record.arg.id": "记录 ID",
 
     "msg.browser.open": "浏览器已打开\n标题: {title}\nURL: {url}\n标签页: {tabs}",
-    "msg.browser.closed": "浏览器未打开，请先使用 pw_navigate 打开页面",
+    "msg.browser.closed": "浏览器未打开，请先使用 bt_navigate 打开页面",
     "msg.element.not_found": "未找到元素: {selector}",
     "msg.select.not_found": "未找到下拉框: {selector}",
     "msg.navigate.done": "已导航到: {url}",
@@ -141,7 +141,7 @@ const zh: LocaleStrings = {
     "msg.click_switch.clicked": "已点击: {selector}",
     "msg.wait_selector.found": "元素已出现",
     "msg.record.sent": " (已发送)",
-    "msg.browser.installing": "正在安装 {browser}（{progress}）。请稍后重试 pw_navigate。",
+    "msg.browser.installing": "正在安装 {browser}（{progress}）。请稍后重试 bt_navigate。",
   },
 
   panel: {

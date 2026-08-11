@@ -1,12 +1,12 @@
-//! pw-shell 主入口:Tauri 应用(跨平台多 Webview)
+//! bt-shell 主入口:Tauri 应用(跨平台多 Webview)
 //! 单窗口:页面 Webview + 覆盖层 Webview + 面板 Webview
 //! 启动参数兼容旧协议:--browsers-path, --browser, --session-isolation, --port
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::sync::Arc;
 
-use pw_shell::ui::annotate::Annotator;
-use pw_shell::ui::{self, AnnotationRecord};
+use bt_shell::ui::annotate::Annotator;
+use bt_shell::ui::{self, AnnotationRecord};
 use tauri::{Listener, Manager, State};
 
 /// 解析命令行参数(兼容旧 Node 服务协议)
@@ -108,13 +108,13 @@ fn main() {
             ui::create_ui(app.handle())?;
 
             // 启动 HTTP 服务(端口由 --port 指定,默认 0 随机)
-            let http_app = Arc::new(pw_shell::service::App::new(
+            let http_app = Arc::new(bt_shell::service::App::new(
                 app.handle().clone(),
                 browsers_path,
             ));
             let http_app2 = http_app.clone();
             tauri::async_runtime::spawn(async move {
-                let _ = pw_shell::http::serve(http_app2, port).await;
+                let _ = bt_shell::http::serve(http_app2, port).await;
             });
 
             // 事件监听:覆盖层鼠标事件 → 批注状态机

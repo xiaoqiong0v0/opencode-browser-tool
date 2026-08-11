@@ -71,5 +71,5 @@ function toRgba(color: number, alpha: number): string {
 
 // 挂载到 window:Rust eval 调用
 const api = new OverlayRenderer();
-(window as unknown as { __pwOverlay: OverlayApi }).__pwOverlay = api;
+(window as unknown as { __btOverlay: OverlayApi }).__btOverlay = api;
 console.log("[overlay] ready");

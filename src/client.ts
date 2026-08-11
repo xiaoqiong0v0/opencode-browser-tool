@@ -6,20 +6,20 @@ import createLogger from "@xiaoqiong0v0/opencode-plugin-logger";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-// Rust 二进制查找:dist/bin/pw-shell-{platform} 或环境变量覆盖
+// Rust 二进制查找:dist/bin/bt-shell-{platform} 或环境变量覆盖
 function resolveShellBinary(): string {
   const platform = process.platform === "win32" ? "win-x64" : "linux-x64";
   const candidates = [
-    process.env.PW_SHELL_PATH,
-    resolve(__dirname, "bin", `pw-shell-${platform}.exe`),
-    resolve(__dirname, "bin", `pw-shell-${platform}`),
-    resolve(__dirname, "..", "rust", "target", "debug", process.platform === "win32" ? "pw-shell.exe" : "pw-shell"),
+    process.env.BT_SHELL_PATH,
+    resolve(__dirname, "bin", `bt-shell-${platform}.exe`),
+    resolve(__dirname, "bin", `bt-shell-${platform}`),
+    resolve(__dirname, "..", "rust", "target", "debug", process.platform === "win32" ? "bt-shell.exe" : "bt-shell"),
   ];
   for (const c of candidates) {
     if (c && existsSync(c)) return c;
   }
   // 默认:开发环境用 cargo target
-  return resolve(__dirname, "..", "rust", "target", "debug", process.platform === "win32" ? "pw-shell.exe" : "pw-shell");
+  return resolve(__dirname, "..", "rust", "target", "debug", process.platform === "win32" ? "bt-shell.exe" : "bt-shell");
 }
 
 let serviceProcess: any = null;
@@ -74,7 +74,7 @@ export async function startService(
     }
     await new Promise((r) => setTimeout(r, 300));
   }
-  throw new Error("Service timeout: pw-shell did not start. Build it with: cd rust && cargo build --release");
+  throw new Error("Service timeout: bt-shell did not start. Build it with: cd rust && cargo build --release");
 }
 
 export async function stopService(): Promise<void> {

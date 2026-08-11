@@ -89,21 +89,21 @@ function applyConfigFile(config: PluginConfig, filePath: string): void {
 }
 
 function applyEnv(config: PluginConfig): void {
-  if (process.env.PW_LANG && isValidLang(process.env.PW_LANG)) {
-    config.panelLang = process.env.PW_LANG as Lang;
-    config.toolLang = process.env.PW_LANG as Lang;
+  if (process.env.BT_LANG && isValidLang(process.env.BT_LANG)) {
+    config.panelLang = process.env.BT_LANG as Lang;
+    config.toolLang = process.env.BT_LANG as Lang;
   }
-  if (process.env.PW_PANEL_LANG && isValidLang(process.env.PW_PANEL_LANG)) {
-    config.panelLang = process.env.PW_PANEL_LANG as Lang;
+  if (process.env.BT_PANEL_LANG && isValidLang(process.env.BT_PANEL_LANG)) {
+    config.panelLang = process.env.BT_PANEL_LANG as Lang;
   }
-  if (process.env.PW_TOOL_LANG && isValidLang(process.env.PW_TOOL_LANG)) {
-    config.toolLang = process.env.PW_TOOL_LANG as Lang;
+  if (process.env.BT_TOOL_LANG && isValidLang(process.env.BT_TOOL_LANG)) {
+    config.toolLang = process.env.BT_TOOL_LANG as Lang;
   }
-  if (process.env.PW_BROWSERS_PATH) {
-    config.browsersPath = process.env.PW_BROWSERS_PATH;
+  if (process.env.BT_BROWSERS_PATH) {
+    config.browsersPath = process.env.BT_BROWSERS_PATH;
   }
-  if (process.env.PW_NODE_PATH) {
-    config.nodePath = process.env.PW_NODE_PATH;
+  if (process.env.BT_NODE_PATH) {
+    config.nodePath = process.env.BT_NODE_PATH;
   }
 }
 
@@ -130,7 +130,7 @@ function generateDefaultConfig(filePath: string): void {
   // 置空 "playwrightMirror": "" 使用 Playwright 官方源
   // "playwrightMirror": "https://npmmirror.com/mirrors/playwright/",
 
-  // 禁用的工具列表（可选，工具名不加 pw_ 前缀）
+  // 禁用的工具列表（可选，工具名不加 bt_ 前缀）
   // "disabledTools": ["close", "custom_user_agent"],
 
   // 会话隔离：为子会话创建独立 BrowserContext（默认 false，全部共享）
