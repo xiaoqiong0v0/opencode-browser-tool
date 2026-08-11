@@ -3,14 +3,22 @@ name = "pw-shell"
 version = "0.1.0"
 edition = "2024"
 
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
 [dependencies]
 axum = "0.8"
 futures-util = "0.3.33"
 reqwest = { version = "0.13.4", features = ["json"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+tauri = { version = "2", features = ["unstable"] }
 tokio = { version = "1.53.1", features = ["full"] }
 tokio-tungstenite = "0.30.0"
 tower-http = { version = "0.7.0", features = ["cors"] }
-webview2-com = "0.39.1"
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_LibraryLoader", "Win32_System_Com", "Win32_System_Ole"] }
+
+[target.'cfg(windows)'.dependencies]
+# 版本与 tauri 内部依赖对齐(tauri-runtime-wry 用 webview2-com 0.38.2 / windows 0.61.3),
+# 否则 PlatformWebview::controller() 返回的类型与本地代码不兼容
+webview2-com = "0.38.2"
+windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_LibraryLoader", "Win32_System_Com", "Win32_System_Ole"] }

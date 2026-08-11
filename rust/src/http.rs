@@ -2,17 +2,14 @@
 //! {success, data} 或 {success: false, error}
 use axum::{
     body::Body,
-    http::{header, HeaderValue, Request, StatusCode},
-    response::{IntoResponse, Response},
-    routing::{any, post},
+    http::{header, Request, StatusCode},
+    response::Response,
+    routing::any,
     Router,
 };
 use serde_json::{json, Value};
-use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use crate::cdp::browser::CdpBrowser;
-use crate::cdp::session::{EventHub, PendingResponse, SessionState};
 use crate::service::App;
 
 /// 启动 HTTP 服务,端口写入 stdout(与 Node client.ts 协议一致)

@@ -1,6 +1,4 @@
-pub mod browsers;
-pub mod cdp;
+pub mod control;
 pub mod http;
 pub mod service;
-#[cfg(windows)]
-pub mod shell;
+pub mod ui;

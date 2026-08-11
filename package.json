@@ -4,12 +4,12 @@
   "description": "opencode 浏览器工具插件：WebView2 外壳渲染 + 零注入视觉元素选取面板",
   "main": "dist/index.js",
   "scripts": {
-    "build": "tsc && npm run build:panel",
-    "build:panel": "esbuild src/panel/panel.ts --bundle --minify --outfile=dist/panel/panel.js --format=iife --target=es2020 --platform=browser --loader:.css=text",
+    "build": "tsc",
     "dev": "tsc --watch",
     "test": "npm run build && tsx test/integration.test.ts",
     "open": "npm run build && tsx test/open.ts",
-    "open:long": "npm run build && tsx test/open-long.ts"
+    "open:long": "npm run build && tsx test/open-long.ts",
+    "build:frontend": "cd frontend && npm install && npm run build"
   },
   "keywords": [
     "opencode",

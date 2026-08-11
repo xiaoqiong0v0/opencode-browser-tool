@@ -1,50 +1,28 @@
 # 实施状态
 
-## 已完成
+## 当前架构（V5：跨平台 Tauri 2 多 Webview）
 
-### V1：Worker 架构（已废弃）
-- BrowserManager + chrome-worker 子进程 + 41 个独立工具文件
-- Proxy page 对象 + IPC 通信 + eval 序列化 hack
-- 问题：proxy 无法传递 ElementHandle/BrowserContext/Keyboard 等子对象，每个都需要加专用命令
+单窗口 + 三 Webview（页面/覆盖层/面板），前端 TS 工程化，详见 [v5-tauri-architecture.md](./v5-tauri-architecture.md)。
 
-### V2：HTTP 服务架构（当前）
-- 移除 BrowserManager、chrome-worker、41 个工具文件
-- Node HTTP 服务 + 插件端 `client.ts`，所有操作通过 `POST /api/{command}` 通信
-- 工具定义全部内联在 `index.ts`，每个工具一个对象
-- 序列化统一：服务端 `JSON.stringify` → IPC → 客户端 `JSON.parse`
+### 已完成
+- [x] V5.1 Tauri 骨架：单窗口 + 三 Webview（页面/覆盖层/面板），页面桥注入
+- [x] V5.2 控制协议：eval 统一封装（导航/点击/填写/文本/状态/滚动/等待/查询）
+- [x] V5.3 覆盖层批注：透明 Webview + Canvas，悬停高亮/点击标记/右键退出
+- [x] V5.4 面板：TS 前端（列表/按钮/说明输入），Rust 命令接通，发送队列+插件端轮询推送
+- [x] V5.5 HTTP 服务对接 + 插件集成，全链路端点回归通过
+- [x] V5.6 截图 Windows CDP 实现（PNG base64 验证通过）
 
-#### 核心功能 ✓
-- [x] 浏览器启动 / 关闭 / 状态查询
-- [x] 导航、前进后退、刷新
-- [x] 点击、填写、清空、选择、悬停、拖拽、按键、上传文件
-- [x] 截图（全页/元素）、evaluate、可见文本、HTML 结构
-- [x] 控制台日志、元素状态、下拉框选项
-- [x] 滚动、滚动到元素、等待选择器
-- [x] 标签页管理（新建/切换/关闭/列表/点击切换）
-- [x] iframe 操作（点击/填写）
-- [x] 自定义 User-Agent、设备预设选择
-- [x] 保存 PDF、显示通知
-- [x] expect_response / assert_response
-- [x] 多浏览器支持（chromium / firefox / webkit，工具调用时动态切换）
-- [x] 会话隔离（可选，默认关闭）
-- [x] Node.js 检测（支持自定义路径）
-- [x] 多语言（中/英切换，工具描述 + 输出消息）
-
-#### 已知问题
-- `pw_get_accessibility_tree` — Playwright 1.61.1 已移除 `page.accessibility`
-
-### V3（当前）
-- 面板全 Shadow DOM 隔离，不受页面 CSS 影响
-- `all:initial` 移除，改用 `!important` 强制关键属性
-- 右键/双击取消批注模式 + 通知提示
-- 安装流程统一到 `getOrCreatePage`，异步 `spawn` 不阻塞
-- 浏览器下载进度实时打印到日志
-- `composedPath()` 检测面板事件来源，兼容 Shadow DOM
-
-### V3.1
-- 修复 jsonc 配置解析：剥离注释后存在尾逗号导致 `JSON.parse` 失败、配置静默失效（如 `panelLang` 不生效）
-- 解析时容错处理尾逗号（`.replace(/,\s*}/g, "}")`）
+### 关键经验
+- `eval_with_callback` 自动 JSON 序列化 JS 返回值，表达式直接返回对象（勿双重 stringify）
+- release 模式 Tauri GUI 无控制台，HTTP 端口需 `--port` 显式指定 + 轮询就绪
+- 覆盖层 show/hide 控制鼠标拦截（批注模式拦截，普通模式穿透）
+- Windows 必须显式 `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)`，否则窗口被虚拟化缩放与 WebView2 布局错位
+- 截图平台分支：Windows CDP（webview2-com 版本须与 tauri 对齐 0.38.2）
+- 调试注意：非 DPI 感知进程读取 GetWindowRect 得到虚拟化坐标，截图会错位
 
 ## 待办
 
-（无，所有功能已验证通过）
+- 截图平台分支（Linux WebKitGTK snapshot / macOS）
+- 面板 i18n 完整迁移
+- 测试目录重写（V5 时代）
+- Linux/macOS 验证

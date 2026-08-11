@@ -1,13 +1,10 @@
-import { readFileSync, existsSync, mkdirSync, writeFileSync, rmSync } from "fs";
-import { resolve, dirname, join } from "path";
-import { fileURLToPath } from "url";
-import { homedir } from "os";
+import { existsSync, rmSync } from "fs";
+import { join } from "path";
 import { loadConfig, getConfig, getBrowsersDir } from "./config/index.js";
-import { registerLocale, t, getPanelStrings } from "./i18n/index.js";
+import { registerLocale, t } from "./i18n/index.js";
 import en from "./i18n/en.js";
 import zh from "./i18n/zh.js";
 import { startService, service } from "./client.js";
-import { HttpBridge } from "./bridge/http-server.js";
 import { devices } from "playwright";
 import type { Plugin } from "@opencode-ai/plugin";
 import createLogger from "@xiaoqiong0v0/opencode-plugin-logger";
@@ -33,49 +30,14 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
     log.loaded();
     await startService(config.nodePath || "", getBrowsersDir(), config.sessionIsolation, config.browserType);
 
-    const panelJs = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "panel/panel.js"), "utf-8");
-    const baseStrings = getPanelStrings(config.panelLang);
-
-    const httpBridge = new HttpBridge(0);
-    const bridgePort = await httpBridge.start();
-    const bridge = (path: string) => `http://127.0.0.1:${bridgePort}${path}`;
-
-    httpBridge.onScreenshot(async (rect) => {
-      const r = await service.screenshot(rect ? { clip: rect } : {});
-      return r.__buffer;
-    });
-
-    httpBridge.onSent((records) => {
-      try {
-        for (const r of records) {
-          if (r.type === "screenshot" && r.sessionId) {
-            const fp = join(cacheDir(r.sessionId), `${r.id}.png`);
-            if (existsSync(fp)) rmSync(fp);
-          }
-        }
-      } catch (e: any) {
-        log.error("onSent error", e);
-      }
-    });
-    httpBridge.onMessage(async (data) => {
-      const sessions = await client.session.list();
-      if (sessions?.data?.length) {
-        await client.session.prompt({
-          path: { id: sessions.data[0].id },
-          body: { noReply: false, parts: [{ type: "text", text: formatPickData(data) }] },
-        });
-      }
-    });
-
-    await service.panelConfig({
-      script: `window.__PW_CONFIG__ = ${JSON.stringify({ port: bridgePort, strings: baseStrings, sessionId: "" })};\n${panelJs}`,
-    });
+    // 轮询批注发送队列(面板"发送全部" → 推送到对话)
+    void startAnnotatePoller(client, log);
 
     return {
       event: async ({ event }) => {
         if (event.type === "session.deleted") {
           const sid = (event as any).data?.sessionID;
-          if (sid) { clearSessionCache(sid); try { await service.closeSession({ _sessionId: sid }); } catch {} }
+          if (sid) { try { await service.closeSession({ _sessionId: sid }); } catch {} }
         }
       },
       tool: filterDisabled(
@@ -481,19 +443,15 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
             }),
           },
           pw_list_records: {
-            description: "List all records in Magic Panel (annotations and screenshots)",
+            description: "List all annotation records in the panel",
             args: {},
-            async execute(_a: any, ctx?: any) {
+            async execute() {
               try {
-                const res = await fetch(bridge(`/records?sessionId=${ctx?.sessionID || ""}&all=true`));
-                const json = await res.json();
-                if (!json.success) return "No records";
-                const records = json.records as any[];
+                const records = await service.annotateRecords();
                 if (!records || records.length === 0) return "(no records)";
-                return records.map((r) => {
-                  const info = r.type === "screenshot" ? "📷" : `✏️ ${r.tag || ""}`;
-                  const status = r.sent ? _t("msg.record.sent") : "";
-                  return `[${r.id}]${status} ${info}: ${r.annotation || ""}${r.pageUrl ? ` (${r.pageUrl})` : ""}`;
+                return records.map((r: any) => {
+                  const rect = r.rect ? ` rect=(${r.rect[0]},${r.rect[1]},${r.rect[2]},${r.rect[3]})` : "";
+                  return `[${r.index}] ${r.selector}${rect}${r.note ? ` note="${r.note}"` : ""}`;
                 }).join("\n");
               } catch { return "(no records)"; }
             },
@@ -501,26 +459,14 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
           pw_read_record_content: {
             description: _t("tool.read_record.desc"),
             args: { id: { type: "number", description: _t("tool.read_record.arg.id") } },
-          async execute(a: any, ctx?: any) {
-            const sid = ctx?.sessionID || "default";
-            const cachedPath = join(cacheDir(sid), `${a.id}.png`);
+          async execute(a: any) {
+            // V5:批注记录在 shell 侧,读取记录信息(截图内容后续支持)
             try {
-              const res = await fetch(bridge(`/record/${a.id}`));
-              const json = await res.json();
-              if (!json.success || !json.record) {
-                if (existsSync(cachedPath)) rmSync(cachedPath);
-                return `Record #${a.id} not found`;
-              }
-              const r = json.record;
-              if (r.type === "screenshot" && r.fullBase64) {
-                if (!existsSync(cachedPath)) mkdirSync(cacheDir(sid), { recursive: true });
-                writeFileSync(cachedPath, Buffer.from(r.fullBase64, "base64"));
-                return `${r.annotation || ""} (screenshot)\n缓存路径: ${cachedPath}`;
-              }
-              return `[${r.type}] ${r.annotation || ""} - ${r.pageUrl || ""}`;
-            } catch {
-              return `Record #${a.id} not found`;
-            }
+              const records = await service.annotateRecords();
+              const rec = (records || []).find((r: any) => r.index === a.id);
+              if (!rec) return `(record #${a.id} not found)`;
+              return `#${rec.index} ${rec.selector}\nrect: ${JSON.stringify(rec.rect)}\nnote: ${rec.note || "(none)"}`;
+            } catch { return "(no records)"; }
           },
         },
         },
@@ -551,26 +497,6 @@ function formatNode(node: any, depth: number, maxDepth: number): string {
   return line;
 }
 
-const CACHE_ROOT = join(homedir(), ".opencode", "plugins-cache", "playwright-tool");
-
-function cacheDir(sid: string): string {
-  return join(CACHE_ROOT, sid, "files");
-}
-
-function clearSessionCache(sid: string): void {
-  const dir = join(CACHE_ROOT, sid);
-  if (existsSync(dir)) try { rmSync(dir, { recursive: true, force: true }); } catch {}
-}
-
-function formatPickData(data: any): string {
-  const lines = [`User annotated via Magic Panel (page: ${data.pageUrl || ""}):`, ""];
-  for (const item of data.elements || []) {
-    const info = item.type === "screenshot" ? "📷" : `✏️ ${item.tag || ""}`;
-    lines.push(`- [${item.id}] ${info}: ${item.annotation || ""}`); lines.push("");
-  }
-  return lines.join("\n");
-}
-
 function filterDisabled(tools: Record<string, any>, disabled?: string[]): Record<string, any> {
   if (!disabled || disabled.length === 0) return tools;
   const result: Record<string, any> = {};
@@ -578,6 +504,36 @@ function filterDisabled(tools: Record<string, any>, disabled?: string[]): Record
     if (!disabled.includes(name)) result[name] = def;
   }
   return result;
+}
+
+/** 轮询批注发送队列:面板"发送全部"后,拉取记录推送当前对话 */
+function startAnnotatePoller(client: any, log: any): void {
+  const POLL_MS = 2000;
+  const timer = setInterval(async () => {
+    try {
+      const r = await service.annotateConsumeSent();
+      const records = r?.records || [];
+      if (records.length === 0) return;
+      const lines = ["User annotated via panel:", ""];
+      for (const item of records) {
+        lines.push(`- [#${item.index}] ${item.selector || "(no selector)"}${item.note ? `: ${item.note}` : ""}`);
+        lines.push("");
+      }
+      const text = lines.join("\n");
+      const sessions = await client.session.list();
+      if (sessions?.data?.length) {
+        await client.session.prompt({
+          path: { id: sessions.data[0].id },
+          body: { noReply: false, parts: [{ type: "text", text }] },
+        });
+      }
+    } catch {
+      // 服务未就绪/已退出,停止轮询
+      clearInterval(timer);
+    }
+  }, POLL_MS);
+  // 不阻塞进程退出
+  if (typeof (timer as any).unref === "function") (timer as any).unref();
 }
 
 // Export default for npm loader

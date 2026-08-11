@@ -1,0 +1,70 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>pw-shell 面板</title>
+    <style>
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      html, body { width: 100%; height: 100%; }
+      body {
+        font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+        font-size: 13px;
+        background: #1e1e1e;
+        color: #ddd;
+        padding: 10px;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        user-select: none;
+      }
+      h3 { font-size: 14px; color: #aaa; font-weight: 600; }
+      button {
+        width: 100%;
+        padding: 8px 0;
+        cursor: pointer;
+        border: 1px solid #444;
+        border-radius: 4px;
+        background: #2a2a2a;
+        color: #ddd;
+        font-size: 13px;
+      }
+      button:hover { background: #333; }
+      button.active { background: #3d5a3d; border-color: #4caf50; }
+      #records {
+        flex: 1;
+        overflow-y: auto;
+        border: 1px solid #444;
+        border-radius: 4px;
+        padding: 6px;
+        background: #242424;
+      }
+      .rec { padding: 4px 2px; border-bottom: 1px solid #333; word-break: break-all; }
+      .rec-note { color: #888; font-size: 12px; margin-top: 2px; }
+      .empty { color: #666; text-align: center; padding: 20px 0; }
+      #send-result { font-size: 12px; text-align: center; min-height: 16px; }
+      .send-ok { color: #4caf50; }
+      .send-empty { color: #666; }
+      textarea {
+        width: 100%;
+        height: 70px;
+        resize: none;
+        background: #2a2a2a;
+        color: #ddd;
+        border: 1px solid #444;
+        border-radius: 4px;
+        padding: 6px;
+        font-family: inherit;
+      }
+    </style>
+  </head>
+  <body>
+    <h3>pw-shell 面板</h3>
+    <button id="btn-annotate">✏️ 批注模式</button>
+    <button id="btn-send">📤 发送全部</button>
+    <div id="send-result" class="send-empty"></div>
+    <div id="records"></div>
+    <textarea id="note" placeholder="批注说明..."></textarea>
+    <script src="index.js"></script>
+  </body>
+</html>

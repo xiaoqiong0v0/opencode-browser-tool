@@ -47,39 +47,34 @@ export async function startService(
 ): Promise<void> {
   const log = createLogger("opencode-browser-tool");
   const shell = resolveShellBinary();
-  const args = ["--browsers-path", browsersPath || ""];
+  // 显式指定端口(release 模式 GUI 程序无控制台,无法解析 stdout)
+  const port = 18000 + Math.floor(Math.random() * 1000);
+  const args = ["--browsers-path", browsersPath || "", "--port", String(port)];
   if (browserType) args.push("--browser", browserType);
   if (sessionIsolation) args.push("--session-isolation");
   serviceProcess = spawn(shell, args, { stdio: ["ignore", "pipe", "pipe"] });
 
-  const port = await new Promise<number>((resolve, reject) => {
-    const t = setTimeout(() => {
-      reject(new Error("Service timeout"));
-    }, 20000);
-    serviceProcess.stdout.on("data", (data: Buffer) => {
-      const line = data.toString().trim();
-      const p = parseInt(line, 10);
-      if (!isNaN(p)) {
-        clearTimeout(t);
-        resolve(p);
+  // 等待服务就绪(轮询端口)
+  const deadline = Date.now() + 20000;
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/api/status`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      if (res.ok) {
+        servicePort = port;
+        serviceReady = true;
+        log.info(`Shell service ready on port ${port} (${shell})`);
+        return;
       }
-    });
-    serviceProcess.stderr.on("data", (data: Buffer) => {
-      log.info("[shell] " + data.toString().trim());
-    });
-    serviceProcess.on("error", (e: Error) => {
-      clearTimeout(t);
-      reject(new Error(`Failed to start pw-shell: ${e.message}. Build it with: cd rust && cargo build --release`));
-    });
-    serviceProcess.on("exit", (code: number) => {
-      clearTimeout(t);
-      if (!serviceReady) reject(new Error(`Service exited ${code}`));
-    });
-  });
-
-  servicePort = port;
-  serviceReady = true;
-  log.info(`Shell service ready on port ${port} (${shell})`);
+    } catch {
+      // 服务未启动,继续等待
+    }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  throw new Error("Service timeout: pw-shell did not start. Build it with: cd rust && cargo build --release");
 }
 
 export async function stopService(): Promise<void> {
@@ -138,5 +133,9 @@ export const service = {
   closeSession: cmd("close-session"),
   status: cmd("status"),
   tabs: cmd("tabs"),
+  annotateToggle: cmd("annotate/toggle"),
+  annotateRecords: cmd("annotate/records"),
+  annotateSend: cmd("annotate/send"),
+  annotateConsumeSent: cmd("annotate/consume-sent"),
 };
 
