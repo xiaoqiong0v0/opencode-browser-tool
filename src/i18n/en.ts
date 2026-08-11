@@ -103,7 +103,7 @@ const en: LocaleStrings = {
     "tool.user_agent.arg.userAgent": "The User-Agent string to use",
 
     "tool.select_ua.desc":
-      "Select a device preset from Playwright's device registry (207+ devices). Call without 'device' to list all available options.",
+      "Select a device preset from the built-in device list. Call without 'device' to list all available options.",
     "tool.select_ua.arg.device": "Device name (omit to list available devices)",
 
     "tool.expect_response.desc":

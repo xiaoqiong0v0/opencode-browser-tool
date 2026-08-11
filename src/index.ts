@@ -5,11 +5,11 @@ import { registerLocale, t } from "./i18n/index.js";
 import en from "./i18n/en.js";
 import zh from "./i18n/zh.js";
 import { startService, service } from "./client.js";
-import { devices } from "playwright";
+import { DEVICES } from "./devices.js";
 import type { Plugin } from "@opencode-ai/plugin";
 import createLogger from "@xiaoqiong0v0/opencode-plugin-logger";
 
-const log = createLogger("playwright-tool");
+const log = createLogger("browser-tool");
 const _t = (k: string) => t(k);
 const _tf = (key: string, vars?: Record<string, string>) => {
   let s = t(key);
@@ -20,7 +20,7 @@ const _exec = (fn: (a: any) => Promise<any>) => async (a: any, ctx?: any) => {
   return fn({ ...a, _sessionId: ctx?.sessionID || "" });
 };
 
-export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
+export const opencodeBrowserTool: Plugin = async ({ client, worktree }) => {
   registerLocale("en", en);
   registerLocale("zh", zh);
   loadConfig(worktree);
@@ -398,19 +398,19 @@ export const opencodePlaywrightTool: Plugin = async ({ client, worktree }) => {
                 const lines = ["Available device presets:", ""];
                 const cats: Record<string, string[]> = {
                   Desktop: ["Desktop Chrome", "Desktop Edge", "Desktop Firefox", "Desktop Safari"],
-                  iPhone: Object.keys(devices).filter((k) => k.startsWith("iPhone")),
-                  iPad: Object.keys(devices).filter((k) => k.startsWith("iPad")),
-                  Pixel: Object.keys(devices).filter((k) => k.startsWith("Pixel")),
+                  iPhone: Object.keys(DEVICES).filter((k) => k.startsWith("iPhone")),
+                  iPad: Object.keys(DEVICES).filter((k) => k.startsWith("iPad")),
+                  Pixel: Object.keys(DEVICES).filter((k) => k.startsWith("Pixel")),
                 };
                 for (const [cat, names] of Object.entries(cats))
                   lines.push(`  ${cat}: ${names.slice(0, 8).join(", ")}${names.length > 8 ? "..." : ""}`);
-                lines.push("", `Total: ${Object.keys(devices).length} devices`);
+                lines.push("", `Total: ${Object.keys(DEVICES).length} devices`);
                 return lines.join("\n");
               }
-              const device = devices[a.device];
-              if (!device) return `Device "${a.device}" not found`;
-              await service.userAgent({ userAgent: device.userAgent });
-              return `Device set: ${a.device}\nUserAgent: ${device.userAgent.slice(0, 80)}...`;
+              const ua = DEVICES[a.device];
+              if (ua === undefined) return `Device "${a.device}" not found`;
+              await service.userAgent({ userAgent: ua });
+              return `Device set: ${a.device}\nUserAgent: ${ua.slice(0, 80) || "(default)"}...`;
             }),
           },
           bt_expect_response: {
@@ -537,4 +537,4 @@ function startAnnotatePoller(client: any, log: any): void {
 }
 
 // Export default for npm loader
-export default opencodePlaywrightTool;
+export default opencodeBrowserTool;

@@ -345,7 +345,7 @@ async function runTests(mgr: BrowserManager) {
 }
 
 async function main() {
-  console.log("=== opencode-playwright-tool Integration Tests ===\n");
+  console.log("=== opencode-browser-tool Integration Tests ===\n");
   const panel = existsSync("dist/panel/panel.js") ? readFileSync("dist/panel/panel.js", "utf-8") : "";
 
   const bridge = new HttpBridge(3456);

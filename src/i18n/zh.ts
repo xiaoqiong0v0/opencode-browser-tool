@@ -102,7 +102,7 @@ const zh: LocaleStrings = {
     "tool.user_agent.arg.userAgent": "要使用的 User-Agent 字符串",
 
     "tool.select_ua.desc":
-      "从 Playwright 设备注册表中选择设备预设（207+ 种设备）。不传 device 参数可列出所有可用选项。",
+      "从内置设备列表中选择设备预设。不传 device 参数可列出所有可用选项。",
     "tool.select_ua.arg.device": "设备名称（不传则列出可用设备）",
 
     "tool.expect_response.desc": "开始等待匹配 URL 模式的 HTTP 响应。之后用 bt_assert_response 检查结果。",

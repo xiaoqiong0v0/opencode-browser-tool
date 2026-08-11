@@ -3,7 +3,7 @@ import { resolve, dirname } from "path";
 import { homedir } from "os";
 
 const PLUGIN_NAME = "opencode-browser-tool";
-const CONFIG_FILE = "playwright-tool.jsonc";
+const CONFIG_FILE = "browser-tool.jsonc";
 
 export type Lang = "en" | "zh";
 
@@ -16,7 +16,6 @@ export interface PluginConfig {
   panelLang: Lang;
   toolLang: Lang;
   disabledTools?: string[];
-  playwrightMirror?: string;
   sessionIsolation?: boolean;
 }
 
@@ -125,10 +124,6 @@ function generateDefaultConfig(filePath: string): void {
 
   // 浏览器缓存目录（可选，不设则使用插件数据目录）
   // "browsersPath": "D:/browsers/chromium",
-
-  // 浏览器下载镜像（可选，默认用 npmmirror 国内镜像）
-  // 置空 "playwrightMirror": "" 使用 Playwright 官方源
-  // "playwrightMirror": "https://npmmirror.com/mirrors/playwright/",
 
   // 禁用的工具列表（可选，工具名不加 bt_ 前缀）
   // "disabledTools": ["close", "custom_user_agent"],
