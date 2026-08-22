@@ -216,6 +216,33 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree }) => {
               return "Resized";
             }),
           },
+          bt_set_device: {
+            description: _t("tool.set_device.desc"),
+            args: { name: { type: "string", description: _t("tool.set_device.arg.name") } },
+            execute: _exec(async (a) => {
+              if (!a.name) {
+                const list = await service.deviceList();
+                const lines = ["Available device presets:", ""];
+                for (const d of list.devices)
+                  lines.push(`  ${d.name}  ${d.width}x${d.height}${d.ua ? `  ${d.ua.slice(0, 60)}...` : "  (default UA)"}`);
+                return lines.join("\n");
+              }
+              const r = await service.device({ name: a.name });
+              return _tf("msg.device.set", {
+                name: r.device,
+                size: `${r.width}x${r.height}`,
+                ua: r.ua === "(default)" ? "(default)" : r.ua,
+              });
+            }),
+          },
+          bt_devtools: {
+            description: _t("tool.devtools.desc"),
+            args: { action: { type: "string", description: _t("tool.devtools.arg.action") } },
+            execute: _exec(async (a) => {
+              const r = await service.devtools({ action: a.action || "toggle" });
+              return r.open ? _t("msg.devtools.open") : _t("msg.devtools.closed");
+            }),
+          },
           bt_reload: {
             description: _t("tool.reload.desc"),
             args: {},

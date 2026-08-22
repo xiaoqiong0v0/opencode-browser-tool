@@ -60,6 +60,13 @@ const en: LocaleStrings = {
     "tool.resize.arg.width": "Viewport width in pixels",
     "tool.resize.arg.height": "Viewport height in pixels",
 
+    "tool.set_device.desc":
+      "Apply a device preset (window size + User-Agent). Call without 'name' to list all available presets.",
+    "tool.set_device.arg.name": "Device preset name (omit to list available presets)",
+
+    "tool.devtools.desc": "Open/close the developer tools (F12)",
+    "tool.devtools.arg.action": "Action: open, close, toggle (default: toggle)",
+
     "tool.reload.desc": "Reload the current page",
     "tool.clear.desc": "Clear an input field",
     "tool.clear.arg.selector": "CSS selector for the input field",
@@ -147,6 +154,9 @@ const en: LocaleStrings = {
     "msg.wait_selector.found": "Element appeared",
     "msg.record.sent": " (sent)",
     "msg.browser.installing": "Installing {browser} ({progress}). Please try bt_navigate again in a moment.",
+    "msg.device.set": "Device preset applied: {name} ({size})\nUser-Agent: {ua}",
+    "msg.devtools.open": "Developer tools opened",
+    "msg.devtools.closed": "Developer tools closed",
   },
 
   panel: {

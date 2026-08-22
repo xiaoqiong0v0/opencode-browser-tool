@@ -61,6 +61,13 @@ const zh: LocaleStrings = {
     "tool.resize.arg.width": "视口宽度（像素）",
     "tool.resize.arg.height": "视口高度（像素）",
 
+    "tool.set_device.desc":
+      "应用设备预设（窗口尺寸 + User-Agent）。不传 name 参数可列出所有可用预设。",
+    "tool.set_device.arg.name": "设备预设名称（不传则列出可用预设）",
+
+    "tool.devtools.desc": "打开/关闭开发者工具（F12）",
+    "tool.devtools.arg.action": "操作: open, close, toggle（默认 toggle）",
+
     "tool.reload.desc": "刷新当前页面",
     "tool.clear.desc": "清空输入框",
     "tool.clear.arg.selector": "输入框的 CSS 选择器",
@@ -142,6 +149,9 @@ const zh: LocaleStrings = {
     "msg.wait_selector.found": "元素已出现",
     "msg.record.sent": " (已发送)",
     "msg.browser.installing": "正在安装 {browser}（{progress}）。请稍后重试 bt_navigate。",
+    "msg.device.set": "已应用设备预设: {name} ({size})\nUser-Agent: {ua}",
+    "msg.devtools.open": "开发者工具已打开",
+    "msg.devtools.closed": "开发者工具已关闭",
   },
 
   panel: {
