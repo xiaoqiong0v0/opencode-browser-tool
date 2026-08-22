@@ -59,6 +59,17 @@ class OverlayRenderer implements OverlayApi {
       ctx.fillText(String(m.index), m.x + 4, m.y + m.h / 2 + 1);
     }
   }
+
+  /** 显示通知气泡(3 秒后消失),type: ok|bad|err */
+  notify(message: string, type?: string): void {
+    const el = document.getElementById("toast") as HTMLDivElement;
+    el.textContent = message;
+    el.className = "show " + (["ok", "bad", "err"].includes(type || "") ? type : "ok");
+    clearTimeout((el as unknown as { _t?: number })._t);
+    (el as unknown as { _t?: number })._t = window.setTimeout(() => {
+      el.className = "";
+    }, 3000);
+  }
 }
 
 /** 颜色 u32(0xRRGGBB) → rgba 字符串 */

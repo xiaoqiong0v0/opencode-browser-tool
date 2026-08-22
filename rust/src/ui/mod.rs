@@ -84,6 +84,19 @@ const PAGE_BRIDGE_JS: &str = r##"
         viewport:{w:innerWidth,h:innerHeight,dpr:devicePixelRatio}};
     }
   };
+  // 控制台日志捕获:劫持 console.* 存入 __btLogs(service /api/console-logs 读取)
+  window.__btLogs=[];
+  ["log","info","warn","error","debug"].forEach(function(level){
+    var orig=console[level]&&console[level].bind(console);
+    console[level]=function(){
+      var msg=Array.prototype.map.call(arguments,function(a){
+        try{return (typeof a==="object"&&a!==null)?JSON.stringify(a):String(a);}catch(e){return String(a);}
+      }).join(" ");
+      if(window.__btLogs.length>=500)window.__btLogs.shift();
+      window.__btLogs.push({level:level,msg:msg});
+      if(orig)orig.apply(null,arguments);
+    };
+  });
 })();
 "##;
 

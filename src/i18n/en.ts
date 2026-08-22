@@ -109,10 +109,6 @@ const en: LocaleStrings = {
     "tool.user_agent.desc": "Set a custom User-Agent string for the browser",
     "tool.user_agent.arg.userAgent": "The User-Agent string to use",
 
-    "tool.select_ua.desc":
-      "Select a device preset from the built-in device list. Call without 'device' to list all available options.",
-    "tool.select_ua.arg.device": "Device name (omit to list available devices)",
-
     "tool.expect_response.desc":
       "Start waiting for an HTTP response matching a URL pattern. Use bt_assert_response later to check the result.",
     "tool.expect_response.arg.id": "Unique identifier to reference this expectation later",

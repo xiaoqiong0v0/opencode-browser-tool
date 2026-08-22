@@ -5,7 +5,6 @@ import { registerLocale, t } from "./i18n/index.js";
 import en from "./i18n/en.js";
 import zh from "./i18n/zh.js";
 import { startService, service } from "./client.js";
-import { DEVICES } from "./devices.js";
 import type { Plugin } from "@opencode-ai/plugin";
 import createLogger from "@xiaoqiong0v0/opencode-plugin-logger";
 
@@ -415,29 +414,6 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree }) => {
             execute: _exec(async (a) => {
               await service.userAgent(a);
               return "User-Agent set";
-            }),
-          },
-          bt_select_user_agent: {
-            description: _t("tool.select_ua.desc"),
-            args: { device: { type: "string", description: _t("tool.select_ua.arg.device") } },
-            execute: _exec(async (a) => {
-              if (!a.device) {
-                const lines = ["Available device presets:", ""];
-                const cats: Record<string, string[]> = {
-                  Desktop: ["Desktop Chrome", "Desktop Edge", "Desktop Firefox", "Desktop Safari"],
-                  iPhone: Object.keys(DEVICES).filter((k) => k.startsWith("iPhone")),
-                  iPad: Object.keys(DEVICES).filter((k) => k.startsWith("iPad")),
-                  Pixel: Object.keys(DEVICES).filter((k) => k.startsWith("Pixel")),
-                };
-                for (const [cat, names] of Object.entries(cats))
-                  lines.push(`  ${cat}: ${names.slice(0, 8).join(", ")}${names.length > 8 ? "..." : ""}`);
-                lines.push("", `Total: ${Object.keys(DEVICES).length} devices`);
-                return lines.join("\n");
-              }
-              const ua = DEVICES[a.device];
-              if (ua === undefined) return `Device "${a.device}" not found`;
-              await service.userAgent({ userAgent: ua });
-              return `Device set: ${a.device}\nUserAgent: ${ua.slice(0, 80) || "(default)"}...`;
             }),
           },
           bt_expect_response: {

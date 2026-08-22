@@ -19,10 +19,15 @@ pub const DEVICES: &[Device] = &[
     Device { name: "desktop-1440p", width: 1440.0, height: 900.0, ua: None },
     Device { name: "ipad-pro-11", width: 834.0, height: 1194.0, ua: Some("Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1") },
     Device { name: "ipad-10", width: 820.0, height: 1180.0, ua: Some("Mozilla/5.0 (iPad; CPU OS 16_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Mobile/15E148 Safari/604.1") },
+    Device { name: "ipad-mini-6", width: 744.0, height: 1133.0, ua: Some("Mozilla/5.0 (iPad; CPU OS 15_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.5 Mobile/15E148 Safari/604.1") },
     Device { name: "iphone-15-pro", width: 393.0, height: 852.0, ua: Some("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1") },
     Device { name: "iphone-14", width: 390.0, height: 844.0, ua: Some("Mozilla/5.0 (iPhone; CPU iPhone OS 16_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Mobile/15E148 Safari/604.1") },
+    Device { name: "iphone-13", width: 390.0, height: 844.0, ua: Some("Mozilla/5.0 (iPhone; CPU iPhone OS 15_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.5 Mobile/15E148 Safari/604.1") },
+    Device { name: "iphone-12", width: 390.0, height: 844.0, ua: Some("Mozilla/5.0 (iPhone; CPU iPhone OS 14_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1 Mobile/15E148 Safari/604.1") },
     Device { name: "iphone-se", width: 375.0, height: 667.0, ua: Some("Mozilla/5.0 (iPhone; CPU iPhone OS 15_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.5 Mobile/15E148 Safari/604.1") },
     Device { name: "pixel-7", width: 412.0, height: 915.0, ua: Some("Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36") },
+    Device { name: "pixel-6", width: 411.0, height: 914.0, ua: Some("Mozilla/5.0 (Linux; Android 13; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36") },
+    Device { name: "galaxy-s23", width: 360.0, height: 780.0, ua: Some("Mozilla/5.0 (Linux; Android 13; SM-S911B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Mobile Safari/537.36") },
 ];
 
 /// 按名称查找设备
@@ -50,7 +55,7 @@ pub fn apply(app: &AppHandle, device: &Device) -> Result<(), String> {
 /// 运行时修改页面 Webview 的 User-Agent
 /// Windows:通过 controller → ICoreWebView2Settings2.SetUserAgent
 #[cfg(windows)]
-fn set_user_agent(app: &AppHandle, ua: &str) -> Result<(), String> {
+pub fn set_user_agent(app: &AppHandle, ua: &str) -> Result<(), String> {
     use std::sync::mpsc;
     let page = ui::page_webview(app).ok_or("page webview not ready")?;
     // 结果通道:闭包内执行(闭包须 'static,不能捕获局部变量)
@@ -88,6 +93,6 @@ fn set_user_agent(app: &AppHandle, ua: &str) -> Result<(), String> {
 
 /// 非 Windows 平台暂不支持运行时修改 UA
 #[cfg(not(windows))]
-fn set_user_agent(_app: &AppHandle, _ua: &str) -> Result<(), String> {
+pub fn set_user_agent(_app: &AppHandle, _ua: &str) -> Result<(), String> {
     Err("runtime user-agent change not supported on this platform yet".into())
 }

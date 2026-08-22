@@ -30,4 +30,6 @@ export interface AnnotationRecord {
 /** 覆盖层绘制命令(window.__btOverlay.redraw) */
 export interface OverlayApi {
   redraw(rects: HighlightRect[], marks: AnnotationMark[]): void;
+  /** 显示通知气泡(message/type: ok|bad|err) */
+  notify(message: string, type?: string): void;
 }

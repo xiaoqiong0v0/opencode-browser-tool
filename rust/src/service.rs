@@ -51,13 +51,14 @@ impl App {
             "/api/console-logs" => self.console_logs(&body).await,
             "/api/expect-response" => self.expect_response(&body).await,
             "/api/assert-response" => self.assert_response(&body).await,
-            "/api/notify" => Ok(json!({ "notified": true })),
+            "/api/notify" => self.notify(&body).await,
             "/api/pdf" => self.pdf().await,
             "/api/user-agent" => self.set_user_agent(&body).await,
             "/api/panel-config" => Ok(json!({ "ok": true })),
             "/api/close-session" => Ok(json!({ "closed": true })),
             "/api/accessibility" => self.accessibility().await,
-            "/api/iframe-click" | "/api/iframe-fill" => Err("iframe ops not supported yet".into()),
+            "/api/iframe-click" => self.iframe_click(&body).await,
+            "/api/iframe-fill" => self.iframe_fill(&body).await,
             "/api/tabs/new" => self.tabs_new(&body).await,
             "/api/tabs/switch" => self.tabs_switch(&body).await,
             "/api/tabs/close" => self.tabs_close(&body).await,
@@ -108,7 +109,31 @@ impl App {
         Ok(json!({ "url": url }))
     }
 
+    /// 在页面显示通知气泡(通过覆盖层 Webview 的 __btOverlay.notify)
+    async fn notify(&self, body: &Value) -> Result<Value, String> {
+        let message = body.get("message").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let ty = body.get("type").and_then(|v| v.as_str()).unwrap_or("ok").to_string();
+        if message.is_empty() {
+            return Err("message is required".into());
+        }
+        let handle = self.handle.clone();
+        let js = format!(
+            "(function(){{ var o = window.__btOverlay; if(!o) return {{error:'overlay not ready'}}; o.notify({m:?},{t:?}); return {{ok:true}}; }})()",
+            m = message,
+            t = ty
+        );
+        tokio::task::block_in_place(|| {
+            let raw = ui::eval_overlay(&handle, &js)?;
+            // eval_overlay 用 eval() 无返回值通道,失败仅返回 Err;success 分支直接返回
+            let _ = raw;
+            Ok::<(), String>(())
+        })?;
+        Ok(json!({ "notified": true }))
+    }
+
+    /// 关闭浏览器:退出整个应用(触发 ExitRequested → 进程退出)
     async fn close(&self) -> Result<Value, String> {
+        self.handle.exit(0);
         Ok(json!({ "closed": true }))
     }
 
@@ -378,36 +403,44 @@ impl App {
         Ok(json!({ "resized": true }))
     }
 
+    /// 读取页面控制台日志(由页面桥 __btLogs 捕获,读取后清空)
     async fn console_logs(&self, _body: &Value) -> Result<Value, String> {
-        Ok(json!({ "logs": [] }))
+        let handle = self.handle.clone();
+        let logs = tokio::task::block_in_place(|| {
+            let v = control::eval(
+                &handle,
+                "(function(){var l=window.__btLogs||[];window.__btLogs=[];return l;})()",
+            )?;
+            Ok::<_, String>(v)
+        })?;
+        Ok(json!({ "logs": logs }))
     }
 
     async fn expect_response(&self, _body: &Value) -> Result<Value, String> {
-        Ok(json!({ "expected": true }))
+        Err("network response interception not supported in this architecture yet".into())
     }
 
     async fn assert_response(&self, _body: &Value) -> Result<Value, String> {
-        Ok(json!({ "asserted": true }))
+        Err("network response interception not supported in this architecture yet".into())
     }
 
     async fn pdf(&self) -> Result<Value, String> {
         Err("pdf not supported on webview".into())
     }
 
+    /// 运行时修改页面 User-Agent(Windows 通过 ICoreWebView2Settings2,其他平台报错)
     async fn set_user_agent(&self, body: &Value) -> Result<Value, String> {
         let ua = body.get("userAgent").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if ua.is_empty() {
+            return Err("userAgent is required".into());
+        }
         let handle = self.handle.clone();
-        tokio::task::block_in_place(|| {
-            let page = ui::page_webview(&handle).ok_or("page webview not ready")?;
-            let _ = page;
-            let _ = ua;
-            Ok::<_, String>(())
-        })?;
-        Ok(json!({ "set": true }))
+        tokio::task::block_in_place(|| crate::devices::set_user_agent(&handle, &ua))?;
+        Ok(json!({ "set": true, "ua": ua }))
     }
 
     async fn accessibility(&self) -> Result<Value, String> {
-        Ok(json!({ "tree": [] }))
+        Err("accessibility tree not supported in this architecture yet".into())
     }
 
     async fn tabs(&self) -> Result<Value, String> {
@@ -422,11 +455,70 @@ impl App {
     }
 
     async fn tabs_switch(&self, _body: &Value) -> Result<Value, String> {
-        Ok(json!({ "switched": true }))
+        Err("multi-tab not supported in this single-page architecture".into())
     }
 
     async fn tabs_close(&self, _body: &Value) -> Result<Value, String> {
-        Ok(json!({ "closed": true }))
+        Err("multi-tab not supported in this single-page architecture".into())
+    }
+
+    /// 在 iframe 中点击元素
+    async fn iframe_click(&self, body: &Value) -> Result<Value, String> {
+        let iframe = body.get("iframeSelector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let sel = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let handle = self.handle.clone();
+        let js = format!(
+            r#"(function(){{
+              const f = document.querySelector({iframe:?});
+              if (!f) return {{error:"iframe not found"}};
+              const d = f.contentDocument;
+              if (!d) return {{error:"cross-origin iframe not accessible"}};
+              const el = d.querySelector({sel:?});
+              if (!el) return {{error:"element not found"}};
+              el.scrollIntoView({{block:"center"}});
+              el.click();
+              return {{ok:true}};
+            }})()"#,
+            iframe = iframe,
+            sel = sel
+        );
+        let r = tokio::task::block_in_place(|| control::eval(&handle, &js))?;
+        if r.get("error").is_some() {
+            return Err(r["error"].as_str().unwrap_or("iframe click failed").to_string());
+        }
+        Ok(json!({ "clicked": true }))
+    }
+
+    /// 在 iframe 中填写输入框
+    async fn iframe_fill(&self, body: &Value) -> Result<Value, String> {
+        let iframe = body.get("iframeSelector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let sel = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let val = body.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let handle = self.handle.clone();
+        let js = format!(
+            r#"(function(){{
+              const f = document.querySelector({iframe:?});
+              if (!f) return {{error:"iframe not found"}};
+              const d = f.contentDocument;
+              if (!d) return {{error:"cross-origin iframe not accessible"}};
+              const el = d.querySelector({sel:?});
+              if (!el) return {{error:"element not found"}};
+              const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+              const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
+              setter.call(el, {val:?});
+              el.dispatchEvent(new Event("input", {{bubbles:true}}));
+              el.dispatchEvent(new Event("change", {{bubbles:true}}));
+              return {{ok:true}};
+            }})()"#,
+            iframe = iframe,
+            sel = sel,
+            val = val
+        );
+        let r = tokio::task::block_in_place(|| control::eval(&handle, &js))?;
+        if r.get("error").is_some() {
+            return Err(r["error"].as_str().unwrap_or("iframe fill failed").to_string());
+        }
+        Ok(json!({ "filled": true }))
     }
 
     async fn click_switch_tab(&self, body: &Value) -> Result<Value, String> {
