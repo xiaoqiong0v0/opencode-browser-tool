@@ -67,6 +67,10 @@ impl App {
             "/api/annotate/records" => self.annotate_records().await,
             "/api/annotate/send" => self.annotate_send().await,
             "/api/annotate/consume-sent" => self.annotate_consume_sent().await,
+            // 设备预设与开发者工具
+            "/api/device" => self.device(&body).await,
+            "/api/device/list" => self.device_list().await,
+            "/api/devtools" => self.devtools(&body).await,
             _ => Err(format!("Not found: POST {url}")),
         }
     }
@@ -434,6 +438,76 @@ impl App {
 
     // ---- 批注状态机端点 ----
 
+    /// 应用设备预设(窗口尺寸 + UA)
+    async fn device(&self, body: &Value) -> Result<Value, String> {
+        let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let device = crate::devices::find(&name).ok_or_else(|| format!("unknown device: {name}"))?;
+        let handle = self.handle.clone();
+        tokio::task::block_in_place(|| crate::devices::apply(&handle, device))?;
+        Ok(json!({
+            "device": device.name,
+            "width": device.width,
+            "height": device.height,
+            "ua": device.ua.unwrap_or("(default)"),
+        }))
+    }
+
+    /// 列出所有设备预设
+    async fn device_list(&self) -> Result<Value, String> {
+        let list: Vec<Value> = crate::devices::DEVICES
+            .iter()
+            .map(|d| {
+                json!({
+                    "name": d.name,
+                    "width": d.width,
+                    "height": d.height,
+                    "ua": d.ua.unwrap_or(""),
+                })
+            })
+            .collect();
+        Ok(json!({ "devices": list }))
+    }
+
+    /// 打开/关闭开发者工具
+    /// 注:wry 的 is_devtools_open/close_devtools 在 webview2 上为空实现,
+    /// 因此开关状态由 UiState 自行维护,close 仅标记状态(窗口需手动关闭)
+    async fn devtools(&self, body: &Value) -> Result<Value, String> {
+        let action = body.get("action").and_then(|v| v.as_str()).unwrap_or("toggle").to_string();
+        let state = self.handle.state::<crate::ui::UiState>();
+        let mut open = state.devtools_open.lock().unwrap();
+        let handle = self.handle.clone();
+        tokio::task::block_in_place(|| {
+            let page = ui::page_webview(&handle).ok_or("page webview not ready")?;
+            match action.as_str() {
+                "open" => {
+                    if !*open {
+                        page.open_devtools();
+                        *open = true;
+                    }
+                }
+                "close" => {
+                    if *open {
+                        page.close_devtools();
+                        *open = false;
+                    }
+                }
+                "toggle" => {
+                    if *open {
+                        page.close_devtools();
+                        *open = false;
+                    } else {
+                        page.open_devtools();
+                        *open = true;
+                    }
+                }
+                other => return Err(format!("unknown action: {other} (open/close/toggle)")),
+            }
+            Ok::<(), String>(())
+        })?;
+        Ok(json!({ "open": *open }))
+    }
+
+    /// 批注模式开关
     async fn annotate_toggle(&self) -> Result<Value, String> {
         let state = self.handle.state::<crate::ui::UiState>();
         let on = crate::ui::annotate::Annotator::toggle(&self.handle, &state)?;

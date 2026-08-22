@@ -36,6 +36,8 @@ pub struct UiState {
     pub records: Mutex<Vec<AnnotationRecord>>,
     /// 待发送记录队列(面板点击"发送全部"后,插件端轮询消费)
     pub sent_records: Mutex<Vec<serde_json::Value>>,
+    /// 开发者工具开关(wry 的 is_devtools_open 在 webview2 上恒 false,需自行维护)
+    pub devtools_open: Mutex<bool>,
 }
 
 impl UiState {
@@ -44,6 +46,7 @@ impl UiState {
             annotate_mode: Mutex::new(false),
             records: Mutex::new(Vec::new()),
             sent_records: Mutex::new(Vec::new()),
+            devtools_open: Mutex::new(false),
         }
     }
 }
@@ -93,42 +96,77 @@ pub fn create_ui(app: &AppHandle) -> tauri::Result<()> {
         .inner_size(1100.0, 700.0)
         .build()?;
 
-    // 读取窗口实际物理尺寸与缩放因子
-    let scale = window.scale_factor().unwrap_or(1.0);
-    let win_size = window.inner_size()?;
-    let panel_w: i32 = (PANEL_WIDTH * scale) as i32;
-    let page_w: i32 = win_size.width as i32 - panel_w;
-    let page_h: i32 = win_size.height as i32;
-    println!("[ui] scale={scale} win={win_size:?} page={page_w}x{page_h} panel={panel_w}");
-
     // 1. 页面 Webview(左侧,渲染目标网页 + 注入页面桥)
-    let page = window.add_child(
+    window.add_child(
         WebviewBuilder::new(
             PAGE_WEBVIEW,
             WebviewUrl::External("about:blank".parse().unwrap()),
         )
         .initialization_script(PAGE_BRIDGE_JS),
         tauri::PhysicalPosition::new(0, 0),
-        tauri::PhysicalSize::new(page_w as u32, page_h as u32),
+        tauri::PhysicalSize::new(100, 100),
     )?;
 
     // 2. 覆盖层 Webview(透明,叠加在页面区)
-    let overlay = window.add_child(
+    window.add_child(
         WebviewBuilder::new(OVERLAY_WEBVIEW, WebviewUrl::App("overlay.html".into()))
             .transparent(true)
             .disable_drag_drop_handler(),
         tauri::PhysicalPosition::new(0, 0),
-        tauri::PhysicalSize::new(page_w as u32, page_h as u32),
+        tauri::PhysicalSize::new(100, 100),
     )?;
 
     // 3. 面板 Webview(右侧并排)
-    let panel = window.add_child(
+    window.add_child(
         WebviewBuilder::new(PANEL_WEBVIEW, WebviewUrl::App("index.html".into())),
-        tauri::PhysicalPosition::new(page_w, 0),
-        tauri::PhysicalSize::new(panel_w as u32, page_h as u32),
+        tauri::PhysicalPosition::new(100, 0),
+        tauri::PhysicalSize::new(100, 100),
     )?;
 
-    let _ = (page, overlay, panel);
+    // 初始布局按窗口实际尺寸重排
+    let size = window.inner_size()?;
+    let scale = window.scale_factor().unwrap_or(1.0);
+    apply_layout(app, size, scale)?;
+
+    // 监听窗口 resize/DPI 变化 → 重排三个 webview
+    let handle = app.clone();
+    window.on_window_event(move |event| match event {
+        tauri::WindowEvent::Resized(size) | tauri::WindowEvent::ScaleFactorChanged { new_inner_size: size, .. } => {
+            if let Some(win) = handle.get_window("main") {
+                let scale = win.scale_factor().unwrap_or(1.0);
+                let _ = apply_layout(&handle, *size, scale);
+            }
+        }
+        _ => {}
+    });
+
+    Ok(())
+}
+
+/// 重排三个 webview 的边界(页面/覆盖层占左侧,面板占右侧固定宽度)
+/// size 为窗口物理内尺寸,scale 为窗口缩放因子
+fn apply_layout(app: &AppHandle, size: tauri::PhysicalSize<u32>, scale: f64) -> tauri::Result<()> {
+    let panel_w = (PANEL_WIDTH * scale) as i32;
+    let page_w = size.width as i32 - panel_w;
+    let page_h = size.height as i32;
+
+    // 1. 页面 Webview(左侧,渲染目标网页 + 注入页面桥)
+    if let Some(w) = app.get_webview(PAGE_WEBVIEW) {
+        w.set_position(tauri::PhysicalPosition::new(0, 0))?;
+        w.set_size(tauri::PhysicalSize::new(page_w.max(0) as u32, page_h.max(0) as u32))?;
+    }
+
+    // 2. 覆盖层 Webview(透明,叠加在页面区)
+    if let Some(w) = app.get_webview(OVERLAY_WEBVIEW) {
+        w.set_position(tauri::PhysicalPosition::new(0, 0))?;
+        w.set_size(tauri::PhysicalSize::new(page_w.max(0) as u32, page_h.max(0) as u32))?;
+    }
+
+    // 3. 面板 Webview(右侧并排)
+    if let Some(w) = app.get_webview(PANEL_WEBVIEW) {
+        w.set_position(tauri::PhysicalPosition::new(page_w.max(0), 0))?;
+        w.set_size(tauri::PhysicalSize::new(panel_w as u32, page_h.max(0) as u32))?;
+    }
     Ok(())
 }
 
