@@ -86,6 +86,12 @@ fn panel_cmd(
     }
 }
 
+/// 面板获取 HTTP 服务端口(用于 fetch /api/* 调用设备切换/开发者工具)
+#[tauri::command]
+fn panel_service_port(state: State<ui::UiState>) -> u16 {
+    *state.service_port.lock().unwrap()
+}
+
 fn main() {
     // 显式声明 DPI 感知(否则窗口被系统虚拟化缩放,与 WebView2 真实 DPI 不一致导致布局错位)
     #[cfg(windows)]
@@ -101,11 +107,18 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             panel_records,
             panel_set_note,
-            panel_cmd
+            panel_cmd,
+            panel_service_port
         ])
         .setup(move |app| {
             // 创建三 Webview 布局
             ui::create_ui(app.handle())?;
+
+            // 记录服务端口供面板查询
+            {
+                let state = app.state::<ui::UiState>();
+                *state.service_port.lock().unwrap() = port;
+            }
 
             // 启动 HTTP 服务(端口由 --port 指定,默认 0 随机)
             let http_app = Arc::new(bt_shell::service::App::new(

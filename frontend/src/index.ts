@@ -1,5 +1,5 @@
-// 面板 Webview 入口:批注列表 + 操作按钮 + 说明输入
-// 与 Rust 通过 Tauri event/invoke 通信
+// 面板 Webview 入口:批注列表 + 操作按钮 + 说明输入 + 设备切换/开发者工具
+// 与 Rust 通过 Tauri event/invoke 通信,设备/开发者工具走 HTTP /api/*
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { AnnotationRecord } from "./types";
@@ -8,6 +8,8 @@ import type { AnnotationRecord } from "./types";
 interface PanelDoms {
   btnAnnotate: HTMLButtonElement;
   btnSend: HTMLButtonElement;
+  btnDevtools: HTMLButtonElement;
+  deviceSelect: HTMLSelectElement;
   records: HTMLDivElement;
   note: HTMLTextAreaElement;
 }
@@ -15,11 +17,14 @@ interface PanelDoms {
 class Panel {
   private doms: PanelDoms;
   private records: AnnotationRecord[] = [];
+  private servicePort = 0;
 
   constructor() {
     this.doms = {
       btnAnnotate: document.getElementById("btn-annotate") as HTMLButtonElement,
       btnSend: document.getElementById("btn-send") as HTMLButtonElement,
+      btnDevtools: document.getElementById("btn-devtools") as HTMLButtonElement,
+      deviceSelect: document.getElementById("device-select") as HTMLSelectElement,
       records: document.getElementById("records") as HTMLDivElement,
       note: document.getElementById("note") as HTMLTextAreaElement,
     };
@@ -41,11 +46,39 @@ class Panel {
         }
       });
     });
+    // 设备切换(选择后应用预设)
+    this.doms.deviceSelect.addEventListener("change", () => {
+      const name = this.doms.deviceSelect.value;
+      if (!name) return;
+      void this.api("/api/device", { name }).catch((e) => {
+        console.error("[panel] apply device failed:", e);
+      });
+    });
+    // 开发者工具开关
+    this.doms.btnDevtools.addEventListener("click", () => {
+      void this.api("/api/devtools", { action: "toggle" })
+        .then((r) => {
+          this.doms.btnDevtools.classList.toggle("active", !!r.data?.open);
+        })
+        .catch((e) => console.error("[panel] devtools failed:", e));
+    });
     // Rust 推送记录变更
     void listen<AnnotationRecord[]>("records-changed", (e) => {
       this.records = e.payload || [];
       this.render();
     });
+  }
+
+  /** 调用本地 HTTP 服务 API */
+  private async api(path: string, body?: unknown): Promise<any> {
+    const port = this.servicePort || (await invoke<number>("panel_service_port"));
+    this.servicePort = port;
+    const res = await fetch(`http://127.0.0.1:${port}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body || {}),
+    });
+    return res.json();
   }
 
   /** 渲染记录列表 */
@@ -74,16 +107,34 @@ class Panel {
   }
 
   /** 主动拉取记录(启动时) */
-  async refresh(): Promise<void> {
+  async init(): Promise<void> {
     try {
       this.records = await invoke<AnnotationRecord[]>("panel_records");
       this.render();
     } catch (e) {
-      console.error("[panel] refresh failed:", e);
+      console.error("[panel] init failed:", e);
+    }
+    // 加载设备列表
+    try {
+      const r = await this.api("/api/device/list");
+      const devices = r.data?.devices || [];
+      this.doms.deviceSelect.innerHTML = "";
+      const placeholder = document.createElement("option");
+      placeholder.value = "";
+      placeholder.textContent = "设备预设...";
+      this.doms.deviceSelect.appendChild(placeholder);
+      for (const d of devices) {
+        const opt = document.createElement("option");
+        opt.value = d.name;
+        opt.textContent = `${d.name} (${d.width}x${d.height})`;
+        this.doms.deviceSelect.appendChild(opt);
+      }
+    } catch (e) {
+      console.error("[panel] load devices failed:", e);
     }
   }
 }
 
 const panel = new Panel();
-void panel.refresh();
+void panel.init();
 console.log("[panel] ready");

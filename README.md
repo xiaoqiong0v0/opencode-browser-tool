@@ -53,18 +53,35 @@ opencode（Bun）
 | 类别 | 工具 |
 |------|------|
 | **导航** | `bt_navigate`, `bt_go_back`, `bt_go_forward`, `bt_reload`, `bt_close` |
-| **交互** | `bt_click`, `bt_fill`, `bt_clear`, `bt_select`, `bt_hover`, `bt_drag`, `bt_press_key`, `bt_upload_file` |
+| **交互** | `bt_click`, `bt_fill`, `bt_clear`, `bt_select`, `bt_hover`, `bt_drag`, `bt_press_key`, `bt_upload_file`, `bt_iframe_click`, `bt_iframe_fill` |
 | **标签页** | `bt_list_tabs`, `bt_switch_tab`, `bt_new_tab`, `bt_close_tab`, `bt_click_and_switch_tab` |
 | **信息** | `bt_screenshot`, `bt_evaluate`, `bt_get_visible_text`, `bt_get_visible_html`, `bt_console_logs`, `bt_get_browser_status`, `bt_get_element_state`, `bt_get_dropdown_options`, `bt_list_records` |
-| **滚动/等待** | `bt_scroll`, `bt_scroll_to_element`, `bt_wait_for_selector`, `bt_resize` |
-| **网络** | `bt_expect_response`, `bt_assert_response` |
-| **其他** | `bt_save_as_pdf`, `bt_custom_user_agent`, `bt_select_user_agent`, `bt_show_notification`, `bt_read_record_content` |
+| **滚动/等待** | `bt_scroll`, `bt_scroll_to_element`, `bt_wait_for_selector`, `bt_resize`, `bt_set_device` |
+| **设备/工具** | `bt_set_device`（13 种设备预设，含尺寸+UA）, `bt_custom_user_agent`, `bt_devtools`（开发者工具开关） |
+| **其他** | `bt_save_as_pdf`, `bt_show_notification`, `bt_read_record_content` |
+
+> 架构限制（V5 单页 Webview）：多标签（`bt_list_tabs`/`bt_switch_tab`/`bt_close_tab`）、网络监听（`bt_expect_response`/`bt_assert_response`）、可访问性树（`bt_get_accessibility_tree`）在当前架构下不适用，调用会明确报错而非假成功。
+
+## 设备预设
+
+内置 13 种设备预设（窗口尺寸 + User-Agent），可通过 `bt_set_device` 或右侧面板下拉框一键切换：
+
+| 分类 | 预设 |
+|------|------|
+| 桌面 | `desktop-1080p`, `desktop-1440p` |
+| iPad | `ipad-pro-11`, `ipad-10`, `ipad-mini-6` |
+| iPhone | `iphone-15-pro`, `iphone-14`, `iphone-13`, `iphone-12`, `iphone-se` |
+| Android | `pixel-7`, `pixel-6`, `galaxy-s23` |
+
+切换时自动调整窗口尺寸并运行时修改 UA（UA 修改仅 Windows 支持）。
 
 ## 批注面板
 
 - **批注模式** — 悬停高亮元素（覆盖层自绘），点击添加批注；引擎层拦截，弹框/下拉类元素不失焦
 - **截图工具** — 框选区域，添加说明
 - **发送全部** → 数据推送到 opencode 对话
+- **设备预设下拉** — 快捷切换 13 种设备（等价 `bt_set_device`）
+- **开发者工具按钮** — 打开/关闭 WebView2 开发者工具（等价 `bt_devtools`）
 
 ## 多会话
 

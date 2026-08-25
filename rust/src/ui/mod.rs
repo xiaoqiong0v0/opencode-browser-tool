@@ -38,6 +38,8 @@ pub struct UiState {
     pub sent_records: Mutex<Vec<serde_json::Value>>,
     /// 开发者工具开关(wry 的 is_devtools_open 在 webview2 上恒 false,需自行维护)
     pub devtools_open: Mutex<bool>,
+    /// HTTP 服务端口(面板 invoke 获取后 fetch /api/*)
+    pub service_port: Mutex<u16>,
 }
 
 impl UiState {
@@ -47,6 +49,7 @@ impl UiState {
             records: Mutex::new(Vec::new()),
             sent_records: Mutex::new(Vec::new()),
             devtools_open: Mutex::new(false),
+            service_port: Mutex::new(0),
         }
     }
 }
