@@ -1,0 +1,149 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>bt-shell toolbar</title>
+    <style>
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      /* 主题变量:深色为默认,data-theme="light" 切浅色(由 theme.ts 按系统/手动设置) */
+      :root, [data-theme="dark"] {
+        --bg: #141414; --fg: #ddd;
+        --btn-bg: #3a3a3a; --btn-fg: #ccc; --btn-hover: #454545;
+        --border: #4a4a4a; --accent: #4caf50;
+      }
+      [data-theme="light"] {
+        --bg: #f0f0f0; --fg: #333;
+        --btn-bg: #e6e6e6; --btn-fg: #555; --btn-hover: #ddd;
+        --border: #ccc; --accent: #2e7d32;
+      }
+      html, body { width: 100%; height: 100%; overflow: hidden; }
+      body {
+        display: flex; flex-direction: column;
+        background: var(--bg); color: var(--fg);
+        font: 13px system-ui, -apple-system, "Segoe UI", sans-serif;
+        user-select: none;
+      }
+      /* 第一行:标签(高度仅由标签决定,使激活标签底部紧贴地址行) */
+      #tab-row {
+        display: flex; align-items: flex-start; gap: 4px;
+        padding: 4px 4px 0; position: relative;
+        min-height: 0;
+      }
+      /* 标签行所有子元素底部留 4px 间距 */
+      #tab-row > * { margin-bottom: 4px; }
+      /* 窗口控制按钮:flex 布局放标签行右侧(高度≤标签,不撑高标签行) */
+      #win-btns {
+        display: flex; align-items: center; margin-left: auto;
+      }
+      .win-btn {
+        flex-shrink: 0; width: 40px; height: 24px; border-radius: 5px;
+        display: flex; align-items: center; justify-content: center;
+        color: var(--btn-fg); cursor: pointer; font-size: 13px; line-height: 1;
+      }
+      .win-btn:hover { background: var(--btn-hover); }
+      #win-close:hover { background: #e81123; color: #fff; }
+      .fold-btn {
+        flex-shrink: 0; width: 20px; height: 24px; border-radius: 4px;
+        display: flex; align-items: center; justify-content: center;
+        color: var(--btn-fg); cursor: pointer; font-size: 12px;
+      }
+      .fold-btn:hover { background: var(--btn-hover); }
+      #tabs { display: flex; align-items: center; gap: 4px; overflow-x: auto; flex: 0 1 auto; margin-bottom: 0; }
+      #tabs::-webkit-scrollbar { height: 0; }
+      /* 可拖动空白:占满标签行剩余空间,用于无标题栏窗口拖动 */
+      #drag-zone { flex: 1; align-self: stretch; min-width: 48px; }
+      /* 标签:高度撑满,flex column 布局(tab-top 三元素 + tab-link 连接条) */
+      .tab {
+        height: 100%; position: relative; flex-shrink: 0;
+        display: flex; flex-direction: column;
+      }
+      /* 标签主体:图标/标题/x 包起来,应用现有胶囊样式 */
+      .tab-top {
+        display: flex; align-items: center; gap: 6px;
+        height: 24px; max-width: 170px; min-width: 70px;
+        padding: 0 8px; box-sizing: border-box;
+        border-radius: 7px;
+        background: color-mix(in srgb, var(--bg) 90%, var(--fg) 5%); color: var(--btn-fg);
+        white-space: nowrap; cursor: pointer;
+      }
+      .tab-top:hover { background: color-mix(in srgb, var(--bg) 80%, var(--fg) 8%); }
+      /* 激活标签:与地址行同色,底部圆角去掉 */
+      .tab.active .tab-top {
+        background: var(--btn-bg); color: var(--fg);
+        border-radius: 7px 7px 0 0;
+      }
+      /* 底部连接条:普通流占 tab 底部 3px,激活时显示同色块(在 tab 内,不被 overflow 裁) */
+      .tab-link {
+        display: none;
+        height: 4px;
+        background: var(--btn-bg);
+      }
+      .tab.active .tab-link { display: block; }
+      .tab-fav {
+        flex-shrink: 0; width: 14px; height: 14px; border-radius: 2px;
+        background: color-mix(in srgb, var(--bg) 70%, var(--fg) 10%);
+        display: inline-flex; align-items: center; justify-content: center; font-size: 11px; line-height: 1;
+      }
+      .tab-title { overflow: hidden; text-overflow: ellipsis; line-height: 1; }
+      .tab-close {
+        flex-shrink: 0; width: 15px; height: 15px; line-height: 1; text-align: center;
+        border-radius: 3px; color: var(--btn-fg); font-size: 12px;
+        display: inline-flex; align-items: center; justify-content: center;
+      }
+      .tab-close:hover { background: #e81123; color: #fff; }
+      #btn-add {
+        flex-shrink: 0; width: 22px; height: 24px; border-radius: 5px;
+        display: flex; align-items: center; justify-content: center;
+        background: var(--btn-bg); color: var(--btn-fg); cursor: pointer; font-size: 15px;
+      }
+      #btn-add:hover { background: var(--btn-hover); }
+      /* 第二行:导航 */
+      #nav-row {
+        display: flex; align-items: center; gap: 6px; padding: 5px 8px;
+        background: var(--btn-bg); /* 底部直角,不要圆角 */
+      }
+      .nav-btn {
+        flex-shrink: 0; width: 30px; height: 26px; border-radius: 6px;
+        display: flex; align-items: center; justify-content: center;
+        background: color-mix(in srgb, var(--btn-bg) 80%, var(--fg) 10%); color: var(--btn-fg); cursor: pointer; font-size: 14px;
+      }
+      .nav-btn:hover { background: var(--btn-hover); }
+      #addr {
+        flex: 1; min-width: 60px; padding: 5px 10px; border: 1px solid var(--border);
+        border-radius: 14px; /* 输入框保留胶囊圆角 */
+        background: var(--bg); color: var(--btn-fg); font: 13px system-ui; outline: none;
+        transition: color 0.15s, border-color 0.15s;
+      }
+      #addr:focus { color: var(--fg); border-color: var(--accent); }
+      #btn-panel {
+        flex-shrink: 0; padding: 5px 10px; border: 1px solid var(--border); border-radius: 14px;
+        background: var(--btn-bg); color: var(--btn-fg); cursor: pointer; font: 13px system-ui;
+      }
+      #btn-panel:hover { background: var(--btn-hover); }
+      #btn-panel.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+    </style>
+  </head>
+  <body>
+    <div id="tab-row" data-tauri-drag-region>
+      <div id="tab-scroll-left" class="fold-btn" title="更多标签">◀</div>
+      <div id="tabs"></div>
+      <div id="tab-scroll-right" class="fold-btn" title="更多标签">▶</div>
+      <div id="btn-add" title="新建标签">+</div>
+      <div id="drag-zone" data-tauri-drag-region></div>
+      <div id="win-btns">
+        <div id="win-min" class="win-btn" title="最小化">─</div>
+        <div id="win-max" class="win-btn" title="最大化">□</div>
+        <div id="win-close" class="win-btn" title="关闭">✕</div>
+      </div>
+    </div>
+    <div id="nav-row">
+      <div id="btn-back" class="nav-btn" title="后退">←</div>
+      <div id="btn-forward" class="nav-btn" title="前进">→</div>
+      <div id="btn-reload" class="nav-btn" title="刷新">⟳</div>
+      <input id="addr" placeholder="输入地址，回车导航" spellcheck="false" />
+      <button id="btn-panel" title="功能面板">⚙ 面板</button>
+    </div>
+    <script src="toolbar.js"></script>
+  </body>
+</html>

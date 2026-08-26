@@ -20,7 +20,7 @@ pub fn eval(app: &AppHandle, js: &str) -> ControlResult<Value> {
 
 /// 导航到 URL
 pub fn navigate(app: &AppHandle, url: &str) -> ControlResult<()> {
-    ui::page_webview(app)
+    ui::active_page_webview(app)
         .ok_or("page webview not ready")?
         .navigate(url.parse().map_err(|e| format!("invalid url: {e}"))?)
         .map_err(|e| format!("navigate failed: {e}"))

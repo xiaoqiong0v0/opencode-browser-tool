@@ -104,8 +104,12 @@ impl App {
         if url.is_empty() {
             return Err("url is required".into());
         }
+        // 裸域名自动补 http://
+        let url = ui::normalize_url(&url);
         let handle = self.handle.clone();
         tokio::task::block_in_place(|| control::navigate(&handle, &url))?;
+        // 同步激活标签的 URL(工具栏显示一致)
+        ui::sync_active_tab(&self.handle, &url, "");
         Ok(json!({ "url": url }))
     }
 
@@ -362,7 +366,7 @@ impl App {
     async fn reload(&self) -> Result<Value, String> {
         let handle = self.handle.clone();
         tokio::task::block_in_place(|| {
-            ui::page_webview(&handle)
+            ui::active_page_webview(&handle)
                 .ok_or("page webview not ready")?
                 .reload()
                 .map_err(|e| format!("reload failed: {e}"))
@@ -393,7 +397,7 @@ impl App {
         let h = body.get("height").and_then(|v| v.as_i64()).unwrap_or(0) as f64;
         let handle = self.handle.clone();
         tokio::task::block_in_place(|| {
-            let win = ui::page_webview(&handle)
+            let win = ui::active_page_webview(&handle)
                 .ok_or("page webview not ready")?
                 .window_ref()
                 .clone();
@@ -569,7 +573,7 @@ impl App {
         let mut open = state.devtools_open.lock().unwrap();
         let handle = self.handle.clone();
         tokio::task::block_in_place(|| {
-            let page = ui::page_webview(&handle).ok_or("page webview not ready")?;
+            let page = ui::active_page_webview(&handle).ok_or("page webview not ready")?;
             match action.as_str() {
                 "open" => {
                     if !*open {

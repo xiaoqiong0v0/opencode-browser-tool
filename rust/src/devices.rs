@@ -38,7 +38,7 @@ pub fn find(name: &str) -> Option<&'static Device> {
 /// 应用设备预设:设置窗口尺寸(逻辑像素) + 运行时修改 UA
 pub fn apply(app: &AppHandle, device: &Device) -> Result<(), String> {
     // 窗口尺寸(逻辑像素,set_size 自动换算物理尺寸并触发 Resized 重排)
-    let win = ui::page_webview(app)
+    let win = ui::active_page_webview(app)
         .ok_or("page webview not ready")?
         .window_ref()
         .clone();
@@ -57,7 +57,7 @@ pub fn apply(app: &AppHandle, device: &Device) -> Result<(), String> {
 #[cfg(windows)]
 pub fn set_user_agent(app: &AppHandle, ua: &str) -> Result<(), String> {
     use std::sync::mpsc;
-    let page = ui::page_webview(app).ok_or("page webview not ready")?;
+    let page = ui::active_page_webview(app).ok_or("page webview not ready")?;
     // 结果通道:闭包内执行(闭包须 'static,不能捕获局部变量)
     let (tx, rx) = mpsc::channel::<Result<(), String>>();
     let ua_owned = ua.to_string();

@@ -10,7 +10,7 @@ const outdir = resolve(root, "dist");
 const srcdir = resolve(root, "src");
 
 /** 打包入口列表 */
-const entries = ["index", "overlay", "page-bridge"];
+const entries = ["index", "overlay", "page-bridge", "toolbar", "newtab"];
 
 /** 递归复制 HTML 模板到 dist(保持目录结构) */
 function copyHtml(dir, dest) {

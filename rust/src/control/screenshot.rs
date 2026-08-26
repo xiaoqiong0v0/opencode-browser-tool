@@ -13,7 +13,7 @@ pub fn screenshot(app: &AppHandle) -> Result<String, String> {
 
 #[cfg(windows)]
 fn screenshot_impl(app: &AppHandle) -> Result<String, String> {
-    let page = ui::page_webview(app).ok_or("page webview not ready")?;
+    let page = ui::active_page_webview(app).ok_or("page webview not ready")?;
     // 结果通道:completed 回调 → 本线程
     let (tx, rx) = mpsc::channel::<Result<String, String>>();
     let tx2 = tx.clone();

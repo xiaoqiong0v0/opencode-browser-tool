@@ -6,63 +6,92 @@
     <title>bt-shell 面板</title>
     <style>
       * { box-sizing: border-box; margin: 0; padding: 0; }
+      /* 主题变量:深色为默认,data-theme="light" 切浅色(由 theme.ts 按系统/手动设置) */
+      :root, [data-theme="dark"] {
+        --bg: #1e1e1e; --fg: #ddd; --fg-dim: #aaa;
+        --panel-bg: #2a2a2a; --panel-hover: #333; --rec-bg: #242424;
+        --border: #444; --rec-border: #333; --muted: #888; --empty: #666;
+        --accent: #4caf50; --accent-active: #3d5a3d;
+      }
+      [data-theme="light"] {
+        --bg: #f5f5f5; --fg: #333; --fg-dim: #666;
+        --panel-bg: #fff; --panel-hover: #ececec; --rec-bg: #fff;
+        --border: #d0d0d0; --rec-border: #e0e0e0; --muted: #888; --empty: #999;
+        --accent: #2e7d32; --accent-active: #c8e6c9;
+      }
       html, body { width: 100%; height: 100%; }
       body {
         font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
         font-size: 13px;
-        background: #1e1e1e;
-        color: #ddd;
+        background: var(--bg);
+        color: var(--fg);
         padding: 10px;
         display: flex;
         flex-direction: column;
         gap: 8px;
         user-select: none;
       }
-      h3 { font-size: 14px; color: #aaa; font-weight: 600; }
+      h3 { font-size: 14px; color: var(--fg-dim); font-weight: 600; }
       button {
         width: 100%;
         padding: 8px 0;
         cursor: pointer;
-        border: 1px solid #444;
+        border: 1px solid var(--border);
         border-radius: 4px;
-        background: #2a2a2a;
-        color: #ddd;
+        background: var(--panel-bg);
+        color: var(--fg);
         font-size: 13px;
       }
-      button:hover { background: #333; }
-      button.active { background: #3d5a3d; border-color: #4caf50; }
+      button:hover { background: var(--panel-hover); }
+      button.active { background: var(--accent-active); border-color: var(--accent); }
       select {
         width: 100%;
         padding: 6px;
-        background: #2a2a2a;
-        color: #ddd;
-        border: 1px solid #444;
+        background: var(--panel-bg);
+        color: var(--fg);
+        border: 1px solid var(--border);
         border-radius: 4px;
         font-size: 13px;
       }
       .row { display: flex; gap: 6px; }
       .row > button { flex: 1; }
+      .head { display: flex; align-items: center; justify-content: space-between; }
+      #btn-panel-close {
+        width: 24px; padding: 0; height: 22px; border-radius: 4px;
+        border: 1px solid var(--border); background: var(--panel-bg); color: var(--muted); cursor: pointer;
+      }
+      #btn-panel-close:hover { background: var(--panel-hover); color: var(--fg); }
+      /* 双 tab 切换 */
+      .tabs { display: flex; gap: 4px; }
+      .tab-btn {
+        flex: 1; padding: 7px 0; font-weight: 600; color: var(--fg-dim);
+      }
+      .tab-btn.active { background: var(--accent-active); border-color: var(--accent); color: var(--fg); }
+      .pane { display: flex; flex-direction: column; gap: 8px; min-height: 0; }
+      .pane[hidden] { display: none; }
+      #tab-ai-pane { flex: 1; }
+      .pane-head { display: flex; align-items: center; justify-content: space-between; }
       #records {
         flex: 1;
         overflow-y: auto;
-        border: 1px solid #444;
+        border: 1px solid var(--border);
         border-radius: 4px;
         padding: 6px;
-        background: #242424;
+        background: var(--rec-bg);
       }
-      .rec { padding: 4px 2px; border-bottom: 1px solid #333; word-break: break-all; }
-      .rec-note { color: #888; font-size: 12px; margin-top: 2px; }
-      .empty { color: #666; text-align: center; padding: 20px 0; }
+      .rec { padding: 4px 2px; border-bottom: 1px solid var(--rec-border); word-break: break-all; }
+      .rec-note { color: var(--muted); font-size: 12px; margin-top: 2px; }
+      .empty { color: var(--empty); text-align: center; padding: 20px 0; }
       #send-result { font-size: 12px; text-align: center; min-height: 16px; }
-      .send-ok { color: #4caf50; }
-      .send-empty { color: #666; }
+      .send-ok { color: var(--accent); }
+      .send-empty { color: var(--empty); }
       textarea {
         width: 100%;
         height: 70px;
         resize: none;
-        background: #2a2a2a;
-        color: #ddd;
-        border: 1px solid #444;
+        background: var(--panel-bg);
+        color: var(--fg);
+        border: 1px solid var(--border);
         border-radius: 4px;
         padding: 6px;
         font-family: inherit;
@@ -70,18 +99,37 @@
     </style>
   </head>
   <body>
-    <h3>bt-shell 面板</h3>
-    <button id="btn-annotate">✏️ 批注模式</button>
-    <button id="btn-send">📤 发送全部</button>
-    <div id="send-result" class="send-empty"></div>
-    <div id="records"></div>
-    <textarea id="note" placeholder="批注说明..."></textarea>
-    <h3>设备 / 工具</h3>
-    <select id="device-select">
-      <option value="">加载设备列表...</option>
-    </select>
-    <div class="row">
-      <button id="btn-devtools">🛠 开发者工具</button>
+    <div class="head">
+      <h3>bt-shell 面板</h3>
+      <button id="btn-panel-close" title="收起面板">✕</button>
+    </div>
+    <div class="tabs">
+      <button id="tab-ai" class="tab-btn active">🤖 AI 功能</button>
+      <button id="tab-config" class="tab-btn">⚙ 配置</button>
+    </div>
+    <!-- Tab1:AI 功能区 -->
+    <div id="tab-ai-pane" class="pane">
+      <button id="btn-annotate">✏️ 批注模式</button>
+      <button id="btn-send">📤 发送全部</button>
+      <div id="send-result" class="send-empty"></div>
+      <div id="records"></div>
+      <textarea id="note" placeholder="批注说明..."></textarea>
+    </div>
+    <!-- Tab2:配置区(外观放顶部) -->
+    <div id="tab-config-pane" class="pane" hidden>
+      <h3>外观</h3>
+      <select id="theme-select">
+        <option value="auto">跟随系统</option>
+        <option value="light">浅色</option>
+        <option value="dark">深色</option>
+      </select>
+      <h3>设备 / 工具</h3>
+      <select id="device-select">
+        <option value="">加载设备列表...</option>
+      </select>
+      <div class="row">
+        <button id="btn-devtools">🛠 开发者工具</button>
+      </div>
     </div>
     <script src="index.js"></script>
   </body>

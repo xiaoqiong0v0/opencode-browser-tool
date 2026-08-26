@@ -1,0 +1,34 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>新标签页</title>
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      /* 主题变量:与工具栏/面板一致,深色默认,浅色 data-theme 覆盖 */
+      :root, [data-theme="dark"] {
+        --bg: #141414; --fg: #666; --fg-hint: #4a4a4a;
+      }
+      [data-theme="light"] {
+        --bg: #f0f0f0; --fg: #bbb; --fg-hint: #ccc;
+      }
+      html, body { height: 100%; }
+      body {
+        background: var(--bg); color: var(--fg);
+        display: flex; flex-direction: column; align-items: center; justify-content: center;
+        font: 15px system-ui, -apple-system, "Segoe UI", sans-serif;
+        user-select: none;
+      }
+      .icon { font-size: 48px; margin-bottom: 14px; opacity: 0.8; }
+      .title { font-size: 16px; }
+      .hint { margin-top: 6px; font-size: 12px; color: var(--fg-hint); }
+    </style>
+  </head>
+  <body>
+    <div class="icon">🌐</div>
+    <div class="title">新标签页</div>
+    <div class="hint">在地址栏输入网址开始浏览</div>
+    <script src="newtab.js"></script>
+  </body>
+</html>

@@ -1,10 +1,12 @@
-//! Tauri UI 模块:单窗口 + 三 Webview(页面/覆盖层/面板)
+//! Tauri UI 模块:单窗口 + 四 Webview(工具栏/页面/覆盖层/面板)
 //! 页面 Webview 注入 page-bridge(零注入,无残留脚本)
-//! 覆盖层 Webview 透明叠加,面板 Webview 右侧并排
+//! 工具栏 Webview 顶部横条(标签 + 地址栏 + 面板开关)
+//! 覆盖层 Webview 透明叠加,面板 Webview 覆盖式浮层(不占页面)
 pub mod annotate;
 
 use std::sync::Mutex;
 
+use serde::Serialize;
 use tauri::window::WindowBuilder;
 use tauri::webview::WebviewBuilder;
 use tauri::{AppHandle, Manager, WebviewUrl};
@@ -15,9 +17,38 @@ pub const PAGE_WEBVIEW: &str = "page";
 pub const OVERLAY_WEBVIEW: &str = "overlay";
 /// 面板 Webview 标签
 pub const PANEL_WEBVIEW: &str = "panel";
+/// 工具栏 Webview 标签
+pub const TOOLBAR_WEBVIEW: &str = "toolbar";
 
-/// 面板宽度(逻辑像素)
+/// 面板宽度(逻辑像素,覆盖式浮层)
 pub const PANEL_WIDTH: f64 = 280.0;
+/// 顶部工具栏高度(逻辑像素,两行:标签行 + 地址栏行)
+pub const TOOLBAR_HEIGHT: f64 = 72.0;
+
+/// 标签页状态
+#[derive(Debug, Clone, Serialize)]
+pub struct TabState {
+    pub id: u32,
+    pub url: String,
+    pub title: String,
+    /// 对应独立页面 Webview 的 label(真多标签,每标签一个 webview)
+    #[serde(skip)]
+    pub webview: Option<String>,
+}
+
+/// 预创建页面 Webview 数量(真多标签,保持创建顺序使 overlay/panel 位于最上)
+/// 超过该数量的新标签走动态创建(create_tab_webview)
+pub const MAX_TABS: u32 = 10;
+
+/// 新标签页地址(tauri 内部页面,背景跟随主题,不依赖 webview 默认背景色)
+pub const NEWTAB_URL: &str = "tauri://localhost/newtab.html";
+
+/// 待确认批注(点击元素后弹框输入,确定后入列)
+#[derive(Debug, Clone)]
+pub struct PendingClick {
+    pub selector: String,
+    pub rect: (i32, i32, i32, i32),
+}
 
 /// 批注记录(Rust 侧持有,推送面板)
 #[derive(Debug, Clone, serde::Serialize)]
@@ -40,6 +71,18 @@ pub struct UiState {
     pub devtools_open: Mutex<bool>,
     /// HTTP 服务端口(面板 invoke 获取后 fetch /api/*)
     pub service_port: Mutex<u16>,
+    /// 面板浮层显示开关(覆盖式)
+    pub panel_open: Mutex<bool>,
+    /// 标签页列表(伪多标签:URL 记录 + 切换导航)
+    pub tabs: Mutex<Vec<TabState>>,
+    /// 当前激活标签 id
+    pub active_tab: Mutex<u32>,
+    /// 标签 id 自增
+    pub next_tab_id: Mutex<u32>,
+    /// 待确认批注(点击元素后弹框确认,未提交前不入列)
+    pub pending_click: Mutex<Option<PendingClick>>,
+    /// 主题模式:auto(跟随系统) / light / dark
+    pub theme: Mutex<String>,
 }
 
 impl UiState {
@@ -50,6 +93,12 @@ impl UiState {
             sent_records: Mutex::new(Vec::new()),
             devtools_open: Mutex::new(false),
             service_port: Mutex::new(0),
+            panel_open: Mutex::new(false),
+            tabs: Mutex::new(vec![TabState { id: 1, url: "about:blank".into(), title: "新标签页".into(), webview: None }]),
+            active_tab: Mutex::new(1),
+            next_tab_id: Mutex::new(2),
+            pending_click: Mutex::new(None),
+            theme: Mutex::new("auto".into()),
         }
     }
 }
@@ -103,36 +152,70 @@ const PAGE_BRIDGE_JS: &str = r##"
 })();
 "##;
 
-/// 创建主窗口 + 三 Webview
+/// 创建主窗口 + 四 Webview(工具栏/页面/覆盖层/面板)
 /// 布局以窗口实际物理尺寸为准(避免 DPI 感知时序导致窗口与子 webview 缩放不一致)
 pub fn create_ui(app: &AppHandle) -> tauri::Result<()> {
     // 主窗口(逻辑 1100x700:150% DPI 下物理 1650x1050,适配常见 1920x1080 屏幕)
+    // 最小尺寸 500x400(逻辑像素),防止窗口拖到过小导致布局崩溃
+    // 背景深色避免启动时白屏闪烁
     let window = WindowBuilder::new(app, "main")
         .title("bt-shell")
         .inner_size(1100.0, 700.0)
+        .min_inner_size(500.0, 400.0)
+        .background_color(tauri::window::Color(20, 20, 20, 255))
+        // 无系统标题栏(窗口控制按钮移到工具栏标签行右侧,布局更紧凑)
+        .decorations(false)
         .build()?;
 
-    // 1. 页面 Webview(左侧,渲染目标网页 + 注入页面桥)
-    window.add_child(
-        WebviewBuilder::new(
-            PAGE_WEBVIEW,
-            WebviewUrl::External("about:blank".parse().unwrap()),
-        )
-        .initialization_script(PAGE_BRIDGE_JS),
+    // 1. 工具栏 Webview(顶部横条:标签 + 地址栏 + 面板开关)
+    // 1. 工具栏 Webview(顶部横条:标签 + 地址栏 + 面板开关)
+    // 创建后先隐藏,布局定位完成后再显示,避免初始 100x100 在左上角闪现
+    let toolbar = window.add_child(
+        WebviewBuilder::new(TOOLBAR_WEBVIEW, WebviewUrl::App("toolbar.html".into())),
         tauri::PhysicalPosition::new(0, 0),
         tauri::PhysicalSize::new(100, 100),
     )?;
+    let _ = toolbar.hide();
 
-    // 2. 覆盖层 Webview(透明,叠加在页面区)
-    window.add_child(
+    // 2. 页面 Webview(工具栏下方,渲染目标网页 + 注入页面桥)
+    // 真多标签:预创建 MAX_TABS 个 page webview(全部先隐藏,布局定位后仅显示第 1 个),
+    // 保证创建顺序 toolbar → page-N → overlay → panel,使 overlay/panel 位于最上
+    for i in 1..=MAX_TABS {
+        let label = format!("{PAGE_WEBVIEW}-{i}");
+        let w = window.add_child(
+            WebviewBuilder::new(
+                &label,
+                // 初始加载自定义新标签页(背景跟随主题,不依赖 webview 默认背景)
+                WebviewUrl::App("newtab.html".into()),
+            )
+            .initialization_script(PAGE_BRIDGE_JS),
+            tauri::PhysicalPosition::new(0, 0),
+            tauri::PhysicalSize::new(100, 100),
+        )?;
+        // 全部先隐藏,避免布局定位前在左上角闪现 100x100 黑框
+        let _ = w.hide();
+    }
+    // 初始标签绑定 webview label
+    {
+        let state = app.state::<UiState>();
+        let mut tabs = state.tabs.lock().unwrap();
+        if let Some(t) = tabs.first_mut() {
+            t.webview = Some(format!("{PAGE_WEBVIEW}-1"));
+        }
+    }
+
+    // 3. 覆盖层 Webview(透明,叠加在页面区)
+    let overlay = window.add_child(
         WebviewBuilder::new(OVERLAY_WEBVIEW, WebviewUrl::App("overlay.html".into()))
             .transparent(true)
             .disable_drag_drop_handler(),
         tauri::PhysicalPosition::new(0, 0),
         tauri::PhysicalSize::new(100, 100),
     )?;
+    // 初始隐藏覆盖层:默认非批注模式,隐藏时不拦截鼠标(页面可正常交互),批注模式开启时显示
+    overlay.hide()?;
 
-    // 3. 面板 Webview(右侧并排)
+    // 4. 面板 Webview(覆盖式浮层,默认隐藏,由工具栏按钮切换)
     window.add_child(
         WebviewBuilder::new(PANEL_WEBVIEW, WebviewUrl::App("index.html".into())),
         tauri::PhysicalPosition::new(100, 0),
@@ -143,8 +226,15 @@ pub fn create_ui(app: &AppHandle) -> tauri::Result<()> {
     let size = window.inner_size()?;
     let scale = window.scale_factor().unwrap_or(1.0);
     apply_layout(app, size, scale)?;
+    // 布局定位完成后显示工具栏与初始标签 page-1(其余预创建 webview 保持隐藏)
+    if let Some(w) = app.get_webview(TOOLBAR_WEBVIEW) {
+        let _ = w.show();
+    }
+    if let Some(w) = app.get_webview("page-1") {
+        let _ = w.show();
+    }
 
-    // 监听窗口 resize/DPI 变化 → 重排三个 webview
+    // 监听窗口 resize/DPI 变化 → 重排 webview
     let handle = app.clone();
     window.on_window_event(move |event| match event {
         tauri::WindowEvent::Resized(size) | tauri::WindowEvent::ScaleFactorChanged { new_inner_size: size, .. } => {
@@ -159,36 +249,97 @@ pub fn create_ui(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-/// 重排三个 webview 的边界(页面/覆盖层占左侧,面板占右侧固定宽度)
+/// 重排 webview 的边界
+/// 工具栏占顶部固定高度;所有页面 Webview(每标签一个)占工具栏下方全宽;
+/// 覆盖层叠加在页面区;面板为右侧覆盖式浮层(关闭时尺寸归零)
 /// size 为窗口物理内尺寸,scale 为窗口缩放因子
-fn apply_layout(app: &AppHandle, size: tauri::PhysicalSize<u32>, scale: f64) -> tauri::Result<()> {
+pub fn apply_layout(app: &AppHandle, size: tauri::PhysicalSize<u32>, scale: f64) -> tauri::Result<()> {
+    let toolbar_h = (TOOLBAR_HEIGHT * scale) as i32;
     let panel_w = (PANEL_WIDTH * scale) as i32;
-    let page_w = size.width as i32 - panel_w;
-    let page_h = size.height as i32;
+    let page_w = size.width as i32;
+    let page_h = size.height as i32 - toolbar_h;
 
-    // 1. 页面 Webview(左侧,渲染目标网页 + 注入页面桥)
-    if let Some(w) = app.get_webview(PAGE_WEBVIEW) {
+    // 1. 工具栏 Webview(顶部横条)
+    if let Some(w) = app.get_webview(TOOLBAR_WEBVIEW) {
         w.set_position(tauri::PhysicalPosition::new(0, 0))?;
-        w.set_size(tauri::PhysicalSize::new(page_w.max(0) as u32, page_h.max(0) as u32))?;
+        w.set_size(tauri::PhysicalSize::new(page_w.max(0) as u32, toolbar_h.max(0) as u32))?;
     }
 
-    // 2. 覆盖层 Webview(透明,叠加在页面区)
+    // 2. 所有页面 Webview(每标签一个,定位到工具栏下方全宽)
+    {
+        let state = app.state::<UiState>();
+        let labels: Vec<String> = state
+            .tabs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.webview.clone())
+            .collect();
+        for label in labels {
+            if let Some(w) = app.get_webview(&label) {
+                w.set_position(tauri::PhysicalPosition::new(0, toolbar_h.max(0)))?;
+                w.set_size(tauri::PhysicalSize::new(page_w.max(0) as u32, page_h.max(0) as u32))?;
+            }
+        }
+    }
+
+    // 3. 覆盖层 Webview(透明,叠加在页面区)
     if let Some(w) = app.get_webview(OVERLAY_WEBVIEW) {
-        w.set_position(tauri::PhysicalPosition::new(0, 0))?;
+        w.set_position(tauri::PhysicalPosition::new(0, toolbar_h.max(0)))?;
         w.set_size(tauri::PhysicalSize::new(page_w.max(0) as u32, page_h.max(0) as u32))?;
     }
 
-    // 3. 面板 Webview(右侧并排)
+    // 4. 面板 Webview(右侧覆盖浮层,panel_open 关闭时尺寸归零隐藏)
     if let Some(w) = app.get_webview(PANEL_WEBVIEW) {
-        w.set_position(tauri::PhysicalPosition::new(page_w.max(0), 0))?;
-        w.set_size(tauri::PhysicalSize::new(panel_w as u32, page_h.max(0) as u32))?;
+        let open = app.state::<UiState>().panel_open.lock().unwrap().clone();
+        let (px, pw) = if open {
+            (page_w - panel_w, panel_w)
+        } else {
+            (page_w, 0)
+        };
+        w.set_position(tauri::PhysicalPosition::new(px.max(0), toolbar_h.max(0)))?;
+        w.set_size(tauri::PhysicalSize::new(pw.max(0) as u32, page_h.max(0) as u32))?;
     }
     Ok(())
 }
 
-/// 获取页面 Webview
-pub fn page_webview(app: &AppHandle) -> Option<tauri::webview::Webview> {
-    app.get_webview(PAGE_WEBVIEW)
+/// 获取激活标签的页面 Webview(真多标签:按 active_tab 的 webview label)
+pub fn active_page_webview(app: &AppHandle) -> Option<tauri::webview::Webview> {
+    let state = app.state::<UiState>();
+    let active = *state.active_tab.lock().unwrap();
+    let label = state
+        .tabs
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|t| t.id == active)
+        .and_then(|t| t.webview.clone())?;
+    app.get_webview(&label)
+}
+
+/// 动态创建标签页面 Webview(真多标签,每标签一个,初始隐藏)
+pub fn create_tab_webview(app: &AppHandle, id: u32) -> Result<tauri::webview::Webview, String> {
+    // add_child 定义在 tauri::Window(需 get_window,而非 get_webview_window)
+    let window = app.get_window("main").ok_or("main window not found")?;
+    let label = format!("{PAGE_WEBVIEW}-{id}");
+    let w = window
+        .add_child(
+            WebviewBuilder::new(&label, WebviewUrl::App("newtab.html".into()))
+                .initialization_script(PAGE_BRIDGE_JS),
+            tauri::PhysicalPosition::new(0, 0),
+            tauri::PhysicalSize::new(100, 100),
+        )
+        .map_err(|e| format!("create page webview failed: {e}"))?;
+    // 初始隐藏,切换到该标签时才显示
+    let _ = w.hide();
+    // 应用布局(定位到页面区)
+    if let Some(win) = app.get_window("main") {
+        if let Ok(size) = win.inner_size() {
+            let scale = win.scale_factor().unwrap_or(1.0);
+            let _ = apply_layout(app, size, scale);
+        }
+    }
+    Ok(w)
 }
 
 /// 获取覆盖层 Webview
@@ -201,10 +352,44 @@ pub fn panel_webview(app: &AppHandle) -> Option<tauri::webview::Webview> {
     app.get_webview(PANEL_WEBVIEW)
 }
 
-/// 在页面 Webview 执行 JS,返回 JSON 结果(控制协议核心)
+/// 获取工具栏 Webview
+pub fn toolbar_webview(app: &AppHandle) -> Option<tauri::webview::Webview> {
+    app.get_webview(TOOLBAR_WEBVIEW)
+}
+
+/// 同步激活标签的 URL/标题(页面导航后调用,保持工具栏显示一致)
+pub fn sync_active_tab(app: &AppHandle, url: &str, title: &str) {
+    let state = app.state::<UiState>();
+    let active = *state.active_tab.lock().unwrap();
+    let mut tabs = state.tabs.lock().unwrap();
+    if let Some(t) = tabs.iter_mut().find(|t| t.id == active) {
+        if !url.is_empty() {
+            t.url = url.to_string();
+        }
+        if !title.is_empty() {
+            t.title = title.to_string();
+        }
+    }
+}
+
+/// 规范化地址栏输入:裸域名/主机自动补 http:// 前缀
+/// 已含协议(http/https/file/data/about 等含 :// 或专属前缀)则原样返回
+pub fn normalize_url(raw: &str) -> String {
+    let t = raw.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    if t.contains("://") || t.starts_with("about:") || t.starts_with("data:") || t.starts_with("file:") {
+        t.to_string()
+    } else {
+        format!("http://{t}")
+    }
+}
+
+/// 在激活页面 Webview 执行 JS,返回 JSON 结果(控制协议核心)
 pub fn eval_page(app: &AppHandle, js: &str) -> Result<String, String> {
     let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
-    let page = page_webview(app).ok_or("page webview not ready")?;
+    let page = active_page_webview(app).ok_or("page webview not ready")?;
     page.eval_with_callback(
         js,
         move |result| {

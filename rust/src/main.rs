@@ -5,8 +5,9 @@
 
 use std::sync::Arc;
 
+use bt_shell::control;
 use bt_shell::ui::annotate::Annotator;
-use bt_shell::ui::{self, AnnotationRecord};
+use bt_shell::ui::{self, AnnotationRecord, TabState};
 use tauri::{Listener, Manager, State};
 
 /// 解析命令行参数(兼容旧 Node 服务协议)
@@ -92,6 +93,328 @@ fn panel_service_port(state: State<ui::UiState>) -> u16 {
     *state.service_port.lock().unwrap()
 }
 
+/// 设置主题模式(auto/light/dark),广播给所有 webview 生效
+#[tauri::command]
+fn panel_set_theme(app: tauri::AppHandle, state: State<'_, ui::UiState>, theme: String) -> Result<(), String> {
+    if !matches!(theme.as_str(), "auto" | "light" | "dark") {
+        return Err(format!("invalid theme: {theme} (auto/light/dark)"));
+    }
+    *state.theme.lock().unwrap() = theme.clone();
+    // 页面 webview 背景跟随主题(用 webview 背景色,不注入修改网页)
+    let bg = match theme.as_str() {
+        "light" => Some(tauri::window::Color(245, 245, 245, 255)),
+        _ => Some(tauri::window::Color(24, 24, 24, 255)),
+    };
+    for i in 1..=ui::MAX_TABS {
+        if let Some(w) = app.get_webview(&format!("page-{i}")) {
+            let _ = w.set_background_color(bg);
+        }
+    }
+    use tauri::Emitter;
+    let _ = app.emit("theme-changed", theme);
+    Ok(())
+}
+
+// ---- 标签状态统一管理:后台轮询检测变化,有变更才广播事件,前端只响应事件不轮询 ----
+
+/// 组装并广播标签状态(tabs/active/panel_open),前端监听 "tabs-changed" 更新
+fn emit_tabs_changed(app: &tauri::AppHandle) {
+    let state = app.state::<ui::UiState>();
+    let tabs = state.tabs.lock().unwrap().clone();
+    let active = *state.active_tab.lock().unwrap();
+    let panel_open = *state.panel_open.lock().unwrap();
+    use tauri::Emitter;
+    let _ = app.emit(
+        "tabs-changed",
+        serde_json::json!({ "tabs": tabs, "active": active, "panel_open": panel_open }),
+    );
+}
+
+/// 后台轮询:刷新激活标签的标题/URL(页面导航后 title 变化),返回是否有变化
+fn poll_tab_title(app: &tauri::AppHandle) -> bool {
+    let state = app.state::<ui::UiState>();
+    let active = *state.active_tab.lock().unwrap();
+    // 当前激活标签的 title/url 快照
+    let before = state
+        .tabs
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|t| t.id == active)
+        .map(|t| (t.title.clone(), t.url.clone()));
+    // 从页面 webview 读取最新状态(阻塞线程 eval)
+    let handle = app.clone();
+    let page = tokio::task::block_in_place(move || control::page_state(&handle)).ok();
+    let mut changed = false;
+    if let Some(page) = page {
+        let url = page["url"].as_str().unwrap_or("").to_string();
+        let title = page["title"].as_str().unwrap_or("").to_string();
+        let state = app.state::<ui::UiState>();
+        let mut tabs = state.tabs.lock().unwrap();
+        if let Some(t) = tabs.iter_mut().find(|t| t.id == active) {
+            if !url.is_empty() {
+                t.url = url.clone();
+            }
+            if !title.is_empty() {
+                t.title = title.clone();
+            }
+            changed = before != Some((t.title.clone(), t.url.clone()));
+        }
+    }
+    changed
+}
+
+// ---- 工具栏命令:标签(伪多标签) + 地址栏导航 + 面板浮层开关 ----
+// 注意:tauri command 默认在主线程执行,而 control::eval 的回调也需要主线程事件循环,
+// 直接调用会死锁卡死整个窗口。因此涉及 eval 的操作一律 async + block_in_place 放到阻塞线程执行。
+
+/// 在阻塞线程执行 UI 控制操作(避免 command 主线程与 eval 回调互等死锁)
+fn ui_block<T, F>(app: &tauri::AppHandle, f: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(&tauri::AppHandle) -> Result<T, String> + Send + 'static,
+{
+    let handle = app.clone();
+    tokio::task::block_in_place(move || f(&handle))
+}
+
+/// 工具栏状态:标签列表 + 激活标签 + 面板开关(同时刷新激活标签的 URL/标题)
+#[tauri::command]
+async fn toolbar_state(app: tauri::AppHandle, state: State<'_, ui::UiState>) -> Result<serde_json::Value, String> {
+    let active = *state.active_tab.lock().unwrap();
+    // 从页面 webview 刷新激活标签的 url/title(阻塞线程执行,避免死锁)
+    if let Ok(page) = ui_block(&app, |h| control::page_state(h)) {
+        let url = page["url"].as_str().unwrap_or("").to_string();
+        let title = page["title"].as_str().unwrap_or("").to_string();
+        let mut tabs = state.tabs.lock().unwrap();
+        if let Some(t) = tabs.iter_mut().find(|t| t.id == active) {
+            if !url.is_empty() { t.url = url; }
+            if !title.is_empty() { t.title = title; }
+        }
+    }
+    let tabs = state.tabs.lock().unwrap().clone();
+    let panel_open = *state.panel_open.lock().unwrap();
+    Ok(serde_json::json!({ "tabs": tabs, "active": active, "panel_open": panel_open }))
+}
+
+/// 新增标签:创建独立页面 Webview(默认 about:blank),切换到新标签
+/// 真多标签:每标签一个 webview,切换只显隐不重新加载
+#[tauri::command]
+async fn toolbar_new_tab(app: tauri::AppHandle, state: State<'_, ui::UiState>, url: Option<String>) -> Result<(), String> {
+    let url = ui::normalize_url(&url.unwrap_or_else(|| ui::NEWTAB_URL.to_string()));
+    let id = {
+        let mut n = state.next_tab_id.lock().unwrap();
+        let id = *n;
+        *n += 1;
+        id
+    };
+    // 隐藏当前激活 webview
+    if let Some(cur) = ui::active_page_webview(&app) {
+        let _ = cur.hide();
+    }
+    // 优先复用预创建 webview,超出 MAX_TABS 则动态创建
+    let label = format!("page-{id}");
+    let wv = match app.get_webview(&label) {
+        Some(w) => w,
+        None => ui::create_tab_webview(&app, id)?,
+    };
+    wv.show().map_err(|e| format!("show webview failed: {e}"))?;
+    // 记录标签并导航
+    {
+        let mut tabs = state.tabs.lock().unwrap();
+        if let Some(t) = tabs.iter_mut().find(|t| t.id == id) {
+            t.url = url.clone();
+            t.title = "新标签页".into();
+            t.webview = Some(label);
+        } else {
+            tabs.push(TabState { id, url: url.clone(), title: "新标签页".into(), webview: Some(label) });
+        }
+        *state.active_tab.lock().unwrap() = id;
+    }
+    ui_block(&app, move |h| control::navigate(h, &url))?;
+    // 应用布局:将新标签 webview 定位到页面区全尺寸(预创建时仅在初始 100x100 位置)
+    if let Some(win) = app.get_window("main") {
+        let size = win.inner_size().map_err(|e| e.to_string())?;
+        let scale = win.scale_factor().unwrap_or(1.0);
+        ui::apply_layout(&app, size, scale).map_err(|e| e.to_string())?;
+    }
+    emit_tabs_changed(&app);
+    Ok(())
+}
+
+/// 切换标签:隐藏当前 webview,显示目标 webview(不重新加载,保留页面状态)
+#[tauri::command]
+async fn toolbar_switch_tab(app: tauri::AppHandle, state: State<'_, ui::UiState>, id: u32) -> Result<(), String> {
+    let active = *state.active_tab.lock().unwrap();
+    if active == id {
+        return Ok(());
+    }
+    let (cur_label, target_label) = {
+        let tabs = state.tabs.lock().unwrap();
+        (
+            tabs.iter().find(|t| t.id == active).and_then(|t| t.webview.clone()),
+            tabs.iter().find(|t| t.id == id).and_then(|t| t.webview.clone()),
+        )
+    };
+    if let Some(l) = cur_label {
+        if let Some(w) = app.get_webview(&l) {
+            let _ = w.hide();
+        }
+    }
+    if let Some(l) = target_label {
+        if let Some(w) = app.get_webview(&l) {
+            w.show().map_err(|e| format!("show webview failed: {e}"))?;
+        }
+    }
+    *state.active_tab.lock().unwrap() = id;
+    emit_tabs_changed(&app);
+    Ok(())
+}
+
+/// 关闭标签:销毁其 webview,切换到邻近标签(关闭最后一个则自动新建空白标签)
+#[tauri::command]
+async fn toolbar_close_tab(app: tauri::AppHandle, state: State<'_, ui::UiState>, id: u32) -> Result<(), String> {
+    let mut tabs = state.tabs.lock().unwrap();
+    let pos = tabs.iter().position(|t| t.id == id);
+    let Some(pos) = pos else { return Err("tab not found".into()) };
+    let closed_label = tabs[pos].webview.clone();
+    tabs.remove(pos);
+    let active = *state.active_tab.lock().unwrap();
+    let new_active;
+    if active != id {
+        drop(tabs);
+        return Ok(());
+    }
+    if tabs.is_empty() {
+        // 关闭最后一个:自动新建空白标签
+        let nid = {
+            let mut n = state.next_tab_id.lock().unwrap();
+            let nid = *n;
+            *n += 1;
+            nid
+        };
+        tabs.push(TabState { id: nid, url: ui::NEWTAB_URL.to_string(), title: "新标签页".into(), webview: None });
+        new_active = nid;
+    } else {
+        // 优先激活右侧标签,否则左侧
+        new_active = tabs[pos.min(tabs.len() - 1)].id;
+    }
+    *state.active_tab.lock().unwrap() = new_active;
+    let target_label = tabs.iter().find(|t| t.id == new_active).and_then(|t| t.webview.clone());
+    drop(tabs);
+
+    // 新建空白标签:优先复用预创建 webview,否则动态创建
+    if target_label.is_none() {
+        let label = format!("page-{new_active}");
+        let wv = match app.get_webview(&label) {
+            Some(w) => w,
+            None => ui::create_tab_webview(&app, new_active)?,
+        };
+        wv.show().map_err(|e| format!("show webview failed: {e}"))?;
+        {
+            let mut tabs = state.tabs.lock().unwrap();
+            if let Some(t) = tabs.iter_mut().find(|t| t.id == new_active) {
+                t.webview = Some(label);
+            }
+        }
+    }
+    // 显示目标 webview(若未隐藏则无操作)
+    if let Some(l) = &target_label {
+        if let Some(w) = app.get_webview(l) {
+            let _ = w.show();
+        }
+    }
+    // 隐藏被关闭标签的 webview(保留实例,避免 z 序变化影响 overlay/panel)
+    if let Some(l) = closed_label {
+        if let Some(w) = app.get_webview(&l) {
+            let _ = w.hide();
+        }
+    }
+    // 新建空白标签导航新标签页
+    if target_label.is_none() {
+        ui_block(&app, |h| control::navigate(h, ui::NEWTAB_URL))?;
+    }
+    // 应用布局:确保激活标签 webview 尺寸正确
+    if let Some(win) = app.get_window("main") {
+        let size = win.inner_size().map_err(|e| e.to_string())?;
+        let scale = win.scale_factor().unwrap_or(1.0);
+        ui::apply_layout(&app, size, scale).map_err(|e| e.to_string())?;
+    }
+    emit_tabs_changed(&app);
+    Ok(())
+}
+
+/// 地址栏导航:更新激活标签 URL 并导航
+#[tauri::command]
+async fn toolbar_navigate(app: tauri::AppHandle, state: State<'_, ui::UiState>, url: String) -> Result<(), String> {
+    if url.is_empty() {
+        return Err("url is required".into());
+    }
+    // 裸域名自动补 http://
+    let url = ui::normalize_url(&url);
+    let active = *state.active_tab.lock().unwrap();
+    let mut tabs = state.tabs.lock().unwrap();
+    if let Some(t) = tabs.iter_mut().find(|t| t.id == active) {
+        t.url = url.clone();
+    }
+    drop(tabs);
+    ui_block(&app, move |h| control::navigate(h, &url))?;
+    emit_tabs_changed(&app);
+    Ok(())
+}
+
+/// 切换面板浮层显示,返回新状态
+#[tauri::command]
+fn toolbar_toggle_panel(app: tauri::AppHandle, state: State<'_, ui::UiState>) -> Result<bool, String> {
+    let mut open = state.panel_open.lock().unwrap();
+    *open = !*open;
+    let now = *open;
+    drop(open);
+    // 打开面板时退出批注模式(批注与面板互斥,避免覆盖层拦截面板操作)
+    if now {
+        let annotate = *state.annotate_mode.lock().unwrap();
+        if annotate {
+            let _ = Annotator::toggle(&app, &state);
+        }
+        // 显示覆盖层 + 半透明遮罩(覆盖页面区,点击遮罩关闭面板)
+        if let Some(overlay) = ui::overlay_webview(&app) {
+            let _ = overlay.show();
+        }
+        let _ = ui::eval_overlay(&app, "window.__btOverlay.showMask()");
+    } else {
+        // 关闭面板:隐藏遮罩与覆盖层
+        let _ = ui::eval_overlay(&app, "window.__btOverlay.hideMask()");
+        if let Some(overlay) = ui::overlay_webview(&app) {
+            let _ = overlay.hide();
+        }
+    }
+    if let Some(win) = app.get_window("main") {
+        let size = win.inner_size().map_err(|e| e.to_string())?;
+        let scale = win.scale_factor().unwrap_or(1.0);
+        ui::apply_layout(&app, size, scale).map_err(|e| e.to_string())?;
+    }
+    emit_tabs_changed(&app);
+    Ok(now)
+}
+
+/// 页面后退(返回历史上一页,通过 eval history.back,阻塞线程执行)
+#[tauri::command]
+async fn toolbar_go_back(app: tauri::AppHandle) -> Result<(), String> {
+    ui_block(&app, |h| control::eval(h, "history.back()").map(|_| ()))
+}
+
+/// 页面前进(通过 eval history.forward)
+#[tauri::command]
+async fn toolbar_go_forward(app: tauri::AppHandle) -> Result<(), String> {
+    ui_block(&app, |h| control::eval(h, "history.forward()").map(|_| ()))
+}
+
+/// 页面刷新(通过 eval location.reload)
+#[tauri::command]
+async fn toolbar_reload(app: tauri::AppHandle) -> Result<(), String> {
+    ui_block(&app, |h| control::eval(h, "location.reload()").map(|_| ()))
+}
+
 fn main() {
     // 显式声明 DPI 感知(否则窗口被系统虚拟化缩放,与 WebView2 真实 DPI 不一致导致布局错位)
     #[cfg(windows)]
@@ -108,7 +431,17 @@ fn main() {
             panel_records,
             panel_set_note,
             panel_cmd,
-            panel_service_port
+            panel_service_port,
+            panel_set_theme,
+            toolbar_state,
+            toolbar_new_tab,
+            toolbar_switch_tab,
+            toolbar_close_tab,
+            toolbar_navigate,
+            toolbar_toggle_panel,
+            toolbar_go_back,
+            toolbar_go_forward,
+            toolbar_reload
         ])
         .setup(move |app| {
             // 创建三 Webview 布局
@@ -138,6 +471,20 @@ fn main() {
                     if let Ok(ev) = serde_json::from_str::<serde_json::Value>(payload) {
                         let state = handle.state::<ui::UiState>();
                         Annotator::on_input(&handle, &state, &ev);
+                    }
+                });
+            }
+
+            // 标签状态统一管理:后台每秒轮询检测标题/URL 变化,有变更才广播 tabs-changed
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        let changed = tokio::task::block_in_place(|| poll_tab_title(&handle));
+                        if changed {
+                            emit_tabs_changed(&handle);
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
                     }
                 });
             }

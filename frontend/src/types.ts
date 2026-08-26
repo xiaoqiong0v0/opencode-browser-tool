@@ -32,4 +32,9 @@ export interface OverlayApi {
   redraw(rects: HighlightRect[], marks: AnnotationMark[]): void;
   /** 显示通知气泡(message/type: ok|bad|err) */
   notify(message: string, type?: string): void;
+  /** 在坐标处显示批注输入弹框(点击元素后调用) */
+  showNoteInput(x: number, y: number, selector: string): void;
+  /** 显示/隐藏面板遮罩(面板打开时覆盖页面区,点击关闭) */
+  showMask(): void;
+  hideMask(): void;
 }

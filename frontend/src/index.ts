@@ -1,15 +1,18 @@
-// 面板 Webview 入口:批注列表 + 操作按钮 + 说明输入 + 设备切换/开发者工具
+// 面板 Webview 入口:批注列表 + 操作按钮 + 说明输入 + 设备切换/开发者工具/主题切换
 // 与 Rust 通过 Tauri event/invoke 通信,设备/开发者工具走 HTTP /api/*
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { AnnotationRecord } from "./types";
+import { applyTheme, getTheme, initTheme, saveTheme } from "./theme";
 
 /** DOM 引用集合 */
 interface PanelDoms {
   btnAnnotate: HTMLButtonElement;
   btnSend: HTMLButtonElement;
   btnDevtools: HTMLButtonElement;
+  btnPanelClose: HTMLButtonElement;
   deviceSelect: HTMLSelectElement;
+  themeSelect: HTMLSelectElement;
   records: HTMLDivElement;
   note: HTMLTextAreaElement;
 }
@@ -24,7 +27,9 @@ class Panel {
       btnAnnotate: document.getElementById("btn-annotate") as HTMLButtonElement,
       btnSend: document.getElementById("btn-send") as HTMLButtonElement,
       btnDevtools: document.getElementById("btn-devtools") as HTMLButtonElement,
+      btnPanelClose: document.getElementById("btn-panel-close") as HTMLButtonElement,
       deviceSelect: document.getElementById("device-select") as HTMLSelectElement,
+      themeSelect: document.getElementById("theme-select") as HTMLSelectElement,
       records: document.getElementById("records") as HTMLDivElement,
       note: document.getElementById("note") as HTMLTextAreaElement,
     };
@@ -32,6 +37,20 @@ class Panel {
   }
 
   private bindEvents(): void {
+    // 双 tab 切换:AI 功能区 / 配置区
+    const tabAi = document.getElementById("tab-ai") as HTMLButtonElement;
+    const tabConfig = document.getElementById("tab-config") as HTMLButtonElement;
+    const paneAi = document.getElementById("tab-ai-pane") as HTMLDivElement;
+    const paneConfig = document.getElementById("tab-config-pane") as HTMLDivElement;
+    const switchTab = (which: "ai" | "config") => {
+      tabAi.classList.toggle("active", which === "ai");
+      tabConfig.classList.toggle("active", which === "config");
+      paneAi.hidden = which !== "ai";
+      paneConfig.hidden = which !== "config";
+    };
+    tabAi.addEventListener("click", () => switchTab("ai"));
+    tabConfig.addEventListener("click", () => switchTab("config"));
+
     this.doms.btnAnnotate.addEventListener("click", () => {
       void invoke<boolean>("panel_cmd", { cmd: "toggle-annotate" }).then((on) => {
         this.doms.btnAnnotate.classList.toggle("active", on);
@@ -61,6 +80,18 @@ class Panel {
           this.doms.btnDevtools.classList.toggle("active", !!r.data?.open);
         })
         .catch((e) => console.error("[panel] devtools failed:", e));
+    });
+    // 收起面板(覆盖式浮层关闭)
+    this.doms.btnPanelClose.addEventListener("click", () => {
+      void invoke<boolean>("toolbar_toggle_panel");
+    });
+    // 主题切换:本地持久化 + 广播所有 webview
+    this.doms.themeSelect.value = getTheme();
+    this.doms.themeSelect.addEventListener("change", () => {
+      const mode = this.doms.themeSelect.value;
+      saveTheme(mode);
+      applyTheme(mode);
+      void invoke("panel_set_theme", { theme: mode }).catch((e) => console.error("[panel] set theme failed:", e));
     });
     // Rust 推送记录变更
     void listen<AnnotationRecord[]>("records-changed", (e) => {
@@ -137,4 +168,5 @@ class Panel {
 
 const panel = new Panel();
 void panel.init();
+void initTheme();
 console.log("[panel] ready");
