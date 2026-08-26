@@ -65,26 +65,22 @@ fn panel_cmd(
     println!("[panel-cmd] {cmd}");
     match cmd.as_str() {
         "toggle-annotate" => Annotator::toggle(&app, &state),
+        "toggle-shot" => Annotator::toggle_shot(&app, &state),
         "send-all" => {
-            // 发送批注:记录快照入队,插件端轮询 consume
-            let records = state.records.lock().unwrap().clone();
-            let count = records.len();
-            let items: Vec<serde_json::Value> = records
-                .iter()
-                .map(|r| {
-                    serde_json::json!({
-                        "index": r.index,
-                        "selector": r.selector,
-                        "rect": [r.rect.0, r.rect.1, r.rect.2, r.rect.3],
-                        "note": r.note,
-                    })
-                })
-                .collect();
-            *state.sent_records.lock().unwrap() = items;
+            // 发送所有记录:快照入队,插件端轮询 consume
+            let count = ui::send_all_records(&app);
             Ok(count > 0)
         }
         _ => Err(format!("unknown panel cmd: {cmd}")),
     }
+}
+
+/// 面板获取当前模式状态(批注/截图开关),用于按钮激活态恢复
+#[tauri::command]
+fn panel_mode(state: State<ui::UiState>) -> serde_json::Value {
+    let annotate = *state.annotate_mode.lock().unwrap();
+    let shot = *state.shot_mode.lock().unwrap();
+    serde_json::json!({ "annotate": annotate, "shot": shot })
 }
 
 /// 面板获取 HTTP 服务端口(用于 fetch /api/* 调用设备切换/开发者工具)
@@ -116,19 +112,6 @@ fn panel_set_theme(app: tauri::AppHandle, state: State<'_, ui::UiState>, theme: 
 }
 
 // ---- 标签状态统一管理:后台轮询检测变化,有变更才广播事件,前端只响应事件不轮询 ----
-
-/// 组装并广播标签状态(tabs/active/panel_open),前端监听 "tabs-changed" 更新
-fn emit_tabs_changed(app: &tauri::AppHandle) {
-    let state = app.state::<ui::UiState>();
-    let tabs = state.tabs.lock().unwrap().clone();
-    let active = *state.active_tab.lock().unwrap();
-    let panel_open = *state.panel_open.lock().unwrap();
-    use tauri::Emitter;
-    let _ = app.emit(
-        "tabs-changed",
-        serde_json::json!({ "tabs": tabs, "active": active, "panel_open": panel_open }),
-    );
-}
 
 /// 后台轮询:刷新激活标签的标题/URL(页面导航后 title 变化),返回是否有变化
 fn poll_tab_title(app: &tauri::AppHandle) -> bool {
@@ -238,7 +221,7 @@ async fn toolbar_new_tab(app: tauri::AppHandle, state: State<'_, ui::UiState>, u
         let scale = win.scale_factor().unwrap_or(1.0);
         ui::apply_layout(&app, size, scale).map_err(|e| e.to_string())?;
     }
-    emit_tabs_changed(&app);
+    ui::emit_tabs_changed(&app);
     Ok(())
 }
 
@@ -267,7 +250,7 @@ async fn toolbar_switch_tab(app: tauri::AppHandle, state: State<'_, ui::UiState>
         }
     }
     *state.active_tab.lock().unwrap() = id;
-    emit_tabs_changed(&app);
+    ui::emit_tabs_changed(&app);
     Ok(())
 }
 
@@ -340,7 +323,7 @@ async fn toolbar_close_tab(app: tauri::AppHandle, state: State<'_, ui::UiState>,
         let scale = win.scale_factor().unwrap_or(1.0);
         ui::apply_layout(&app, size, scale).map_err(|e| e.to_string())?;
     }
-    emit_tabs_changed(&app);
+    ui::emit_tabs_changed(&app);
     Ok(())
 }
 
@@ -359,7 +342,7 @@ async fn toolbar_navigate(app: tauri::AppHandle, state: State<'_, ui::UiState>, 
     }
     drop(tabs);
     ui_block(&app, move |h| control::navigate(h, &url))?;
-    emit_tabs_changed(&app);
+    ui::emit_tabs_changed(&app);
     Ok(())
 }
 
@@ -393,7 +376,7 @@ fn toolbar_toggle_panel(app: tauri::AppHandle, state: State<'_, ui::UiState>) ->
         let scale = win.scale_factor().unwrap_or(1.0);
         ui::apply_layout(&app, size, scale).map_err(|e| e.to_string())?;
     }
-    emit_tabs_changed(&app);
+    ui::emit_tabs_changed(&app);
     Ok(now)
 }
 
@@ -431,6 +414,7 @@ fn main() {
             panel_records,
             panel_set_note,
             panel_cmd,
+            panel_mode,
             panel_service_port,
             panel_set_theme,
             toolbar_state,
@@ -482,7 +466,7 @@ fn main() {
                     loop {
                         let changed = tokio::task::block_in_place(|| poll_tab_title(&handle));
                         if changed {
-                            emit_tabs_changed(&handle);
+                            ui::emit_tabs_changed(&handle);
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
                     }

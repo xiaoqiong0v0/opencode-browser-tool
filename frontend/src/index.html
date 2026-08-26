@@ -11,13 +11,13 @@
         --bg: #1e1e1e; --fg: #ddd; --fg-dim: #aaa;
         --panel-bg: #2a2a2a; --panel-hover: #333; --rec-bg: #242424;
         --border: #444; --rec-border: #333; --muted: #888; --empty: #666;
-        --accent: #4caf50; --accent-active: #3d5a3d;
+        --accent: #4caf50; --accent-active: #3d5a3d; --accent-blue: #3b5bdb;
       }
       [data-theme="light"] {
         --bg: #f5f5f5; --fg: #333; --fg-dim: #666;
         --panel-bg: #fff; --panel-hover: #ececec; --rec-bg: #fff;
         --border: #d0d0d0; --rec-border: #e0e0e0; --muted: #888; --empty: #999;
-        --accent: #2e7d32; --accent-active: #c8e6c9;
+        --accent: #2e7d32; --accent-active: #c8e6c9; --accent-blue: #2f52c4;
       }
       html, body { width: 100%; height: 100%; }
       body {
@@ -33,7 +33,6 @@
       }
       h3 { font-size: 14px; color: var(--fg-dim); font-weight: 600; }
       button {
-        width: 100%;
         padding: 8px 0;
         cursor: pointer;
         border: 1px solid var(--border);
@@ -41,7 +40,12 @@
         background: var(--panel-bg);
         color: var(--fg);
         font-size: 13px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 6px;
       }
+      button svg { width: 16px; height: 16px; }
       button:hover { background: var(--panel-hover); }
       button.active { background: var(--accent-active); border-color: var(--accent); }
       select {
@@ -60,6 +64,7 @@
         width: 24px; padding: 0; height: 22px; border-radius: 4px;
         border: 1px solid var(--border); background: var(--panel-bg); color: var(--muted); cursor: pointer;
       }
+      #btn-panel-close svg { width: 14px; height: 14px; }
       #btn-panel-close:hover { background: var(--panel-hover); color: var(--fg); }
       /* 双 tab 切换 */
       .tabs { display: flex; gap: 4px; }
@@ -71,6 +76,8 @@
       .pane[hidden] { display: none; }
       #tab-ai-pane { flex: 1; }
       .pane-head { display: flex; align-items: center; justify-content: space-between; }
+      /* 顶部功能按钮:批注 + 截图 */
+      #btn-shot.active { background: var(--accent-active); border-color: var(--accent-blue); }
       #records {
         flex: 1;
         overflow-y: auto;
@@ -80,40 +87,41 @@
         background: var(--rec-bg);
       }
       .rec { padding: 4px 2px; border-bottom: 1px solid var(--rec-border); word-break: break-all; }
+      .rec-head { display: flex; align-items: center; gap: 6px; }
+      .rec-tag {
+        font-size: 11px; padding: 1px 5px; border-radius: 3px; color: #fff; flex-shrink: 0;
+      }
+      .rec-tag.annotate { background: #4a6d5a; }
+      .rec-tag.screenshot { background: #3b5bdb; }
+      .rec-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .rec-note { color: var(--muted); font-size: 12px; margin-top: 2px; }
+      .rec-thumb { max-width: 100%; border-radius: 4px; margin-top: 4px; border: 1px solid var(--rec-border); }
       .empty { color: var(--empty); text-align: center; padding: 20px 0; }
+      #btn-send { background: var(--accent-blue); color: #fff; border-color: var(--accent-blue); }
+      #btn-send:hover { filter: brightness(1.1); }
       #send-result { font-size: 12px; text-align: center; min-height: 16px; }
       .send-ok { color: var(--accent); }
       .send-empty { color: var(--empty); }
-      textarea {
-        width: 100%;
-        height: 70px;
-        resize: none;
-        background: var(--panel-bg);
-        color: var(--fg);
-        border: 1px solid var(--border);
-        border-radius: 4px;
-        padding: 6px;
-        font-family: inherit;
-      }
     </style>
   </head>
   <body>
     <div class="head">
       <h3>bt-shell 面板</h3>
-      <button id="btn-panel-close" title="收起面板">✕</button>
+      <button id="btn-panel-close" title="收起面板"><i data-lucide="x"></i></button>
     </div>
     <div class="tabs">
       <button id="tab-ai" class="tab-btn active">🤖 AI 功能</button>
       <button id="tab-config" class="tab-btn">⚙ 配置</button>
     </div>
-    <!-- Tab1:AI 功能区 -->
+    <!-- Tab1:AI 功能区(顶部功能按钮 → 中间记录 → 底部发送) -->
     <div id="tab-ai-pane" class="pane">
-      <button id="btn-annotate">✏️ 批注模式</button>
-      <button id="btn-send">📤 发送全部</button>
-      <div id="send-result" class="send-empty"></div>
+      <div class="row">
+        <button id="btn-annotate"><i data-lucide="pen-line"></i>批注</button>
+        <button id="btn-shot"><i data-lucide="camera"></i>截图</button>
+      </div>
       <div id="records"></div>
-      <textarea id="note" placeholder="批注说明..."></textarea>
+      <button id="btn-send"><i data-lucide="send"></i>发送</button>
+      <div id="send-result" class="send-empty"></div>
     </div>
     <!-- Tab2:配置区(外观放顶部) -->
     <div id="tab-config-pane" class="pane" hidden>

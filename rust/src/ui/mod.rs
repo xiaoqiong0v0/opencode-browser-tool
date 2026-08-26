@@ -50,13 +50,33 @@ pub struct PendingClick {
     pub rect: (i32, i32, i32, i32),
 }
 
-/// 批注记录(Rust 侧持有,推送面板)
+/// 待确认截图(双击全屏/框选后显示预览,保存/取消后清除)
+#[derive(Debug, Clone)]
+pub struct PendingShot {
+    /// PNG base64(不含 data: 前缀,推送 opencode 时直接作为 file.data)
+    pub image: String,
+    /// 截图区域(视口 CSS 像素坐标)
+    pub rect: (i32, i32, i32, i32),
+}
+
+/// 记录类型:批注
+pub const RECORD_ANNOTATE: &str = "annotate";
+/// 记录类型:截图
+pub const RECORD_SCREENSHOT: &str = "screenshot";
+
+/// 批注/截图记录(Rust 侧持有,推送面板)
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AnnotationRecord {
     pub index: u32,
+    /// 记录类型:annotate(批注) / screenshot(截图)
+    #[serde(rename = "type")]
+    pub typ: String,
     pub selector: String,
     pub rect: (i32, i32, i32, i32),
     pub note: String,
+    /// 截图记录:Png base64(仅 screenshot 类型有值)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
 }
 
 /// UI 状态(跨线程共享)
@@ -81,6 +101,10 @@ pub struct UiState {
     pub next_tab_id: Mutex<u32>,
     /// 待确认批注(点击元素后弹框确认,未提交前不入列)
     pub pending_click: Mutex<Option<PendingClick>>,
+    /// 待确认截图(截图模式截取后待保存)
+    pub pending_shot: Mutex<Option<PendingShot>>,
+    /// 截图模式开关(截图模式下 overlay 拦截鼠标,双击截全屏/框选截区域)
+    pub shot_mode: Mutex<bool>,
     /// 主题模式:auto(跟随系统) / light / dark
     pub theme: Mutex<String>,
 }
@@ -98,6 +122,8 @@ impl UiState {
             active_tab: Mutex::new(1),
             next_tab_id: Mutex::new(2),
             pending_click: Mutex::new(None),
+            pending_shot: Mutex::new(None),
+            shot_mode: Mutex::new(false),
             theme: Mutex::new("auto".into()),
         }
     }
@@ -370,6 +396,45 @@ pub fn sync_active_tab(app: &AppHandle, url: &str, title: &str) {
             t.title = title.to_string();
         }
     }
+}
+
+/// 组装并广播标签状态(tabs/active/panel_open),前端监听 "tabs-changed" 更新
+/// 所有会改变标签/面板状态的路径都必须调用,保持工具栏/面板 UI 同步
+pub fn emit_tabs_changed(app: &AppHandle) {
+    use tauri::Emitter;
+    let state = app.state::<UiState>();
+    let tabs = state.tabs.lock().unwrap().clone();
+    let active = *state.active_tab.lock().unwrap();
+    let panel_open = *state.panel_open.lock().unwrap();
+    let _ = app.emit(
+        "tabs-changed",
+        serde_json::json!({ "tabs": tabs, "active": active, "panel_open": panel_open }),
+    );
+}
+
+/// 发送所有记录:快照入 sent_records 队列(插件端轮询 consume),返回记录数量
+/// 面板"发送"按钮、截图模式"发送"按钮共用
+pub fn send_all_records(app: &AppHandle) -> usize {
+    let state = app.state::<UiState>();
+    let records = state.records.lock().unwrap();
+    let count = records.len();
+    let items: Vec<serde_json::Value> = records
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "index": r.index,
+                "type": r.typ,
+                "selector": r.selector,
+                "rect": [r.rect.0, r.rect.1, r.rect.2, r.rect.3],
+                "note": r.note,
+                "image": r.image,
+            })
+        })
+        .collect();
+    drop(records);
+    *state.sent_records.lock().unwrap() = items;
+    let _ = app;
+    count
 }
 
 /// 规范化地址栏输入:裸域名/主机自动补 http:// 前缀

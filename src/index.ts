@@ -509,7 +509,7 @@ function filterDisabled(tools: Record<string, any>, disabled?: string[]): Record
   return result;
 }
 
-/** 轮询批注发送队列:面板"发送全部"后,拉取记录推送当前对话 */
+/** 轮询批注发送队列:面板"发送全部"/截图"发送"后,拉取记录推送当前对话 */
 function startAnnotatePoller(client: any, log: any): void {
   const POLL_MS = 2000;
   const timer = setInterval(async () => {
@@ -518,16 +518,27 @@ function startAnnotatePoller(client: any, log: any): void {
       const records = r?.records || [];
       if (records.length === 0) return;
       const lines = ["User annotated via panel:", ""];
+      const parts: any[] = [];
       for (const item of records) {
-        lines.push(`- [#${item.index}] ${item.selector || "(no selector)"}${item.note ? `: ${item.note}` : ""}`);
+        // 截图记录:附带图片 part(裸 base64),AI 可直接看图
+        if (item.type === "screenshot" && item.image) {
+          parts.push({ type: "file", mime: "image/png", data: item.image, url: "" });
+        }
+        const label =
+          item.type === "screenshot"
+            ? `[#${item.index}] 截图`
+            : `[#${item.index}] ${item.selector || "(no selector)"}`;
+        lines.push(`- ${label}${item.note ? `: ${item.note}` : ""}`);
         lines.push("");
       }
       const text = lines.join("\n");
+      const bodyParts: any[] = [{ type: "text", text }];
+      for (const p of parts) bodyParts.push(p);
       const sessions = await client.session.list();
       if (sessions?.data?.length) {
         await client.session.prompt({
           path: { id: sessions.data[0].id },
-          body: { noReply: false, parts: [{ type: "text", text }] },
+          body: { noReply: false, parts: bodyParts },
         });
       }
     } catch {

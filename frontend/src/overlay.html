@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>bt-shell overlay</title>
     <style>
-      * { margin: 0; padding: 0; }
+      * { margin: 0; padding: 0; box-sizing: border-box; }
       html, body { width: 100%; height: 100%; overflow: hidden; background: transparent; }
       #canvas { display: block; width: 100%; height: 100%; }
       /* 主题变量:深色为默认,data-theme="light" 切浅色(由 theme.ts 按系统/手动设置) */
@@ -47,8 +47,9 @@
       #note-pop .btns { display: flex; gap: 6px; margin-top: 8px; }
       #note-pop .btns button {
         flex: 1; padding: 5px 0; border: none; border-radius: 5px; cursor: pointer;
-        font: 13px system-ui;
+        font: 13px system-ui; display: flex; align-items: center; justify-content: center;
       }
+      #note-pop .btns button svg { width: 16px; height: 16px; }
       #note-pop #note-pop-ok { background: #4a6d5a; color: #fff; }
       #note-pop #note-pop-ok:hover { background: #5a7d6a; }
       #note-pop #note-pop-cancel { background: var(--btn-bg); color: var(--btn-fg); }
@@ -58,6 +59,42 @@
         position: fixed; inset: 0; z-index: 9000; display: none;
         background: rgba(0, 0, 0, 0.35);
       }
+      /* 截图预览:全屏展示截图 + 底部工具栏(说明/取消/保存/发送) */
+      #shot-preview {
+        position: fixed; inset: 0; z-index: 10001; display: none;
+        background: rgba(0, 0, 0, 0.72); align-items: center; justify-content: center;
+        flex-direction: column; gap: 10px;
+      }
+      #shot-preview.show { display: flex; }
+      #shot-preview .preview-box {
+        display: flex; flex-direction: column; align-items: center; gap: 10px;
+        max-width: 92vw; max-height: 92vh;
+      }
+      #shot-preview img {
+        max-width: 92vw; max-height: 76vh; border: 2px solid var(--pop-border);
+        border-radius: 6px; background: #fff; box-shadow: 0 8px 30px rgba(0,0,0,.6);
+      }
+      #shot-preview .shot-bar {
+        display: flex; align-items: center; gap: 8px; width: 100%;
+        background: var(--pop-bg); border: 1px solid var(--pop-border); border-radius: 8px;
+        padding: 8px 10px; box-shadow: 0 6px 20px rgba(0,0,0,.5);
+      }
+      #shot-preview textarea {
+        flex: 1; height: 34px; resize: none; background: var(--input-bg); color: var(--pop-fg);
+        border: 1px solid #444; border-radius: 5px; padding: 6px; font: 13px system-ui; outline: none;
+      }
+      #shot-preview .shot-btns { display: flex; gap: 6px; }
+      #shot-preview .shot-btns button {
+        width: 36px; height: 34px; border: none; border-radius: 5px; cursor: pointer;
+        display: flex; align-items: center; justify-content: center;
+      }
+      #shot-preview .shot-btns button svg { width: 17px; height: 17px; }
+      #shot-save { background: #4a6d5a; color: #fff; }
+      #shot-save:hover { background: #5a7d6a; }
+      #shot-cancel { background: var(--btn-bg); color: var(--btn-fg); }
+      #shot-cancel:hover { background: var(--btn-hover); }
+      #shot-send { background: #3b5bdb; color: #fff; }
+      #shot-send:hover { background: #4a6ae0; }
     </style>
   </head>
   <body>
@@ -69,8 +106,21 @@
         <div class="box-title" id="note-pop-title">添加批注</div>
         <textarea id="note-pop-input" placeholder="批注内容..."></textarea>
         <div class="btns">
-          <button id="note-pop-cancel">取消</button>
-          <button id="note-pop-ok">确定</button>
+          <button id="note-pop-cancel"><i data-lucide="x"></i></button>
+          <button id="note-pop-ok"><i data-lucide="check"></i></button>
+        </div>
+      </div>
+    </div>
+    <div id="shot-preview">
+      <div class="preview-box">
+        <img id="shot-img" alt="screenshot" />
+        <div class="shot-bar">
+          <textarea id="shot-note" placeholder="截图说明..."></textarea>
+          <div class="shot-btns">
+            <button id="shot-cancel" title="取消"><i data-lucide="x"></i></button>
+            <button id="shot-save" title="保存"><i data-lucide="check"></i></button>
+            <button id="shot-send" title="发送全部"><i data-lucide="send"></i></button>
+          </div>
         </div>
       </div>
     </div>

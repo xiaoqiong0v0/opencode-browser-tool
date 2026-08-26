@@ -603,10 +603,12 @@ impl App {
         Ok(json!({ "open": *open }))
     }
 
-    /// 批注模式开关
+    /// 批注模式开关(需 block_in_place:webview show/hide 需主线程,直接调用会与 tokio 死锁)
     async fn annotate_toggle(&self) -> Result<Value, String> {
         let state = self.handle.state::<crate::ui::UiState>();
-        let on = crate::ui::annotate::Annotator::toggle(&self.handle, &state)?;
+        let on = tokio::task::block_in_place(|| {
+            crate::ui::annotate::Annotator::toggle(&self.handle, &state)
+        })?;
         Ok(json!({ "annotate": on }))
     }
 
@@ -617,22 +619,8 @@ impl App {
     }
 
     async fn annotate_send(&self) -> Result<Value, String> {
-        let state = self.handle.state::<crate::ui::UiState>();
         // 将当前记录快照放入待发送队列(插件端轮询 consume 拉取)
-        let records = state.records.lock().unwrap().clone();
-        let count = records.len();
-        let items: Vec<serde_json::Value> = records
-            .iter()
-            .map(|r| {
-                json!({
-                    "index": r.index,
-                    "selector": r.selector,
-                    "rect": [r.rect.0, r.rect.1, r.rect.2, r.rect.3],
-                    "note": r.note,
-                })
-            })
-            .collect();
-        *state.sent_records.lock().unwrap() = items;
+        let count = crate::ui::send_all_records(&self.handle);
         Ok(json!({ "count": count }))
     }
 

@@ -11,5 +11,8 @@
     "@tauri-apps/api": "^2.0.0",
     "esbuild": "^0.28.1",
     "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "lucide": "^1.34.0"
   }
 }

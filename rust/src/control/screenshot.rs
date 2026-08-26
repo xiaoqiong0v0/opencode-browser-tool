@@ -8,11 +8,25 @@ use crate::ui;
 
 /// 截图页面 Webview,返回 PNG base64
 pub fn screenshot(app: &AppHandle) -> Result<String, String> {
-    screenshot_impl(app)
+    screenshot_impl(app, None)
+}
+
+/// 截取页面指定区域(视口 CSS 像素坐标),返回 PNG base64
+pub fn screenshot_clip(
+    app: &AppHandle,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+) -> Result<String, String> {
+    screenshot_impl(app, Some((x, y, w, h)))
 }
 
 #[cfg(windows)]
-fn screenshot_impl(app: &AppHandle) -> Result<String, String> {
+fn screenshot_impl(
+    app: &AppHandle,
+    clip: Option<(i32, i32, i32, i32)>,
+) -> Result<String, String> {
     let page = ui::active_page_webview(app).ok_or("page webview not ready")?;
     // 结果通道:completed 回调 → 本线程
     let (tx, rx) = mpsc::channel::<Result<String, String>>();
@@ -32,8 +46,15 @@ fn screenshot_impl(app: &AppHandle) -> Result<String, String> {
             match webview_result {
                 Err(e) => { let _ = tx.send(Err(e)); }
                 Ok(webview) => {
+                    // 区域截图:CDP clip 用视口 CSS 像素坐标,scale=1 按 device 像素输出
+                    let params = match clip {
+                        Some((cx, cy, cw, ch)) => format!(
+                            r#"{{"format":"png","captureBeyondViewport":false,"clip":{{"x":{cx},"y":{cy},"width":{cw},"height":{ch},"scale":1}}}}"#
+                        ),
+                        None => r#"{"format":"png","captureBeyondViewport":false}"#.to_string(),
+                    };
                     let method = windows::core::HSTRING::from("Page.captureScreenshot");
-                    let params = windows::core::HSTRING::from(r#"{"format":"png","captureBeyondViewport":false}"#);
+                    let params = windows::core::HSTRING::from(params);
                     // 在 UI 线程泵消息等待回调
                     // 回调签名 (windows::core::Result<()>, String) → windows::core::Result<()>
                     let result = CallDevToolsProtocolMethodCompletedHandler::wait_for_async_operation(
@@ -73,6 +94,9 @@ fn screenshot_impl(app: &AppHandle) -> Result<String, String> {
 }
 
 #[cfg(not(windows))]
-fn screenshot_impl(_app: &AppHandle) -> Result<String, String> {
+fn screenshot_impl(
+    _app: &AppHandle,
+    _clip: Option<(i32, i32, i32, i32)>,
+) -> Result<String, String> {
     Err("screenshot not implemented on this platform yet".into())
 }
