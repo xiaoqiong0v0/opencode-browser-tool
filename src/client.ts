@@ -26,9 +26,35 @@ function resolveShellBinary(): string {
 let serviceProcess: any = null;
 let servicePort = 0;
 let serviceReady = false;
+/** 服务启动参数(configureService 保存,ensureService 懒启动时使用) */
+let serviceConfig: { nodePath: string; browsersPath?: string; sessionIsolation?: boolean; browserType?: string } | null = null;
+/** 正在启动中的 Promise(并发保护,多个工具同时调用只启动一次) */
+let starting: Promise<void> | null = null;
+
+/** 保存服务启动参数(插件加载时调用,不立即启动窗口) */
+export function configureService(opts: { nodePath: string; browsersPath?: string; sessionIsolation?: boolean; browserType?: string }): void {
+  serviceConfig = opts;
+}
+
+/** 懒启动服务:未启动则 spawn bt-shell(弹窗);已启动直接返回;并发时复用同一个 Promise */
+export async function ensureService(): Promise<void> {
+  if (serviceReady) return;
+  if (!serviceConfig) throw new Error("Service not configured");
+  if (starting) return starting;
+  starting = startService(
+    serviceConfig.nodePath,
+    serviceConfig.browsersPath,
+    serviceConfig.sessionIsolation,
+    serviceConfig.browserType,
+  ).finally(() => {
+    starting = null;
+  });
+  return starting;
+}
 
 async function callApi(path: string, body?: any, sessionId?: string): Promise<any> {
-  if (!serviceReady) throw new Error("Service not ready");
+  // 懒启动:首次调用工具时自动打开窗口
+  await ensureService();
   const payload = { ...(body || {}), _sessionId: sessionId || "" };
   const res = await fetch(`http://127.0.0.1:${servicePort}${path}`, {
     method: "POST",
@@ -89,6 +115,16 @@ export async function stopService(): Promise<void> {
   servicePort = 0;
 }
 
+/** 打开浏览器窗口(未启动则启动;已启动幂等) */
+export async function openWindow(): Promise<void> {
+  await ensureService();
+}
+
+/** 服务当前是否运行 */
+export function isRunning(): boolean {
+  return serviceReady;
+}
+
 function cmd(name: string) {
   return (params?: any, sessionId?: string) => callApi(`/api/${name}`, params, sessionId);
 }
@@ -119,6 +155,7 @@ export const service = {
   device: cmd("device"),
   deviceList: cmd("device/list"),
   devtools: cmd("devtools"),
+  mediaMode: cmd("media/mode"),
   close: cmd("close"),
   newTab: cmd("tabs/new"),
   switchTab: cmd("tabs/switch"),

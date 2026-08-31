@@ -109,6 +109,8 @@ pub struct UiState {
     pub pending_shot: Mutex<Option<PendingShot>>,
     /// 截图模式开关(截图模式下 overlay 拦截鼠标,双击截全屏/框选截区域)
     pub shot_mode: Mutex<bool>,
+    /// 媒体设备模式:simulate(默认,模拟摄像头/麦克风) / real(真实设备,无设备自动回退模拟)
+    pub media_mode: Mutex<String>,
     /// 主题模式:auto(跟随系统) / light / dark
     pub theme: Mutex<String>,
 }
@@ -128,6 +130,7 @@ impl UiState {
             pending_click: Mutex::new(None),
             pending_shot: Mutex::new(None),
             shot_mode: Mutex::new(false),
+            media_mode: Mutex::new("simulate".into()),
             theme: Mutex::new("auto".into()),
         }
     }
@@ -182,6 +185,178 @@ const PAGE_BRIDGE_JS: &str = r##"
 })();
 "##;
 
+/// 媒体模拟脚本(注入页面 Webview,覆盖 getUserMedia 实现模拟/真实设备切换)
+/// 模式:simulate(默认,fake 流不占真实硬件) / real(真实设备,无设备自动回退模拟)
+/// 切换由 Rust 通过 eval 设置 window.__btMediaMode;PermissionRequested 已在 Rust 侧统一放行
+const MEDIA_FAKE_JS: &str = r##"
+(function(){
+  var media=navigator.mediaDevices;
+  if(!media)return;
+  window.__btMediaMode="simulate";
+  var _orig=media.getUserMedia&&media.getUserMedia.bind(media);
+  function makeFake(constraints){
+    return new Promise(function(resolve){
+      try{
+        var w=640,h=480,c=document.createElement("canvas");c.width=w;c.height=h;
+        var ctx=c.getContext("2d");
+        // ---- 多场景轮换:每 4 秒自动切换一个场景 ----
+        // 场景函数签名:function(ctx,w,h,t,now)  t=场景内已运行秒数  now=当前时间戳
+        // 场景1:弹跳球乐园(渐变动画 + 彩色弹跳球 + 顶部时钟)
+        function sceneBalls(ctx,w,h,t,now){
+          var hue=(t*40)%360;
+          var g=ctx.createLinearGradient(0,0,w,h);
+          g.addColorStop(0,"hsl("+hue+",70%,55%)");
+          g.addColorStop(1,"hsl("+((hue+120)%360)+",70%,45%)");
+          ctx.fillStyle=g;ctx.fillRect(0,0,w,h);
+          var balls=[
+            {x:0.30,y:0.30,vx:80,vy:60,r:28,c:"#ffd93d"},
+            {x:0.70,y:0.60,vx:-70,vy:50,r:20,c:"#ff6b6b"},
+            {x:0.50,y:0.80,vx:60,vy:-80,r:16,c:"#4ecdc4"},
+            {x:0.20,y:0.50,vx:-50,vy:70,r:22,c:"#a29bfe"},
+            {x:0.80,y:0.20,vx:55,vy:-60,r:18,c:"#ffe28a"}
+          ];
+          ctx.textAlign="left";
+          for(var i=0;i<balls.length;i++){
+            var b=balls[i];
+            var px=(b.x*w+b.vx*t)%(2*w);if(px<0)px+=2*w;var xx=px<w?px:2*w-px;
+            var py=(b.y*h+b.vy*t)%(2*h);if(py<0)py+=2*h;var yy=py<h?py:2*h-py;
+            ctx.beginPath();ctx.arc(xx,yy,b.r,0,Math.PI*2);
+            ctx.fillStyle=b.c;ctx.fill();
+            ctx.strokeStyle="rgba(255,255,255,.55)";ctx.lineWidth=3;ctx.stroke();
+          }
+          ctx.fillStyle="rgba(0,0,0,.35)";ctx.fillRect(0,0,w,52);
+          ctx.fillStyle="#fff";ctx.font="bold 22px sans-serif";
+          ctx.fillText("FAKE CAMERA",16,35);
+          ctx.font="bold 24px monospace";ctx.textAlign="right";
+          ctx.fillText(new Date(now).toLocaleTimeString(),w-16,36);
+        }
+        // 场景2:电视测试卡(SMPTE 七色彩条 + 网格 + 时间码)
+        function sceneTestcard(ctx,w,h,t,now){
+          ctx.fillStyle="#1a1a2e";ctx.fillRect(0,0,w,h);
+          var cols=["#c0c0c0","#c0c000","#00c0c0","#00c000","#c000c0","#c00000","#0000c0"];
+          var bw=w/cols.length,bh=h*0.55;
+          for(var i=0;i<cols.length;i++){ctx.fillStyle=cols[i];ctx.fillRect(i*bw,0,bw,bh);}
+          var grad=ctx.createLinearGradient(0,bh,0,bh+h*0.2);
+          grad.addColorStop(0,"#000");grad.addColorStop(1,"#fff");
+          ctx.fillStyle=grad;ctx.fillRect(0,bh,w,h*0.2);
+          ctx.strokeStyle="#333";ctx.lineWidth=1;
+          for(var x=0;x<=w;x+=w/8){ctx.beginPath();ctx.moveTo(x,bh);ctx.lineTo(x,bh+h*0.2);ctx.stroke();}
+          ctx.fillStyle="#111";ctx.fillRect(0,h-56,w,56);
+          ctx.strokeStyle="#222";
+          for(var y=0;y<3;y++){ctx.beginPath();ctx.moveTo(0,h-56+y*14);ctx.lineTo(w,h-56+y*14);ctx.stroke();}
+          ctx.fillStyle="#fff";ctx.font="bold 26px monospace";ctx.textAlign="center";
+          var d=new Date(now);
+          var ts=("0"+d.getHours()).slice(-2)+":"+("0"+d.getMinutes()).slice(-2)+":"+("0"+d.getSeconds()).slice(-2);
+          ctx.fillText("TIME "+ts,w/2,h-22);
+          ctx.font="bold 15px sans-serif";
+          ctx.fillText("FAKE CAMERA TEST CARD",w/2,h-44);
+        }
+        // 场景3:表情动效(大号表情轮换 + 彩带飘落)
+        function sceneEmoji(ctx,w,h,t,now){
+          var g=ctx.createLinearGradient(0,0,w,h);
+          g.addColorStop(0,"#2b1055");g.addColorStop(1,"#7597de");
+          ctx.fillStyle=g;ctx.fillRect(0,0,w,h);
+          var emo=["😀","😎","🤖","🎉","🐱","🌈"];
+          var e=emo[Math.floor(now/800)%emo.length];
+          ctx.textAlign="center";ctx.textBaseline="middle";
+          ctx.font="150px sans-serif";
+          ctx.fillText(e,w/2,h/2-20);
+          ctx.textBaseline="alphabetic";
+          for(var i=0;i<24;i++){
+            var p=((i*137+now*0.05)%1);
+            var px=((i*83+Math.sin(now/900+i)*40)%w);if(px<0)px+=w;
+            var py=p*(h-60);
+            ctx.globalAlpha=0.7;
+            ctx.fillStyle=["#ff6b6b","#ffd93d","#4ecdc4","#a29bfe"][i%4];
+            ctx.fillRect(px,py,10,10);
+          }
+          ctx.globalAlpha=1;
+          ctx.fillStyle="rgba(0,0,0,.35)";ctx.fillRect(0,h-48,w,48);
+          ctx.fillStyle="#fff";ctx.font="bold 20px sans-serif";
+          ctx.fillText("FAKE CAMERA",w/2,h-16);
+        }
+        // 场景4:流星夜空(径向渐变 + 星星 + 周期性流星划过)
+        function sceneStars(ctx,w,h,t,now){
+          var g=ctx.createRadialGradient(w/2,h/2,40,w/2,h/2,Math.max(w,h)*0.65);
+          g.addColorStop(0,"#0f0c29");g.addColorStop(0.5,"#302b63");g.addColorStop(1,"#24243e");
+          ctx.fillStyle=g;ctx.fillRect(0,0,w,h);
+          // 静止星星(微弱,衬托流星)
+          for(var i=0;i<60;i++){
+            var sx=(i*97.3+13)%w,sy=(i*61.7+29)%h;
+            var tw=0.5+0.5*Math.sin(now/400+i);
+            ctx.globalAlpha=tw*0.6;
+            ctx.fillStyle="#fff";
+            ctx.fillRect(sx,sy,1+((i*7)%2),1+((i*7)%2));
+          }
+          // 流星:多个不同起点/角度/速度,按 gap 周期持续划过,头部亮+拖尾渐变
+          var meteors=[
+            {st:0,   dur:1200, gap:2600, x:0.10, y:0.05, dx:0.55, dy:0.18, len:120, c:"#ffffff"},
+            {st:900, dur:1000, gap:2200, x:0.90, y:0.10, dx:-0.50, dy:0.22, len:90, c:"#cfe8ff"},
+            {st:300, dur:1400, gap:2800, x:0.20, y:0.02, dx:0.45, dy:0.15, len:150, c:"#ffe9c4"},
+            {st:1500,dur:900,  gap:2500, x:0.60, y:0.06, dx:-0.60, dy:0.20, len:100, c:"#e6d9ff"}
+          ];
+          for(var m=0;m<meteors.length;m++){
+            var mt=meteors[m];
+            var age=(now+mt.st)%mt.gap;
+            if(age>mt.dur)continue;              // 未到或已划过
+            var p=age/mt.dur;                     // 0..1 划过进度
+            var fade=Math.min(p/0.12,(1-p)/0.12,1);
+            if(fade<=0)continue;
+            var hx=mt.x*w+mt.dx*w*p, hy=mt.y*h+mt.dy*h*p;
+            var tx=hx-mt.dx*mt.len, ty=hy-mt.dy*mt.len;
+            // 尾迹渐变(头部亮 → 尾端透明)
+            var gr=ctx.createLinearGradient(hx,hy,tx,ty);
+            gr.addColorStop(0,mt.c);
+            gr.addColorStop(1,"rgba(255,255,255,0)");
+            ctx.globalAlpha=fade;
+            ctx.strokeStyle=gr;
+            ctx.lineWidth=2;
+            ctx.beginPath();ctx.moveTo(hx,hy);ctx.lineTo(tx,ty);ctx.stroke();
+            // 头部亮点
+            ctx.fillStyle="#fff";
+            ctx.beginPath();ctx.arc(hx,hy,2.5,0,Math.PI*2);ctx.fill();
+          }
+          ctx.globalAlpha=1;
+          ctx.fillStyle="rgba(0,0,0,.35)";ctx.fillRect(0,h-48,w,48);
+          ctx.fillStyle="#fff";ctx.font="bold 20px sans-serif";ctx.textAlign="center";
+          ctx.fillText("FAKE CAMERA · METEOR SHOWER",w/2,h-16);
+          ctx.textAlign="left";
+        }
+        // 场景调度:每 15 秒轮换
+        var scenes=[sceneBalls,sceneTestcard,sceneEmoji,sceneStars];
+        var si=0,start=Date.now();
+        function draw(){
+          var now=Date.now();
+          if(now-start>15000){start=now;si=(si+1)%scenes.length;}
+          scenes[si](ctx,w,h,(now-start)/1000,now);
+          requestAnimationFrame(draw);
+        }
+        draw();
+        var video=c.captureStream(15).getVideoTracks()[0];
+        var audioCtx=new (window.AudioContext||window.webkitAudioContext)();
+        var dst=audioCtx.createMediaStreamDestination();
+        var gain=audioCtx.createGain();gain.gain.value=0;
+        var osc=audioCtx.createOscillator();osc.connect(gain);gain.connect(dst);osc.start();
+        var audio=dst.stream.getAudioTracks()[0];
+        var tracks=[];
+        if(!constraints.video||constraints.video!==false)tracks.push(video);
+        if(!constraints.audio||constraints.audio!==false)tracks.push(audio);
+        resolve(new MediaStream(tracks));
+      }catch(e){resolve(new MediaStream());}
+    });
+  }
+  media.getUserMedia=function(constraints){
+    if(window.__btMediaMode!=="real"){
+      return makeFake(constraints||{});
+    }
+    if(_orig){
+      return _orig(constraints).catch(function(){return makeFake(constraints||{});});
+    }
+    return makeFake(constraints||{});
+  };
+})();
+"##;
+
 /// 创建主窗口 + 四 Webview(工具栏/页面/覆盖层/面板)
 /// 布局以窗口实际物理尺寸为准(避免 DPI 感知时序导致窗口与子 webview 缩放不一致)
 pub fn create_ui(app: &AppHandle) -> tauri::Result<()> {
@@ -218,7 +393,7 @@ pub fn create_ui(app: &AppHandle) -> tauri::Result<()> {
                 // 初始加载自定义新标签页(背景跟随主题,不依赖 webview 默认背景)
                 WebviewUrl::App("newtab.html".into()),
             )
-            .initialization_script(PAGE_BRIDGE_JS),
+            .initialization_script(format!("{PAGE_BRIDGE_JS}{MEDIA_FAKE_JS}")),
             tauri::PhysicalPosition::new(0, 0),
             tauri::PhysicalSize::new(100, 100),
         )?;
@@ -230,6 +405,9 @@ pub fn create_ui(app: &AppHandle) -> tauri::Result<()> {
         // 注册响应捕获(expect/assert-response 查询历史)
         #[cfg(windows)]
         crate::control::responses::setup(app, &w);
+        // 注册媒体权限放行(摄像头/麦克风统一 Allow)
+        #[cfg(windows)]
+        crate::control::media::setup(app, &w);
     }
     // 初始标签绑定 webview label
     {
@@ -387,7 +565,7 @@ pub fn create_tab_webview(app: &AppHandle, id: u32) -> Result<tauri::webview::We
     let w = window
         .add_child(
             WebviewBuilder::new(&label, WebviewUrl::App("newtab.html".into()))
-                .initialization_script(PAGE_BRIDGE_JS),
+                .initialization_script(format!("{PAGE_BRIDGE_JS}{MEDIA_FAKE_JS}")),
             tauri::PhysicalPosition::new(0, 0),
             tauri::PhysicalSize::new(100, 100),
         )
@@ -400,6 +578,9 @@ pub fn create_tab_webview(app: &AppHandle, id: u32) -> Result<tauri::webview::We
     // 注册响应捕获(expect/assert-response 查询历史)
     #[cfg(windows)]
     crate::control::responses::setup(app, &w);
+    // 注册媒体权限放行(摄像头/麦克风统一 Allow)
+    #[cfg(windows)]
+    crate::control::media::setup(app, &w);
     // 应用布局(定位到页面区)
     if let Some(win) = app.get_window("main") {
         if let Ok(size) = win.inner_size() {

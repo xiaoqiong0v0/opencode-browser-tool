@@ -67,10 +67,15 @@ const zh: LocaleStrings = {
     "tool.devtools.desc": "打开/关闭开发者工具（F12）",
     "tool.devtools.arg.action": "操作: open, close, toggle（默认 toggle）",
 
+    "tool.set_media_mode.desc":
+      "切换摄像头/麦克风模式：simulate（模拟设备，默认）或 real（真实设备，无设备自动回退模拟）。不带参数时查询当前模式。",
+    "tool.set_media_mode.arg.mode": "模式：simulate 或 real（省略则查询当前）",
+
     "tool.reload.desc": "刷新当前页面",
     "tool.clear.desc": "清空输入框",
     "tool.clear.arg.selector": "输入框的 CSS 选择器",
     "tool.close.desc": "关闭浏览器（任务完成时调用）",
+    "tool.open_window.desc": "打开浏览器窗口（未启动时启动，已打开则无操作）",
     "tool.scroll.desc": "滚动页面方向",
     "tool.scroll.arg.direction": "方向: up, down, left, right（默认 down）",
     "tool.scroll.arg.amount": "滚动像素（默认 300）",
@@ -145,6 +150,7 @@ const zh: LocaleStrings = {
     "msg.device.set": "已应用设备预设: {name} ({size})\nUser-Agent: {ua}",
     "msg.devtools.open": "开发者工具已打开",
     "msg.devtools.closed": "开发者工具已关闭",
+    "msg.media_mode.set": "媒体设备模式：{mode}",
   },
 
   panel: {

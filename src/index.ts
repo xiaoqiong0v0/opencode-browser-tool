@@ -4,7 +4,7 @@ import { loadConfig, getConfig, getBrowsersDir } from "./config/index.js";
 import { registerLocale, t } from "./i18n/index.js";
 import en from "./i18n/en.js";
 import zh from "./i18n/zh.js";
-import { startService, service } from "./client.js";
+import { configureService, ensureService, openWindow, isRunning, stopService, service } from "./client.js";
 import type { Plugin } from "@opencode-ai/plugin";
 import createLogger from "@xiaoqiong0v0/opencode-plugin-logger";
 
@@ -27,7 +27,13 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree }) => {
 
   try {
     log.loaded();
-    await startService(config.nodePath || "", getBrowsersDir(), config.sessionIsolation, config.browserType);
+    // 懒启动:仅保存启动参数,不立即弹窗;bt_open_window 或首次调工具时启动
+    configureService({
+      nodePath: config.nodePath || "",
+      browsersPath: getBrowsersDir(),
+      sessionIsolation: config.sessionIsolation,
+      browserType: config.browserType,
+    });
 
     // 轮询批注发送队列(面板"发送全部" → 推送到对话)
     void startAnnotatePoller(client, log);
@@ -158,7 +164,7 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree }) => {
             args: { selector: { type: "string", description: _t("tool.get_visible_text.arg.selector") } },
             execute: _exec(async (a) => {
               const r = await service.visibleText(a);
-              return r || "(no visible text)";
+              return r?.text || "(no visible text)";
             }),
           },
           bt_get_visible_html: {
@@ -239,6 +245,14 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree }) => {
               return r.open ? _t("msg.devtools.open") : _t("msg.devtools.closed");
             }),
           },
+          bt_set_media_mode: {
+            description: _t("tool.set_media_mode.desc"),
+            args: { mode: { type: "string", description: _t("tool.set_media_mode.arg.mode") } },
+            execute: _exec(async (a) => {
+              const r = await service.mediaMode(a);
+              return _tf("msg.media_mode.set", { mode: r.mode });
+            }),
+          },
           bt_reload: {
             description: _t("tool.reload.desc"),
             args: {},
@@ -247,11 +261,22 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree }) => {
               return `Page reloaded: ${r.url}`;
             }),
           },
+          bt_open_window: {
+            description: _t("tool.open_window.desc"),
+            args: {},
+            execute: _exec(async () => {
+              await openWindow();
+              return "Browser window opened";
+            }),
+          },
           bt_close: {
             description: _t("tool.close.desc"),
             args: {},
             execute: _exec(async () => {
+              if (!isRunning()) return "Browser already closed";
               await service.close();
+              // 服务进程已退出,重置状态(下次 bt_open_window 可重新启动)
+              await stopService();
               return "Browser closed";
             }),
           },
@@ -510,6 +535,8 @@ function filterDisabled(tools: Record<string, any>, disabled?: string[]): Record
 function startAnnotatePoller(client: any, log: any): void {
   const POLL_MS = 2000;
   const timer = setInterval(async () => {
+    // 服务未启动/已关闭:跳过本次轮询(窗口打开后再恢复推送)
+    if (!isRunning()) return;
     try {
       const r = await service.annotateConsumeSent();
       const records = r?.records || [];

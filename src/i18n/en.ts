@@ -67,10 +67,15 @@ const en: LocaleStrings = {
     "tool.devtools.desc": "Open/close the developer tools (F12)",
     "tool.devtools.arg.action": "Action: open, close, toggle (default: toggle)",
 
+    "tool.set_media_mode.desc":
+      "Switch camera/microphone mode: 'simulate' (fake devices, default) or 'real' (real devices, falls back to simulate if unavailable). Call without mode to query the current mode.",
+    "tool.set_media_mode.arg.mode": "Mode: simulate or real (omit to query current)",
+
     "tool.reload.desc": "Reload the current page",
     "tool.clear.desc": "Clear an input field",
     "tool.clear.arg.selector": "CSS selector for the input field",
     "tool.close.desc": "Close the browser (use this when the task is complete)",
+    "tool.open_window.desc": "Open the browser window (starts it if not running; no-op if already open)",
     "tool.scroll.desc": "Scroll the page in any direction",
     "tool.scroll.arg.direction": "Direction: up, down, left, right (default: down)",
     "tool.scroll.arg.amount": "Pixels to scroll (default: 300)",
@@ -150,6 +155,7 @@ const en: LocaleStrings = {
     "msg.device.set": "Device preset applied: {name} ({size})\nUser-Agent: {ua}",
     "msg.devtools.open": "Developer tools opened",
     "msg.devtools.closed": "Developer tools closed",
+    "msg.media_mode.set": "Media mode: {mode}",
   },
 
   panel: {

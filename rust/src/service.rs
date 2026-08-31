@@ -72,6 +72,8 @@ impl App {
             "/api/device" => self.device(&body).await,
             "/api/device/list" => self.device_list().await,
             "/api/devtools" => self.devtools(&body).await,
+            // 媒体设备模式(simulate=模拟 / real=真实)
+            "/api/media/mode" => self.media_mode(&body).await,
             _ => Err(format!("Not found: POST {url}")),
         }
     }
@@ -682,6 +684,48 @@ impl App {
             Ok::<(), String>(())
         })?;
         Ok(json!({ "open": *open }))
+    }
+
+    /// 查询/切换媒体设备模式(simulate=模拟设备 / real=真实设备)
+    /// 带 mode:校验后更新 UiState 并同步所有页面脚本;不带 mode:返回当前模式
+    async fn media_mode(&self, body: &Value) -> Result<Value, String> {
+        match body.get("mode").and_then(|v| v.as_str()) {
+            Some(m) if m == "simulate" || m == "real" => {
+                let m2 = m.to_string();
+                let handle = self.handle.clone();
+                // 闭包 move 捕获,m2 保留在外部供返回
+                let mode = m2.clone();
+                tokio::task::block_in_place(move || {
+                    let state = handle.state::<crate::ui::UiState>();
+                    *state.media_mode.lock().unwrap() = mode.clone();
+                    // 同步所有页面 webview 的 __btMediaMode(切换标签后模式保持一致)
+                    let labels: Vec<String> = state
+                        .tabs
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter_map(|t| t.webview.clone())
+                        .collect();
+                    for label in labels {
+                        if let Some(w) = handle.get_webview(&label) {
+                            let _ = w.eval(&format!("window.__btMediaMode = {mode:?}"));
+                        }
+                    }
+                });
+                Ok(json!({ "mode": m2 }))
+            }
+            None => {
+                let cur = self
+                    .handle
+                    .state::<crate::ui::UiState>()
+                    .media_mode
+                    .lock()
+                    .unwrap()
+                    .clone();
+                Ok(json!({ "mode": cur }))
+            }
+            Some(other) => Err(format!("invalid mode: {other} (simulate/real)")),
+        }
     }
 
     /// 批注模式开关(需 block_in_place:webview show/hide 需主线程,直接调用会与 tokio 死锁)
