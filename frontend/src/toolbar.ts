@@ -1,5 +1,6 @@
-// 工具栏 Webview 入口:标签(伪多标签) + 地址栏导航 + 面板浮层开关
+// 工具栏 Webview 入口:标签(伪多标签) + 地址栏导航 + 批注/截图/面板按钮
 // 与 Rust 通过 Tauri invoke 通信
+import { createIcons, Camera, PenLine } from "lucide";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
@@ -21,12 +22,16 @@ class Toolbar {
   private tabsEl: HTMLDivElement;
   private addr: HTMLInputElement;
   private btnPanel: HTMLButtonElement;
+  private btnAnnotate: HTMLButtonElement;
+  private btnShot: HTMLButtonElement;
   private state: ToolbarState = { tabs: [], active: 0, panel_open: false };
 
   constructor() {
     this.tabsEl = document.getElementById("tabs") as HTMLDivElement;
     this.addr = document.getElementById("addr") as HTMLInputElement;
     this.btnPanel = document.getElementById("btn-panel") as HTMLButtonElement;
+    this.btnAnnotate = document.getElementById("btn-annotate") as HTMLButtonElement;
+    this.btnShot = document.getElementById("btn-shot") as HTMLButtonElement;
     this.bindEvents();
     void this.init();
   }
@@ -34,6 +39,11 @@ class Toolbar {
   /** 事件驱动:监听 Rust 广播的标签状态变化(后台统一检测,有变更才发送) */
   private async init(): Promise<void> {
     await listen<ToolbarState>("tabs-changed", (e) => this.update(e.payload));
+    // 监听批注/截图模式状态(按钮激活态同步)
+    void listen<{ annotate: boolean; shot: boolean }>("annotate-state", (e) => {
+      this.btnAnnotate.classList.toggle("active", !!e.payload?.annotate);
+      this.btnShot.classList.toggle("active", !!e.payload?.shot);
+    });
     // 初始拉取一次当前状态
     void this.refresh();
   }
@@ -75,6 +85,21 @@ class Toolbar {
     this.btnPanel.addEventListener("click", () => {
       void invoke<boolean>("toolbar_toggle_panel").then((open) => {
         this.btnPanel.classList.toggle("active", open);
+      });
+    });
+    // 批注模式快捷按钮(免开面板)
+    this.btnAnnotate.addEventListener("click", () => {
+      void invoke<boolean>("panel_cmd", { cmd: "toggle-annotate" }).then((on) => {
+        this.btnAnnotate.classList.toggle("active", on);
+      });
+    });
+    // 截图快捷按钮(立即截全屏,不进模式)
+    this.btnShot.addEventListener("click", () => {
+      void invoke<boolean>("panel_cmd", { cmd: "shot-now" }).then(() => {
+        // 如果面板开着,关闭它(截图预览在 overlay 显示)
+        if (this.state.panel_open) {
+          void invoke<boolean>("toolbar_toggle_panel");
+        }
       });
     });
     // 新建标签
@@ -186,6 +211,8 @@ function isNewTabUrl(url: string): boolean {
   return url === "about:blank" || url.includes("/newtab.html") || url.includes("tauri://localhost") || url.includes("tauri.localhost");
 }
 
-const toolbar = new Toolbar();
+new Toolbar();
 void initTheme();
+// lucide 图标替换(批注/截图)
+createIcons({ icons: { PenLine, Camera } });
 console.log("[toolbar] ready");

@@ -45,11 +45,6 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree }) => {
             description: _t("tool.navigate.desc"),
             args: {
               url: { type: "string", description: _t("tool.navigate.arg.url") },
-              headless: { type: "boolean", description: _t("tool.navigate.arg.headless") },
-              browserType: {
-                type: "string",
-                description: "Browser engine: chromium, firefox, webkit (optional, keep current if omitted)",
-              },
             },
             execute: _exec(async (a) => {
               const r = await service.navigate(a);
@@ -143,9 +138,10 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree }) => {
             args: { selector: { type: "string", description: _t("tool.screenshot.arg.selector") } },
             execute: _exec(async (a) => {
               const r = await service.screenshot(a);
+              // 与批注/截图推送一致:file part 带 data(裸 base64)
               return {
                 output: `Screenshot taken${a.selector ? ` (element: ${a.selector})` : " (full page)"}`,
-                attachments: [{ type: "file" as const, mime: "image/png", url: `data:image/png;base64,${r.__buffer}` }],
+                attachments: [{ type: "file", mime: r.mime || "image/png", data: r.base64, url: "" }],
               };
             }),
           },
@@ -185,7 +181,8 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree }) => {
             },
             execute: _exec(async (a) => {
               const r = await service.consoleLogs(a);
-              return (r as string[]).join("\n") || "(no logs)";
+              const logs: string[] = r.logs || [];
+              return logs.join("\n") || "(no logs)";
             }),
           },
           bt_go_back: {
@@ -296,10 +293,8 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree }) => {
             args: { selector: { type: "string", description: _t("tool.click_and_switch_tab.arg.selector") } },
             execute: _exec(async (a) => {
               const r = await service.clickSwitchTab(a);
-              return _tf(r.switched ? "msg.click_switch.done" : "msg.click_switch.clicked", {
-                url: r.url || "",
-                selector: a.selector,
-              });
+              // V5 真多标签:target=_blank 链接点击后新开标签并自动切换,返回当前 url
+              return `Clicked ${a.selector}, current URL: ${r.url || ""}`;
             }),
           },
           bt_iframe_click: {
@@ -352,8 +347,10 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree }) => {
             description: _t("tool.list_tabs.desc"),
             args: {},
             execute: _exec(async () => {
-              const pages = (await service.tabs()) as any[];
-              return `Tabs (${pages.length}):\n${pages.map((p, i) => `[${i}] ${p.url}`).join("\n")}`;
+              const res = (await service.tabs()) as any;
+              const list: any[] = res?.tabs || [];
+              if (list.length === 0) return "(no tabs)";
+              return `Tabs (${list.length}):\n${list.map((p: any, i: number) => `[${i}] ${p.url || p.title}`).join("\n")}`;
             }),
           },
           bt_switch_tab: {
@@ -526,8 +523,8 @@ function startAnnotatePoller(client: any, log: any): void {
         }
         const label =
           item.type === "screenshot"
-            ? `[#${item.index}] 截图`
-            : `[#${item.index}] ${item.selector || "(no selector)"}`;
+            ? `[#${item.index}] 截图${item.url ? ` @ ${item.url}` : ""}`
+            : `[#${item.index}] ${item.selector || "(no selector)"}${item.url ? ` @ ${item.url}` : ""}`;
         lines.push(`- ${label}${item.note ? `: ${item.note}` : ""}`);
         lines.push("");
       }

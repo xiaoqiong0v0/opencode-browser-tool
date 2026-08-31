@@ -2,6 +2,8 @@
 //! 所有操作在页面内执行一次性 JS,无残留脚本;截图平台分支
 //! 注意:eval_with_callback 会把 JS 表达式返回值 JSON 序列化后传回,
 //! 因此 JS 表达式直接返回对象/原始值,不要再包 JSON.stringify
+pub mod accessibility;
+pub mod responses;
 pub mod screenshot;
 
 use serde_json::Value;

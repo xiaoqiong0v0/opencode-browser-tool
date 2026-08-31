@@ -56,12 +56,59 @@ opencode（Bun）
 | **导航** | `bt_navigate`, `bt_go_back`, `bt_go_forward`, `bt_reload`, `bt_close` |
 | **交互** | `bt_click`, `bt_fill`, `bt_clear`, `bt_select`, `bt_hover`, `bt_drag`, `bt_press_key`, `bt_upload_file`, `bt_iframe_click`, `bt_iframe_fill` |
 | **标签页** | `bt_list_tabs`, `bt_switch_tab`, `bt_new_tab`, `bt_close_tab`, `bt_click_and_switch_tab` |
-| **信息** | `bt_screenshot`, `bt_evaluate`, `bt_get_visible_text`, `bt_get_visible_html`, `bt_console_logs`, `bt_get_browser_status`, `bt_get_element_state`, `bt_get_dropdown_options`, `bt_list_records` |
+| **信息** | `bt_screenshot`, `bt_evaluate`, `bt_get_visible_text`, `bt_get_visible_html`, `bt_console_logs`, `bt_get_browser_status`, `bt_get_element_state`, `bt_get_dropdown_options`, `bt_list_records`, `bt_expect_response`, `bt_assert_response`, `bt_get_accessibility_tree` |
 | **滚动/等待** | `bt_scroll`, `bt_scroll_to_element`, `bt_wait_for_selector`, `bt_resize`, `bt_set_device` |
-| **设备/工具** | `bt_set_device`（13 种设备预设，含尺寸+UA）, `bt_custom_user_agent`, `bt_devtools`（开发者工具开关） |
+| **设备/工具** | `bt_custom_user_agent`, `bt_devtools`（开发者工具开关） |
 | **其他** | `bt_save_as_pdf`, `bt_show_notification`, `bt_read_record_content` |
 
-> 架构限制（V5 单页 Webview）：多标签（`bt_list_tabs`/`bt_switch_tab`/`bt_close_tab`）、网络监听（`bt_expect_response`/`bt_assert_response`）、可访问性树（`bt_get_accessibility_tree`）在当前架构下不适用，调用会明确报错而非假成功。
+### 工具参数
+
+| 工具 | 参数（类型） | 说明 |
+|------|------|------|
+| `bt_navigate` | `url`(string) 必填 | 导航到指定地址（裸域名自动补 http://） |
+| `bt_click` | `selector`(string) 必填 | 点击 CSS 选择器匹配的元素 |
+| `bt_fill` | `selector`, `value`(string) 必填 | 向输入框填入文本 |
+| `bt_clear` | `selector`(string) 必填 | 清空输入框 |
+| `bt_select` | `selector`, `value`(string) 必填 | 选择下拉框选项 |
+| `bt_hover` | `selector`(string) 必填 | 悬停在元素上 |
+| `bt_drag` | `sourceSelector`, `targetSelector`(string) 必填 | 从源元素拖到目标元素 |
+| `bt_press_key` | `key`(string) 必填, `selector`(string) 可选 | 按键（如 Enter/Escape）；可指定聚焦元素 |
+| `bt_upload_file` | `selector`, `filePath`(string) 必填 | 向文件输入框上传文件 |
+| `bt_screenshot` | `selector`(string) 可选（当前忽略） | 截取当前视口，返回图片附件（PNG） |
+| `bt_evaluate` | `script`(string) 必填 | 在页面执行 JS 并返回 JSON 结果 |
+| `bt_get_visible_text` | `selector`(string) 可选 | 返回页面/元素可见文本 |
+| `bt_get_visible_html` | `selector`, `removeScripts`(boolean), `removeComments`(boolean), `maxLength`(number) | 返回页面/元素 HTML |
+| `bt_console_logs` | `type`(string), `search`(string), `limit`(number), `clear`(boolean) | 读取页面控制台日志 |
+| `bt_go_back` | 无 | 浏览器后退，返回当前 URL |
+| `bt_go_forward` | 无 | 浏览器前进，返回当前 URL |
+| `bt_resize` | `width`, `height`(number) 必填 | 调整窗口尺寸（逻辑像素） |
+| `bt_set_device` | `name`(string) 可选 | 应用设备预设（空参数列出 13 种预设） |
+| `bt_devtools` | `action`(string)：`toggle`/`open`/`close` | 开关开发者工具 |
+| `bt_reload` | 无 | 刷新当前页面，返回 URL |
+| `bt_close` | 无 | 退出浏览器外壳 |
+| `bt_show_notification` | `message`(string), `type`(string)：`ok`/`bad`/`err` | 显示页面通知气泡 |
+| `bt_scroll` | `direction`(string)：`up`/`down`/`left`/`right`, `amount`(number) | 滚动页面 |
+| `bt_wait_for_selector` | `selector`, `timeout`(number, ms) | 等待元素出现 |
+| `bt_click_and_switch_tab` | `selector`(string) 必填 | 点击元素；若触发新标签则自动切换，返回当前 URL |
+| `bt_iframe_click` | `iframeSelector`, `selector`(string) 必填 | 在 iframe 中点击（仅同源可访问） |
+| `bt_iframe_fill` | `iframeSelector`, `selector`, `value`(string) 必填 | 在 iframe 中输入（仅同源可访问） |
+| `bt_save_as_pdf` | 无 | ⚠ 当前架构不支持，调用明确报错 |
+| `bt_get_browser_status` | 无 | 返回 open/url/title/tabs 数量 |
+| `bt_list_tabs` | 无 | 列出标签页（索引+URL） |
+| `bt_switch_tab` | `index`(number) 必填 | 按位置（0 起）切换标签 |
+| `bt_new_tab` | `url`(string) 必填 | 新建独立标签页（真多标签）并导航 |
+| `bt_close_tab` | `index`(number) 可选 | 关闭指定标签；缺省关闭当前激活标签 |
+| `bt_get_element_state` | `selector`(string) 必填 | 返回元素可见性/文本/位置 |
+| `bt_scroll_to_element` | `selector`(string) 必填 | 滚动到元素 |
+| `bt_get_dropdown_options` | `selector`(string) 必填 | 列出下拉框选项 |
+| `bt_custom_user_agent` | `userAgent`(string) 必填 | 设置自定义 User-Agent（仅 Windows 支持） |
+| `bt_expect_response` | `url`(string) 必填 | 记录期望匹配的响应模式，清空响应历史后重新捕获 |
+| `bt_assert_response` | `id`(string) 必填 | 断言是否存在匹配的响应（返回 `url` + `status` 码） |
+| `bt_get_accessibility_tree` | `selector`, `maxDepth`(number) | 返回页面可访问性树（role/name/value 嵌套结构） |
+| `bt_list_records` | 无 | 列出批注/截图记录（索引/标签/说明） |
+| `bt_read_record_content` | `id`(number) 必填 | 读取单条记录详情 |
+
+> 架构限制：`bt_save_as_pdf`（PDF 导出）在 Tauri WebView 架构下无法实现，调用会明确报错而非假成功。
 
 ## 设备预设
 
@@ -95,7 +142,7 @@ cd rust && cargo build --release
 npm publish
 ```
 
-只发布 `dist/` 和 `bin/`（`files: ["dist", "bin"]`）。
+只发布 `dist/`（`files: ["dist"]`）。
 
 ## 开发
 

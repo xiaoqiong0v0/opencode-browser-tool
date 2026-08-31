@@ -13,13 +13,14 @@ function resolveShellBinary(): string {
     process.env.BT_SHELL_PATH,
     resolve(__dirname, "bin", `bt-shell-${platform}.exe`),
     resolve(__dirname, "bin", `bt-shell-${platform}`),
+    resolve(__dirname, "..", "rust", "target", "release", process.platform === "win32" ? "bt-shell.exe" : "bt-shell"),
     resolve(__dirname, "..", "rust", "target", "debug", process.platform === "win32" ? "bt-shell.exe" : "bt-shell"),
   ];
   for (const c of candidates) {
     if (c && existsSync(c)) return c;
   }
-  // 默认:开发环境用 cargo target
-  return resolve(__dirname, "..", "rust", "target", "debug", process.platform === "win32" ? "bt-shell.exe" : "bt-shell");
+  // 默认:开发环境用 cargo target 产物(release 优先)
+  return resolve(__dirname, "..", "rust", "target", "release", process.platform === "win32" ? "bt-shell.exe" : "bt-shell");
 }
 
 let serviceProcess: any = null;

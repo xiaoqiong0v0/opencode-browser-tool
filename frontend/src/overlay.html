@@ -12,18 +12,19 @@
       :root, [data-theme="dark"] {
         --pop-bg: #2a2a2a; --pop-fg: #eee; --pop-border: #4a6d5a;
         --input-bg: #1e1e1e; --btn-bg: #3a3a3a; --btn-fg: #ccc; --btn-hover: #444;
-        --title-fg: #aaa;
+        --title-fg: #aaa; --shot-bg: #000;
       }
       [data-theme="light"] {
         --pop-bg: #fff; --pop-fg: #333; --pop-border: #4a6d5a;
         --input-bg: #f5f5f5; --btn-bg: #e6e6e6; --btn-fg: #555; --btn-hover: #ddd;
-        --title-fg: #888;
+        --title-fg: #888; --shot-bg: #888;
       }
       #toast {
         position: fixed; top: 16px; left: 50%; transform: translateX(-50%);
         padding: 8px 16px; border-radius: 6px; font: 13px system-ui, sans-serif;
         color: #fff; pointer-events: none; opacity: 0; transition: opacity 0.25s;
-        z-index: 9999; max-width: 70%; word-break: break-all;
+        /* 最高层级:截图预览/批注弹框/遮罩之上,提示不被遮挡 */
+        z-index: 12000; max-width: 70%; word-break: break-all;
       }
       #toast.show { opacity: 1; }
       #toast.ok { background: rgba(16, 163, 127, 0.92); }
@@ -40,7 +41,8 @@
       }
       #note-pop .box-title { font-size: 12px; color: var(--title-fg); margin-bottom: 6px; }
       #note-pop textarea {
-        width: 100%; height: 56px; resize: none; box-sizing: border-box;
+        width: 100%; height: 56px; min-height: 40px; max-height: 200px;
+        resize: vertical; box-sizing: border-box;
         background: var(--input-bg); color: var(--pop-fg); border: 1px solid #444; border-radius: 5px;
         padding: 6px; font: 13px system-ui; outline: none;
       }
@@ -52,6 +54,8 @@
       #note-pop .btns button svg { width: 16px; height: 16px; }
       #note-pop #note-pop-ok { background: #4a6d5a; color: #fff; }
       #note-pop #note-pop-ok:hover { background: #5a7d6a; }
+      #note-pop #note-pop-send { background: #3b5bdb; color: #fff; }
+      #note-pop #note-pop-send:hover { background: #4a6ae0; }
       #note-pop #note-pop-cancel { background: var(--btn-bg); color: var(--btn-fg); }
       #note-pop #note-pop-cancel:hover { background: var(--btn-hover); }
       /* 面板遮罩:面板打开时覆盖页面区,点击关闭面板 */
@@ -68,12 +72,40 @@
       #shot-preview.show { display: flex; }
       #shot-preview .preview-box {
         display: flex; flex-direction: column; align-items: center; gap: 10px;
-        max-width: 92vw; max-height: 92vh;
+        max-width: 92vw; max-height: 92vh; position: relative;
       }
-      #shot-preview img {
-        max-width: 92vw; max-height: 76vh; border: 2px solid var(--pop-border);
-        border-radius: 6px; background: #fff; box-shadow: 0 8px 30px rgba(0,0,0,.6);
+      /* 固定视口:图片完整显示(等比缩放内),内部滑动框选裁剪区域 */
+      #shot-preview .shot-viewport {
+        max-width: 92vw; max-height: 76vh; width: 92vw;
+        overflow: hidden; position: relative;
+        border: 2px solid var(--pop-border); border-radius: 6px;
+        background: var(--shot-bg); box-shadow: 0 8px 30px rgba(0,0,0,.6);
+        display: flex; align-items: center; justify-content: center;
       }
+      /* 图片包裹层:inline-flex 按图片实际尺寸撑开(避免 flex+max-width 循环依赖塌缩),框选坐标系基于此 */
+      #shot-preview .shot-img-wrap {
+        position: relative; display: inline-flex;
+      }
+      #shot-preview .shot-viewport img {
+        display: block; user-select: none;
+        max-width: 92vw; max-height: 76vh;
+      }
+      /* 框选裁剪层:选区内透明,选区外半透明遮罩(box-shadow 扩散) */
+      #crop-layer { position: absolute; inset: 0; pointer-events: none; }
+      #crop-box {
+        position: absolute; border: 2px solid #4caf50; background: transparent;
+        box-shadow: 0 0 0 100vmax rgba(0,0,0,0.5);
+        display: none; box-sizing: border-box;
+      }
+      #crop-box.crop-active { display: block; }
+      .crop-handle {
+        position: absolute; width: 11px; height: 11px; background: #fff;
+        border: 2px solid #4caf50; border-radius: 2px; box-sizing: border-box;
+      }
+      .crop-handle.nw { left: -6px; top: -6px; cursor: nwse-resize; }
+      .crop-handle.ne { right: -6px; top: -6px; cursor: nesw-resize; }
+      .crop-handle.sw { left: -6px; bottom: -6px; cursor: nesw-resize; }
+      .crop-handle.se { right: -6px; bottom: -6px; cursor: nwse-resize; }
       #shot-preview .shot-bar {
         display: flex; align-items: center; gap: 8px; width: 100%;
         background: var(--pop-bg); border: 1px solid var(--pop-border); border-radius: 8px;
@@ -108,12 +140,25 @@
         <div class="btns">
           <button id="note-pop-cancel"><i data-lucide="x"></i></button>
           <button id="note-pop-ok"><i data-lucide="check"></i></button>
+          <button id="note-pop-send" title="保存并发送全部"><i data-lucide="send"></i></button>
         </div>
       </div>
     </div>
     <div id="shot-preview">
       <div class="preview-box">
-        <img id="shot-img" alt="screenshot" />
+        <div class="shot-viewport">
+          <div class="shot-img-wrap">
+            <img id="shot-img" alt="screenshot" />
+            <div id="crop-layer">
+              <div id="crop-box">
+                <span class="crop-handle nw"></span>
+                <span class="crop-handle ne"></span>
+                <span class="crop-handle sw"></span>
+                <span class="crop-handle se"></span>
+              </div>
+            </div>
+          </div>
+        </div>
         <div class="shot-bar">
           <textarea id="shot-note" placeholder="截图说明..."></textarea>
           <div class="shot-btns">

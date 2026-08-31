@@ -66,12 +66,15 @@
       }
       #btn-panel-close svg { width: 14px; height: 14px; }
       #btn-panel-close:hover { background: var(--panel-hover); color: var(--fg); }
-      /* 双 tab 切换 */
-      .tabs { display: flex; gap: 4px; }
+      /* 顶部导航 tab(导航样式:下划线指示激活,非功能按钮) */
+      .tabs { display: flex; border-bottom: 1px solid var(--border); }
       .tab-btn {
-        flex: 1; padding: 7px 0; font-weight: 600; color: var(--fg-dim);
+        flex: 1; padding: 8px 0; font-weight: 600; color: var(--fg-dim);
+        background: transparent; border: none; border-radius: 0;
+        border-bottom: 2px solid transparent; margin-bottom: -1px;
       }
-      .tab-btn.active { background: var(--accent-active); border-color: var(--accent); color: var(--fg); }
+      .tab-btn:hover { background: var(--panel-hover); color: var(--fg); }
+      .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); background: transparent; }
       .pane { display: flex; flex-direction: column; gap: 8px; min-height: 0; }
       .pane[hidden] { display: none; }
       #tab-ai-pane { flex: 1; }
@@ -84,9 +87,42 @@
         border: 1px solid var(--border);
         border-radius: 4px;
         padding: 6px;
+        padding-right: 4px;
         background: var(--rec-bg);
       }
-      .rec { padding: 4px 2px; border-bottom: 1px solid var(--rec-border); word-break: break-all; }
+      /* 自定义滚动条:细窄、圆角、主题适配 */
+      #records::-webkit-scrollbar {
+        width: 8px;
+      }
+      #records::-webkit-scrollbar-track {
+        background: transparent;
+      }
+      #records::-webkit-scrollbar-thumb {
+        background: var(--border);
+        border-radius: 4px;
+        border: 2px solid transparent;
+        background-clip: content-box;
+      }
+      #records::-webkit-scrollbar-thumb:hover {
+        background: var(--muted);
+        border: 2px solid transparent;
+        background-clip: content-box;
+      }
+      /* Firefox */
+      #records {
+        scrollbar-width: thin;
+        scrollbar-color: var(--border) transparent;
+      }
+      /* 每条记录独立卡片:分隔清晰 */
+      .rec {
+        padding: 8px;
+        border-radius: 6px;
+        background: var(--panel-bg);
+        border: 1px solid var(--rec-border);
+        margin-bottom: 8px;
+        word-break: break-all;
+      }
+      .rec:last-child { margin-bottom: 0; }
       .rec-head { display: flex; align-items: center; gap: 6px; }
       .rec-tag {
         font-size: 11px; padding: 1px 5px; border-radius: 3px; color: #fff; flex-shrink: 0;
@@ -94,14 +130,23 @@
       .rec-tag.annotate { background: #4a6d5a; }
       .rec-tag.screenshot { background: #3b5bdb; }
       .rec-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .rec-url { color: var(--muted); font-size: 11px; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .rec-note { color: var(--muted); font-size: 12px; margin-top: 2px; }
       .rec-thumb { max-width: 100%; border-radius: 4px; margin-top: 4px; border: 1px solid var(--rec-border); }
       .empty { color: var(--empty); text-align: center; padding: 20px 0; }
       #btn-send { background: var(--accent-blue); color: #fff; border-color: var(--accent-blue); }
       #btn-send:hover { filter: brightness(1.1); }
-      #send-result { font-size: 12px; text-align: center; min-height: 16px; }
-      .send-ok { color: var(--accent); }
-      .send-empty { color: var(--empty); }
+      /* 统一通知气泡(与批注/截图一致) */
+      #toast {
+        position: fixed; top: 16px; left: 50%; transform: translateX(-50%);
+        padding: 8px 16px; border-radius: 6px; font: 13px system-ui, sans-serif;
+        color: #fff; pointer-events: none; opacity: 0; transition: opacity 0.25s;
+        z-index: 12000; max-width: 70%; word-break: break-all;
+      }
+      #toast.show { opacity: 1; }
+      #toast.ok { background: rgba(16, 163, 127, 0.92); }
+      #toast.bad { background: rgba(245, 158, 11, 0.92); }
+      #toast.err { background: rgba(220, 38, 38, 0.92); }
     </style>
   </head>
   <body>
@@ -113,15 +158,11 @@
       <button id="tab-ai" class="tab-btn active">🤖 AI 功能</button>
       <button id="tab-config" class="tab-btn">⚙ 配置</button>
     </div>
-    <!-- Tab1:AI 功能区(顶部功能按钮 → 中间记录 → 底部发送) -->
+    <!-- Tab1:AI 功能区(记录列表 → 底部发送;批注/截图已移至工具栏) -->
     <div id="tab-ai-pane" class="pane">
-      <div class="row">
-        <button id="btn-annotate"><i data-lucide="pen-line"></i>批注</button>
-        <button id="btn-shot"><i data-lucide="camera"></i>截图</button>
-      </div>
       <div id="records"></div>
       <button id="btn-send"><i data-lucide="send"></i>发送</button>
-      <div id="send-result" class="send-empty"></div>
+      <div id="toast"></div>
     </div>
     <!-- Tab2:配置区(外观放顶部) -->
     <div id="tab-config-pane" class="pane" hidden>

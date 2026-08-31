@@ -96,7 +96,8 @@ impl App {
             let cur = url["url"].as_str().unwrap_or("").to_string();
             Ok::<_, String>((cur, title))
         })?;
-        Ok(json!({ "open": true, "url": st.0, "title": st.1, "tabs": 1, "installing": {} }))
+        let tabs_count = self.handle.state::<crate::ui::UiState>().tabs.lock().unwrap().len();
+        Ok(json!({ "open": true, "url": st.0, "title": st.1, "tabs": tabs_count, "installing": {} }))
     }
 
     async fn navigate(&self, body: &Value) -> Result<Value, String> {
@@ -380,7 +381,14 @@ impl App {
             let js = "history.back(); true";
             control::eval(&handle, js)
         })?;
-        Ok(json!({ "back": true }))
+        // 等待导航生效后读取当前 URL
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let handle2 = self.handle.clone();
+        let url = tokio::task::block_in_place(|| {
+            let v = control::page_state(&handle2).unwrap_or_default();
+            v["url"].as_str().unwrap_or("").to_string()
+        });
+        Ok(json!({ "back": true, "url": url }))
     }
 
     async fn go_forward(&self) -> Result<Value, String> {
@@ -389,7 +397,14 @@ impl App {
             let js = "history.forward(); true";
             control::eval(&handle, js)
         })?;
-        Ok(json!({ "forward": true }))
+        // 等待导航生效后读取当前 URL
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let handle2 = self.handle.clone();
+        let url = tokio::task::block_in_place(|| {
+            let v = control::page_state(&handle2).unwrap_or_default();
+            v["url"].as_str().unwrap_or("").to_string()
+        });
+        Ok(json!({ "forward": true, "url": url }))
     }
 
     async fn resize(&self, body: &Value) -> Result<Value, String> {
@@ -420,12 +435,33 @@ impl App {
         Ok(json!({ "logs": logs }))
     }
 
-    async fn expect_response(&self, _body: &Value) -> Result<Value, String> {
-        Err("network response interception not supported in this architecture yet".into())
+    /// 记录期望:清空响应历史并登记(声明"从此开始捕获")
+    async fn expect_response(&self, body: &Value) -> Result<Value, String> {
+        let pattern = body
+            .get("urlPattern")
+            .or_else(|| body.get("url"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        crate::control::responses::clear();
+        Ok(json!({ "expected": true, "pattern": pattern }))
     }
 
-    async fn assert_response(&self, _body: &Value) -> Result<Value, String> {
-        Err("network response interception not supported in this architecture yet".into())
+    /// 断言响应:在已捕获历史中匹配 pattern(URL 子串),返回最近命中
+    async fn assert_response(&self, body: &Value) -> Result<Value, String> {
+        let pattern = body
+            .get("id")
+            .or_else(|| body.get("urlPattern"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if pattern.is_empty() {
+            return Ok(json!({ "matched": false, "error": "no pattern provided" }));
+        }
+        match crate::control::responses::find(&pattern) {
+            Some(entry) => Ok(json!({ "matched": true, "url": entry.url, "status": entry.status })),
+            None => Ok(json!({ "matched": false, "error": "no response matched the pattern yet" })),
+        }
     }
 
     async fn pdf(&self) -> Result<Value, String> {
@@ -444,26 +480,64 @@ impl App {
     }
 
     async fn accessibility(&self) -> Result<Value, String> {
-        Err("accessibility tree not supported in this architecture yet".into())
+        let handle = self.handle.clone();
+        let tree =
+            tokio::task::block_in_place(|| crate::control::accessibility::accessibility_tree(&handle))?;
+        Ok(tree)
     }
 
+    /// 标签列表(真实多标签,含 id/url/title)
     async fn tabs(&self) -> Result<Value, String> {
-        Ok(json!({ "tabs": [] }))
+        let state = self.handle.state::<crate::ui::UiState>();
+        let tabs = state.tabs.lock().unwrap().clone();
+        let list: Vec<serde_json::Value> = tabs
+            .iter()
+            .map(|t| json!({ "id": t.id, "url": t.url, "title": t.title }))
+            .collect();
+        Ok(json!({ "tabs": list }))
     }
 
+    /// 新建标签:真多标签独立 Webview 并导航(工具栏/+ / target=_blank 共用逻辑)
     async fn tabs_new(&self, body: &Value) -> Result<Value, String> {
         let url = body.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string();
+        if url.is_empty() {
+            return Err("url is required".into());
+        }
         let handle = self.handle.clone();
-        tokio::task::block_in_place(|| control::navigate(&handle, &url))?;
-        Ok(json!({ "opened": true }))
+        tokio::task::block_in_place(|| crate::ui::open_new_tab(&handle, &url))?;
+        Ok(json!({ "opened": true, "url": url }))
     }
 
-    async fn tabs_switch(&self, _body: &Value) -> Result<Value, String> {
-        Err("multi-tab not supported in this single-page architecture".into())
+    /// 切换标签(index:标签位置 0 起,映射到真实 tab id)
+    async fn tabs_switch(&self, body: &Value) -> Result<Value, String> {
+        let idx = body.get("index").and_then(|v| v.as_i64()).unwrap_or(0) as usize;
+        let state = self.handle.state::<crate::ui::UiState>();
+        let tabs = state.tabs.lock().unwrap();
+        let tid = tabs.get(idx).map(|t| t.id).ok_or("tab index out of range")?;
+        let url = tabs[idx].url.clone();
+        drop(tabs);
+        let handle = self.handle.clone();
+        tokio::task::block_in_place(|| crate::ui::switch_tab(&handle, tid))?;
+        Ok(json!({ "switched": true, "url": url }))
     }
 
-    async fn tabs_close(&self, _body: &Value) -> Result<Value, String> {
-        Err("multi-tab not supported in this single-page architecture".into())
+    /// 关闭标签(index 可选:不传/负数关闭当前激活标签)
+    async fn tabs_close(&self, body: &Value) -> Result<Value, String> {
+        let idx = body.get("index").and_then(|v| v.as_i64());
+        let state = self.handle.state::<crate::ui::UiState>();
+        let tabs = state.tabs.lock().unwrap();
+        let tid = match idx {
+            Some(i) if i >= 0 => tabs.get(i as usize).map(|t| t.id).ok_or("tab index out of range")?,
+            _ => {
+                // 不传 index:关闭当前激活标签
+                let active = *state.active_tab.lock().unwrap();
+                active
+            }
+        };
+        drop(tabs);
+        let handle = self.handle.clone();
+        tokio::task::block_in_place(|| crate::ui::close_tab(&handle, tid))?;
+        Ok(json!({ "closed": true }))
     }
 
     /// 在 iframe 中点击元素
@@ -529,7 +603,14 @@ impl App {
         let s = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let handle = self.handle.clone();
         tokio::task::block_in_place(|| control::click(&handle, &s))?;
-        Ok(json!({ "clicked": true }))
+        // 点击后读取当前 URL(点击可能触发导航)
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let handle2 = self.handle.clone();
+        let url = tokio::task::block_in_place(|| {
+            let v = control::page_state(&handle2).unwrap_or_default();
+            v["url"].as_str().unwrap_or("").to_string()
+        });
+        Ok(json!({ "clicked": true, "url": url }))
     }
 
     // ---- 批注状态机端点 ----

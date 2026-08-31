@@ -122,6 +122,15 @@
       }
       #btn-panel:hover { background: var(--btn-hover); }
       #btn-panel.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+      /* 批注/截图快捷按钮(⚙ 面板按钮左侧,免开面板直接操作) */
+      .tool-btn {
+        flex-shrink: 0; padding: 4px 10px; border: 1px solid var(--border); border-radius: 14px;
+        background: color-mix(in srgb, var(--btn-bg) 80%, var(--fg) 10%); color: var(--btn-fg);
+        cursor: pointer; font: 13px system-ui; display: flex; align-items: center; gap: 4px;
+      }
+      .tool-btn svg { width: 14px; height: 14px; }
+      .tool-btn:hover { background: var(--btn-hover); }
+      .tool-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
     </style>
   </head>
   <body>
@@ -142,6 +151,8 @@
       <div id="btn-forward" class="nav-btn" title="前进">→</div>
       <div id="btn-reload" class="nav-btn" title="刷新">⟳</div>
       <input id="addr" placeholder="输入地址，回车导航" spellcheck="false" />
+      <button id="btn-annotate" class="tool-btn" title="批注模式(点击元素标注)"><i data-lucide="pen-line"></i>批注</button>
+      <button id="btn-shot" class="tool-btn" title="立即截图"><i data-lucide="camera"></i>截图</button>
       <button id="btn-panel" title="功能面板">⚙ 面板</button>
     </div>
     <script src="toolbar.js"></script>

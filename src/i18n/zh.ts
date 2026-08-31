@@ -4,7 +4,6 @@ const zh: LocaleStrings = {
   tool: {
     "tool.navigate.desc": "导航浏览器到指定 URL",
     "tool.navigate.arg.url": "目标 URL",
-    "tool.navigate.arg.headless": "无头模式运行（不显示窗口）。默认 false（有界面）",
 
     "tool.click.desc": "点击页面元素",
     "tool.click.arg.selector": "元素的 CSS 选择器",
@@ -140,8 +139,6 @@ const zh: LocaleStrings = {
     "msg.tab.new": "已打开新标签页: {url}",
     "msg.tab.closed": "已关闭标签页 #{idx}",
     "msg.tab.closed_current": "已关闭当前标签页",
-    "msg.click_switch.done": "已点击并切换到新标签页: {url}",
-    "msg.click_switch.clicked": "已点击: {selector}",
     "msg.wait_selector.found": "元素已出现",
     "msg.record.sent": " (已发送)",
     "msg.browser.installing": "正在安装 {browser}（{progress}）。请稍后重试 bt_navigate。",

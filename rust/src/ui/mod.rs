@@ -3,6 +3,9 @@
 //! 工具栏 Webview 顶部横条(标签 + 地址栏 + 面板开关)
 //! 覆盖层 Webview 透明叠加,面板 Webview 覆盖式浮层(不占页面)
 pub mod annotate;
+/// 新窗口拦截(Windows:target=_blank → 新标签页)
+#[cfg(windows)]
+pub mod new_window;
 
 use std::sync::Mutex;
 
@@ -36,9 +39,8 @@ pub struct TabState {
     pub webview: Option<String>,
 }
 
-/// 预创建页面 Webview 数量(真多标签,保持创建顺序使 overlay/panel 位于最上)
-/// 超过该数量的新标签走动态创建(create_tab_webview)
-pub const MAX_TABS: u32 = 10;
+/// 预创建页面 Webview 数量(初始少量,其余动态创建;动态创建后用 SetWindowPos 置顶浮层)
+pub const MAX_TABS: u32 = 3;
 
 /// 新标签页地址(tauri 内部页面,背景跟随主题,不依赖 webview 默认背景色)
 pub const NEWTAB_URL: &str = "tauri://localhost/newtab.html";
@@ -71,6 +73,8 @@ pub struct AnnotationRecord {
     /// 记录类型:annotate(批注) / screenshot(截图)
     #[serde(rename = "type")]
     pub typ: String,
+    /// 记录时所在页面地址(换地址/路由后按地址区分)
+    pub url: String,
     pub selector: String,
     pub rect: (i32, i32, i32, i32),
     pub note: String,
@@ -220,6 +224,12 @@ pub fn create_ui(app: &AppHandle) -> tauri::Result<()> {
         )?;
         // 全部先隐藏,避免布局定位前在左上角闪现 100x100 黑框
         let _ = w.hide();
+        // 注册新窗口拦截(target=_blank → 新标签页)
+        #[cfg(windows)]
+        new_window::setup(app, &w);
+        // 注册响应捕获(expect/assert-response 查询历史)
+        #[cfg(windows)]
+        crate::control::responses::setup(app, &w);
     }
     // 初始标签绑定 webview label
     {
@@ -326,7 +336,33 @@ pub fn apply_layout(app: &AppHandle, size: tauri::PhysicalSize<u32>, scale: f64)
         w.set_position(tauri::PhysicalPosition::new(px.max(0), toolbar_h.max(0)))?;
         w.set_size(tauri::PhysicalSize::new(pw.max(0) as u32, page_h.max(0) as u32))?;
     }
+    // 覆盖层/面板重新置顶:动态创建的页面 webview 会排在它们之上,导致切换标签后面板被盖
+    #[cfg(windows)]
+    bring_webviews_to_top(app);
     Ok(())
+}
+
+/// 覆盖层/面板置顶(Windows):每个 webview 有独立 host HWND(controller 的父窗口),
+/// 动态创建的页面 webview 会排在 overlay/panel 之上,用 SetWindowPos 把浮层提到最上
+#[cfg(windows)]
+pub fn bring_webviews_to_top(app: &AppHandle) {
+    use tauri::Manager;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{SetWindowPos, HWND_TOP, SWP_NOMOVE, SWP_NOSIZE};
+    // 先 overlay 后 panel,panel 最终在最上
+    for label in [OVERLAY_WEBVIEW, PANEL_WEBVIEW] {
+        if let Some(w) = app.get_webview(label) {
+            let _ = w.with_webview(move |platform_webview| {
+                unsafe {
+                    let controller = platform_webview.controller();
+                    let mut parent: HWND = HWND::default();
+                    if controller.ParentWindow(&mut parent).is_ok() {
+                        let _ = SetWindowPos(parent, Some(HWND_TOP), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+                    }
+                }
+            });
+        }
+    }
 }
 
 /// 获取激活标签的页面 Webview(真多标签:按 active_tab 的 webview label)
@@ -358,6 +394,12 @@ pub fn create_tab_webview(app: &AppHandle, id: u32) -> Result<tauri::webview::We
         .map_err(|e| format!("create page webview failed: {e}"))?;
     // 初始隐藏,切换到该标签时才显示
     let _ = w.hide();
+    // 注册新窗口拦截(target=_blank → 新标签页)
+    #[cfg(windows)]
+    new_window::setup(app, &w);
+    // 注册响应捕获(expect/assert-response 查询历史)
+    #[cfg(windows)]
+    crate::control::responses::setup(app, &w);
     // 应用布局(定位到页面区)
     if let Some(win) = app.get_window("main") {
         if let Ok(size) = win.inner_size() {
@@ -412,8 +454,72 @@ pub fn emit_tabs_changed(app: &AppHandle) {
     );
 }
 
-/// 发送所有记录:快照入 sent_records 队列(插件端轮询 consume),返回记录数量
-/// 面板"发送"按钮、截图模式"发送"按钮共用
+/// 打开面板:展开尺寸 + 遮罩盖页面区 + 广播状态
+pub fn open_panel(app: &AppHandle) {
+    {
+        let state = app.state::<UiState>();
+        *state.panel_open.lock().unwrap() = true;
+    }
+    if let Some(win) = app.get_window("main") {
+        if let (Ok(size), Ok(scale)) = (win.inner_size(), win.scale_factor()) {
+            let _ = apply_layout(app, size, scale);
+        }
+    }
+    let _ = eval_overlay(app, "window.__btOverlay.showMask()");
+    emit_tabs_changed(app);
+}
+
+/// 仅收起面板(不退出模式/不动覆盖层):开启批注/截图模式时内部自动关面板用
+pub fn collapse_panel(app: &AppHandle) {
+    {
+        let state = app.state::<UiState>();
+        *state.panel_open.lock().unwrap() = false;
+    }
+    let _ = eval_overlay(app, "window.__btOverlay.hideMask()");
+    if let Some(win) = app.get_window("main") {
+        if let (Ok(size), Ok(scale)) = (win.inner_size(), win.scale_factor()) {
+            let _ = apply_layout(app, size, scale);
+        }
+    }
+    emit_tabs_changed(app);
+}
+
+/// 关闭面板(完整):收起面板 + 取消批注/截图模式 + 关闭对应弹窗 + 清理待确认
+/// 若存在未确认的截图预览/批注弹框(如"立即截图"后),保留覆盖层使其可见
+pub fn close_panel(app: &AppHandle) {
+    let state = app.state::<UiState>();
+    *state.panel_open.lock().unwrap() = false;
+    let _ = eval_overlay(app, "window.__btOverlay.hideMask()");
+    // 取消批注/截图模式(退出时覆盖层隐藏,批注弹框/截图预览随模式关闭)
+    let annotate = *state.annotate_mode.lock().unwrap();
+    if annotate {
+        let _ = annotate::Annotator::toggle(app, &state);
+    }
+    let shot = *state.shot_mode.lock().unwrap();
+    if shot {
+        let _ = annotate::Annotator::toggle_shot(app, &state);
+    }
+    // 存在未确认预览(立即截图/批注弹框)时保留覆盖层,否则隐藏
+    let has_pending = state.pending_shot.lock().unwrap().is_some()
+        || state.pending_click.lock().unwrap().is_some();
+    // 清理待确认
+    *state.pending_click.lock().unwrap() = None;
+    *state.pending_shot.lock().unwrap() = None;
+    if !has_pending {
+        if let Some(overlay) = overlay_webview(app) {
+            let _ = overlay.hide();
+        }
+    }
+    if let Some(win) = app.get_window("main") {
+        if let (Ok(size), Ok(scale)) = (win.inner_size(), win.scale_factor()) {
+            let _ = apply_layout(app, size, scale);
+        }
+    }
+    emit_tabs_changed(app);
+}
+
+/// 发送所有记录:快照入 sent_records 队列(插件端轮询 consume)并清空已发送记录,返回记录数量
+/// 面板"发送"、批注/截图"发送"按钮共用
 pub fn send_all_records(app: &AppHandle) -> usize {
     let state = app.state::<UiState>();
     let records = state.records.lock().unwrap();
@@ -424,6 +530,7 @@ pub fn send_all_records(app: &AppHandle) -> usize {
             serde_json::json!({
                 "index": r.index,
                 "type": r.typ,
+                "url": r.url,
                 "selector": r.selector,
                 "rect": [r.rect.0, r.rect.1, r.rect.2, r.rect.3],
                 "note": r.note,
@@ -432,9 +539,203 @@ pub fn send_all_records(app: &AppHandle) -> usize {
         })
         .collect();
     drop(records);
+    // 清空已发送的记录(发送后不再保留)
+    state.records.lock().unwrap().clear();
     *state.sent_records.lock().unwrap() = items;
-    let _ = app;
+    // 通知面板刷新(空列表)
+    use tauri::Emitter;
+    if let Some(panel) = panel_webview(app) {
+        let _ = panel.emit("records-changed", Vec::<AnnotationRecord>::new());
+    }
+    // 清空覆盖层批注/截图标记
+    let _ = eval_overlay(app, "window.__btOverlay._marks = []; window.__btOverlay.redraw([], [])");
     count
+}
+
+/// 获取当前激活标签的页面地址(记录归属地址)
+pub fn active_tab_url(app: &AppHandle) -> String {
+    let state = app.state::<UiState>();
+    let active = *state.active_tab.lock().unwrap();
+    state
+        .tabs
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|t| t.id == active)
+        .map(|t| t.url.clone())
+        .unwrap_or_default()
+}
+
+/// 标签切换/新建前清理:退出批注/截图模式并关闭面板
+/// (覆盖层停留在旧页面,切换/新建标签后需清理,避免残留遮挡)
+pub fn exit_modes_and_close_panel(app: &AppHandle) {
+    let state = app.state::<UiState>();
+    let annotate = *state.annotate_mode.lock().unwrap();
+    if annotate {
+        let _ = annotate::Annotator::toggle(app, &state);
+    }
+    let shot = *state.shot_mode.lock().unwrap();
+    if shot {
+        let _ = annotate::Annotator::toggle_shot(app, &state);
+    }
+    if *state.panel_open.lock().unwrap() {
+        close_panel(app);
+    }
+}
+
+/// 打开新标签页:创建独立页面 Webview 并导航(工具栏"+"与页面 target=_blank/window.open 事件共用)
+pub fn open_new_tab(app: &AppHandle, url: &str) -> Result<(), String> {
+    // 新建标签前清理:退出批注/截图模式并关闭面板
+    exit_modes_and_close_panel(app);
+    let url = normalize_url(url);
+    let state = app.state::<UiState>();
+    let id = {
+        let mut n = state.next_tab_id.lock().unwrap();
+        let id = *n;
+        *n += 1;
+        id
+    };
+    // 隐藏当前激活 webview
+    if let Some(cur) = active_page_webview(app) {
+        let _ = cur.hide();
+    }
+    // 优先复用预创建 webview,超出 MAX_TABS 则动态创建
+    let label = format!("{PAGE_WEBVIEW}-{id}");
+    let wv = match app.get_webview(&label) {
+        Some(w) => w,
+        None => create_tab_webview(app, id)?,
+    };
+    wv.show().map_err(|e| format!("show webview failed: {e}"))?;
+    // 记录标签并导航
+    {
+        let mut tabs = state.tabs.lock().unwrap();
+        if let Some(t) = tabs.iter_mut().find(|t| t.id == id) {
+            t.url = url.clone();
+            t.title = "新标签页".into();
+            t.webview = Some(label);
+        } else {
+            tabs.push(TabState { id, url: url.clone(), title: "新标签页".into(), webview: Some(label) });
+        }
+        *state.active_tab.lock().unwrap() = id;
+    }
+    let url2 = url.clone();
+    tokio::task::block_in_place(move || crate::control::navigate(app, &url2))?;
+    // 应用布局:将新标签 webview 定位到页面区全尺寸(预创建时仅在初始 100x100 位置)
+    if let Some(win) = app.get_window("main") {
+        let size = win.inner_size().map_err(|e| e.to_string())?;
+        let scale = win.scale_factor().unwrap_or(1.0);
+        apply_layout(app, size, scale).map_err(|e| e.to_string())?;
+    }
+    emit_tabs_changed(app);
+    Ok(())
+}
+
+/// 切换标签:隐藏当前 webview,显示目标 webview(不重新加载,保留页面状态)
+pub fn switch_tab(app: &AppHandle, id: u32) -> Result<(), String> {
+    let state = app.state::<UiState>();
+    let active = *state.active_tab.lock().unwrap();
+    if active == id {
+        return Ok(());
+    }
+    // 切换标签:退出批注/截图模式(覆盖层停留在旧页面)并自动关闭面板
+    exit_modes_and_close_panel(app);
+    let (cur_label, target_label) = {
+        let tabs = state.tabs.lock().unwrap();
+        (
+            tabs.iter().find(|t| t.id == active).and_then(|t| t.webview.clone()),
+            tabs.iter().find(|t| t.id == id).and_then(|t| t.webview.clone()),
+        )
+    };
+    if let Some(l) = cur_label {
+        if let Some(w) = app.get_webview(&l) {
+            let _ = w.hide();
+        }
+    }
+    if let Some(l) = target_label {
+        if let Some(w) = app.get_webview(&l) {
+            w.show().map_err(|e| format!("show webview failed: {e}"))?;
+        }
+    }
+    *state.active_tab.lock().unwrap() = id;
+    emit_tabs_changed(app);
+    // 切到动态创建的标签时其 webview 会盖住面板,重新置顶浮层
+    #[cfg(windows)]
+    bring_webviews_to_top(app);
+    Ok(())
+}
+
+/// 关闭标签:销毁其 webview,切换到邻近标签(关闭最后一个则自动新建空白标签)
+pub fn close_tab(app: &AppHandle, id: u32) -> Result<(), String> {
+    let state = app.state::<UiState>();
+    let mut tabs = state.tabs.lock().unwrap();
+    let pos = tabs.iter().position(|t| t.id == id);
+    let Some(pos) = pos else { return Err("tab not found".into()) };
+    let closed_label = tabs[pos].webview.clone();
+    tabs.remove(pos);
+    let active = *state.active_tab.lock().unwrap();
+    if active != id {
+        // 关闭非激活标签:仅移除记录,不切换
+        emit_tabs_changed(app);
+        return Ok(());
+    }
+    let new_active;
+    if tabs.is_empty() {
+        // 关闭最后一个:自动新建空白标签
+        let nid = {
+            let mut n = state.next_tab_id.lock().unwrap();
+            let nid = *n;
+            *n += 1;
+            nid
+        };
+        tabs.push(TabState { id: nid, url: NEWTAB_URL.to_string(), title: "新标签页".into(), webview: None });
+        new_active = nid;
+    } else {
+        // 优先激活右侧标签,否则左侧
+        new_active = tabs[pos.min(tabs.len() - 1)].id;
+    }
+    *state.active_tab.lock().unwrap() = new_active;
+    let target_label = tabs.iter().find(|t| t.id == new_active).and_then(|t| t.webview.clone());
+    drop(tabs);
+
+    // 新建空白标签:优先复用预创建 webview,否则动态创建
+    if target_label.is_none() {
+        let label = format!("{PAGE_WEBVIEW}-{new_active}");
+        let wv = match app.get_webview(&label) {
+            Some(w) => w,
+            None => create_tab_webview(app, new_active)?,
+        };
+        wv.show().map_err(|e| format!("show webview failed: {e}"))?;
+        {
+            let mut tabs = state.tabs.lock().unwrap();
+            if let Some(t) = tabs.iter_mut().find(|t| t.id == new_active) {
+                t.webview = Some(label);
+            }
+        }
+    }
+    // 显示目标 webview(若未隐藏则无操作)
+    if let Some(l) = &target_label {
+        if let Some(w) = app.get_webview(l) {
+            let _ = w.show();
+        }
+    }
+    // 隐藏被关闭标签的 webview(保留实例,避免 z 序变化影响 overlay/panel)
+    if let Some(l) = closed_label {
+        if let Some(w) = app.get_webview(&l) {
+            let _ = w.hide();
+        }
+    }
+    // 新建空白标签导航新标签页
+    if target_label.is_none() {
+        tokio::task::block_in_place(|| crate::control::navigate(app, NEWTAB_URL))?;
+    }
+    // 应用布局:确保激活标签 webview 尺寸正确
+    if let Some(win) = app.get_window("main") {
+        let size = win.inner_size().map_err(|e| e.to_string())?;
+        let scale = win.scale_factor().unwrap_or(1.0);
+        apply_layout(app, size, scale).map_err(|e| e.to_string())?;
+    }
+    emit_tabs_changed(app);
+    Ok(())
 }
 
 /// 规范化地址栏输入:裸域名/主机自动补 http:// 前缀

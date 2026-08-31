@@ -13,10 +13,11 @@ pub struct Device {
     pub ua: Option<&'static str>,
 }
 
-/// 内置设备预设表
+/// 内置设备预设表(首项 desktop-720p 为默认设备)
 pub const DEVICES: &[Device] = &[
+    Device { name: "desktop-720p", width: 1024.0, height: 720.0, ua: None },
     Device { name: "desktop-1080p", width: 1920.0, height: 1080.0, ua: None },
-    Device { name: "desktop-1440p", width: 1440.0, height: 900.0, ua: None },
+    Device { name: "desktop-900p", width: 1440.0, height: 900.0, ua: None },
     Device { name: "ipad-pro-11", width: 834.0, height: 1194.0, ua: Some("Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1") },
     Device { name: "ipad-10", width: 820.0, height: 1180.0, ua: Some("Mozilla/5.0 (iPad; CPU OS 16_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Mobile/15E148 Safari/604.1") },
     Device { name: "ipad-mini-6", width: 744.0, height: 1133.0, ua: Some("Mozilla/5.0 (iPad; CPU OS 15_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.5 Mobile/15E148 Safari/604.1") },

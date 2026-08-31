@@ -8,10 +8,6 @@ use crate::ui::{self, AnnotationRecord, PendingShot, RECORD_ANNOTATE, RECORD_SCR
 
 /// 悬停高亮色(0xRRGGBB)
 const HOVER_COLOR: u32 = 0xFFC107;
-/// 批注标记色
-const MARK_COLOR: u32 = 0x4CAF50;
-/// 截图标记色
-const SHOT_COLOR: u32 = 0x2196F3;
 
 /// 批注/截图状态机
 pub struct Annotator {
@@ -25,7 +21,7 @@ impl Annotator {
     }
 
     /// 切换批注模式(覆盖层显示/隐藏)
-    /// 开:显示覆盖层拦截鼠标,同时关闭右侧功能面板(批注需全页面交互)
+    /// 开:显示覆盖层拦截鼠标,同时关闭右侧功能面板(批注需全页面交互),并取消截图模式
     /// 关:隐藏覆盖层,页面恢复交互
     pub fn toggle(app: &AppHandle, state: &State<UiState>) -> Result<bool, String> {
         let mut mode = state.annotate_mode.lock().unwrap();
@@ -33,31 +29,31 @@ impl Annotator {
         let on = *mode;
         // 提前释放锁(emit_mode_state 需重新加锁,std Mutex 不可重入)
         drop(mode);
-        // 覆盖层显示状态:批注模式显示(拦截鼠标),否则隐藏(页面交互)
         let overlay = ui::overlay_webview(app).ok_or("overlay webview not ready")?;
+        let _ = ui::eval_overlay(app, "window.__btOverlay.hideMask()");
         if on {
-            // 批注与截图互斥
+            // 互斥:开启批注时取消截图模式
             *state.shot_mode.lock().unwrap() = false;
-            // 批注模式:隐藏面板遮罩(避免干扰),显示覆盖层拦截鼠标
-            let _ = ui::eval_overlay(app, "window.__btOverlay.hideMask()");
-            let _ = ui::eval_overlay(app, "window.__btOverlay.setMode('annotate')");
-            overlay.show().map_err(|e| format!("overlay show failed: {e}"))?;
+            *state.pending_shot.lock().unwrap() = None;
+            let _ = ui::eval_overlay(app, "window.__btOverlay.hideShotPreview()");
             // 批注模式需要全页面交互,自动关闭右侧面板
             Self::close_panel_if_open(app, state);
         } else {
-            overlay.hide().map_err(|e| format!("overlay hide failed: {e}"))?;
-            // 退出时清空高亮与待确认批注
+            // 退出时清空高亮、批注弹框与待确认批注
             let _ = ui::eval_overlay(app, "window.__btOverlay.redraw([], [])");
-            let _ = ui::eval_overlay(app, "window.__btOverlay.setMode('none')");
+            let _ = ui::eval_overlay(app, "window.__btOverlay.hideNotePop()");
             *state.pending_click.lock().unwrap() = None;
         }
-        // 广播模式状态,面板按钮激活态同步
+        let _ = overlay;
+        // 按当前模式状态同步覆盖层显示
+        Self::sync_overlay_display(app, state);
+        // 广播模式状态,面板/工具栏按钮激活态同步
         Self::emit_mode_state(app, state);
         Ok(on)
     }
 
     /// 切换截图模式
-    /// 开:显示覆盖层拦截鼠标,双击截全屏 / 拖动框选截区域
+    /// 开:显示覆盖层拦截鼠标,双击截全屏 / 拖动框选截区域,并取消批注模式
     /// 关:隐藏覆盖层,页面恢复交互
     pub fn toggle_shot(app: &AppHandle, state: &State<UiState>) -> Result<bool, String> {
         let mut shot = state.shot_mode.lock().unwrap();
@@ -65,33 +61,64 @@ impl Annotator {
         let on = *shot;
         // 提前释放锁(emit_mode_state 需重新加锁,std Mutex 不可重入)
         drop(shot);
-        let overlay = ui::overlay_webview(app).ok_or("overlay webview not ready")?;
+        let _ = ui::eval_overlay(app, "window.__btOverlay.hideMask()");
         if on {
-            // 批注与截图互斥
+            // 互斥:开启截图时取消批注模式
             *state.annotate_mode.lock().unwrap() = false;
-            let _ = ui::eval_overlay(app, "window.__btOverlay.hideMask()");
-            let _ = ui::eval_overlay(app, "window.__btOverlay.setMode('shot')");
-            overlay.show().map_err(|e| format!("overlay show failed: {e}"))?;
+            *state.pending_click.lock().unwrap() = None;
+            let _ = ui::eval_overlay(app, "window.__btOverlay.hideNotePop()");
             Self::close_panel_if_open(app, state);
         } else {
-            overlay.hide().map_err(|e| format!("overlay hide failed: {e}"))?;
             *state.pending_shot.lock().unwrap() = None;
-            let _ = ui::eval_overlay(app, "window.__btOverlay.setMode('none')");
             let _ = ui::eval_overlay(app, "window.__btOverlay.hideShotPreview()");
-            let _ = ui::eval_overlay(app, "window.__btOverlay.redraw([], [])");
         }
-        // 广播模式状态,面板按钮激活态同步
+        // 按当前模式状态同步覆盖层显示
+        Self::sync_overlay_display(app, state);
+        // 广播模式状态,面板/工具栏按钮激活态同步
         Self::emit_mode_state(app, state);
         Ok(on)
     }
 
-    /// 广播批注/截图模式状态,面板按钮激活态同步
-    fn emit_mode_state(app: &AppHandle, state: &State<UiState>) {
+    /// 按当前模式状态同步覆盖层显示:
+    /// 批注/截图可共存,优先显示最近激活的模式;两者都关时隐藏覆盖层
+    fn sync_overlay_display(app: &AppHandle, state: &State<UiState>) {
         let annotate = *state.annotate_mode.lock().unwrap();
         let shot = *state.shot_mode.lock().unwrap();
-        if let Some(panel) = ui::panel_webview(app) {
-            let _ = panel.emit("annotate-state", json!({ "annotate": annotate, "shot": shot }));
+        if annotate {
+            let _ = ui::eval_overlay(app, "window.__btOverlay.setMode('annotate')");
+            if let Some(overlay) = ui::overlay_webview(app) {
+                let _ = overlay.show();
+            }
+        } else if shot {
+            let _ = ui::eval_overlay(app, "window.__btOverlay.setMode('shot')");
+            if let Some(overlay) = ui::overlay_webview(app) {
+                let _ = overlay.show();
+            }
+        } else {
+            let _ = ui::eval_overlay(app, "window.__btOverlay.setMode('none')");
+            if let Some(overlay) = ui::overlay_webview(app) {
+                let _ = overlay.hide();
+            }
         }
+    }
+
+    /// 完成单次截图(立即截图后):退出截图模式并隐藏覆盖层(不恢复批注,已互斥取消)
+    fn complete_shot(app: &AppHandle, state: &State<UiState>) {
+        *state.shot_mode.lock().unwrap() = false;
+        *state.pending_shot.lock().unwrap() = None;
+        let _ = ui::eval_overlay(app, "window.__btOverlay.hideShotPreview()");
+        let _ = ui::eval_overlay(app, "window.__btOverlay.setMode('none')");
+        if let Some(overlay) = ui::overlay_webview(app) {
+            let _ = overlay.hide();
+        }
+        Self::emit_mode_state(app, state);
+    }
+
+    /// 广播批注/截图模式状态,面板与工具栏按钮激活态同步(全局广播,各 webview 各自 listen)
+    pub fn emit_mode_state(app: &AppHandle, state: &State<UiState>) {
+        let annotate = *state.annotate_mode.lock().unwrap();
+        let shot = *state.shot_mode.lock().unwrap();
+        let _ = app.emit("annotate-state", json!({ "annotate": annotate, "shot": shot }));
     }
 
     /// 处理覆盖层上报的鼠标事件
@@ -172,11 +199,31 @@ impl Annotator {
                 }
             }
             "note-submit" => {
-                // 弹框确定:读取待确认批注入列,刷新面板 + 画标记
+                // 弹框确定:有说明文字才保存批注入列,无则丢弃
                 let text = ev.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
                 let pending = state.pending_click.lock().unwrap().take();
                 if let Some(p) = pending {
-                    Self::push_record(app, state, RECORD_ANNOTATE, &p.selector, p.rect, &text, None);
+                    if !text.trim().is_empty() {
+                        Self::push_record(app, state, RECORD_ANNOTATE, &p.selector, p.rect, &text, None);
+                    }
+                }
+            }
+            "note-send" => {
+                // 弹框发送:有说明先保存当前批注,再发送所有记录,随后退出批注模式
+                let text = ev.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                let pending = state.pending_click.lock().unwrap().take();
+                if let Some(p) = pending {
+                    if !text.trim().is_empty() {
+                        Self::push_record(app, state, RECORD_ANNOTATE, &p.selector, p.rect, &text, None);
+                    }
+                }
+                let count = ui::send_all_records(app);
+                if let Some(panel) = ui::panel_webview(app) {
+                    let _ = panel.emit("records-sent", count);
+                }
+                // 发送后退出批注模式(取消工具激活)
+                if *state.annotate_mode.lock().unwrap() {
+                    let _ = Self::toggle(app, state);
                 }
             }
             "note-cancel" => {
@@ -203,7 +250,7 @@ impl Annotator {
                     match crate::control::screenshot::screenshot(&app2) {
                         Ok(img) => {
                             let rect = (0, 0, w, h);
-                            Self::store_pending_shot(&app2, img, rect);
+                            Self::show_shot_preview(&app2, img, rect);
                         }
                         Err(e) => {
                             let msg = format!("截图失败:{e}");
@@ -225,7 +272,7 @@ impl Annotator {
                 std::thread::spawn(move || {
                     match crate::control::screenshot::screenshot_clip(&app2, x, y, w, h) {
                         Ok(img) => {
-                            Self::store_pending_shot(&app2, img, (x, y, w, h));
+                            Self::show_shot_preview(&app2, img, (x, y, w, h));
                         }
                         Err(e) => {
                             let msg = format!("截图失败:{e}");
@@ -235,24 +282,40 @@ impl Annotator {
                 });
             }
             "shot-cancel" => {
-                // 取消本次截图
-                *state.pending_shot.lock().unwrap() = None;
-                let _ = ui::eval_overlay(app, "window.__btOverlay.hideShotPreview()");
+                // 取消本次截图,完成单次截图(恢复批注/隐藏覆盖层)
+                Self::complete_shot(app, state);
             }
             "shot-save" => {
-                // 保存截图记录(带说明文字),保持截图模式可继续
+                // 保存截图记录:有说明文字才保存,无则丢弃,完成后单次截图
                 let text = ev.get("note").and_then(|t| t.as_str()).unwrap_or("").to_string();
-                let pending = state.pending_shot.lock().unwrap().take();
-                if let Some(p) = pending {
-                    Self::push_record(app, state, RECORD_SCREENSHOT, "", p.rect, &text, Some(p.image));
+                if !text.trim().is_empty() {
+                    // 前端裁剪后的 base64(按选区裁剪),空则用整图
+                    let crop = ev.get("image").and_then(|i| i.as_str()).map(|s| s.to_string());
+                    let pending = state.pending_shot.lock().unwrap().take();
+                    if let Some(p) = pending {
+                        let image = crop.filter(|s| !s.is_empty()).unwrap_or(p.image);
+                        Self::push_record(app, state, RECORD_SCREENSHOT, "", p.rect, &text, Some(image));
+                    }
+                } else {
+                    *state.pending_shot.lock().unwrap() = None;
                 }
-                let _ = ui::eval_overlay(app, "window.__btOverlay.hideShotPreview()");
+                Self::complete_shot(app, state);
             }
             "shot-send" => {
-                // 发送所有记录(批注+截图),发送后退出截图模式
-                let _ = ui::eval_overlay(app, "window.__btOverlay.hideShotPreview()");
+                // 发送:有说明先保存当前截图,再发送所有记录,完成后单次截图
+                let text = ev.get("note").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                if !text.trim().is_empty() {
+                    let crop = ev.get("image").and_then(|i| i.as_str()).map(|s| s.to_string());
+                    let pending = state.pending_shot.lock().unwrap().take();
+                    if let Some(p) = pending {
+                        let image = crop.filter(|s| !s.is_empty()).unwrap_or(p.image);
+                        Self::push_record(app, state, RECORD_SCREENSHOT, "", p.rect, &text, Some(image));
+                    }
+                } else {
+                    *state.pending_shot.lock().unwrap() = None;
+                }
                 let count = ui::send_all_records(app);
-                let _ = Self::toggle_shot(app, state);
+                Self::complete_shot(app, state);
                 if let Some(panel) = ui::panel_webview(app) {
                     let _ = panel.emit("records-sent", count);
                 }
@@ -265,8 +328,8 @@ impl Annotator {
         }
     }
 
-    /// 截图完成:暂存待确认截图并显示预览(后台线程调用)
-    fn store_pending_shot(app: &AppHandle, image: String, rect: (i32, i32, i32, i32)) {
+    /// 截图完成:暂存待确认截图并显示预览(面板"立即截图"与截图模式共用)
+    pub fn show_shot_preview(app: &AppHandle, image: String, rect: (i32, i32, i32, i32)) {
         let state = app.state::<UiState>();
         *state.pending_shot.lock().unwrap() = Some(PendingShot { image: image.clone(), rect });
         let _ = ui::eval_overlay(
@@ -282,40 +345,21 @@ impl Annotator {
         );
     }
 
-    /// 关闭面板(遮罩点击触发):隐藏遮罩与覆盖层,重排面板消失,并广播状态同步工具栏按钮
+    /// 关闭面板(遮罩点击触发):完整关闭(退出模式 + 清理弹窗),并广播状态同步工具栏按钮
     pub fn close_panel(app: &AppHandle, state: &State<UiState>) {
-        let mut open = state.panel_open.lock().unwrap();
-        *open = false;
-        drop(open);
-        let _ = ui::eval_overlay(app, "window.__btOverlay.hideMask()");
-        if let Some(overlay) = ui::overlay_webview(app) {
-            let _ = overlay.hide();
-        }
-        if let Some(win) = app.get_window("main") {
-            let size = win.inner_size().unwrap_or_default();
-            let scale = win.scale_factor().unwrap_or(1.0);
-            let _ = ui::apply_layout(app, size, scale);
-        }
-        // 广播状态,工具栏面板按钮同步为非激活
-        ui::emit_tabs_changed(app);
+        let _ = state;
+        ui::close_panel(app);
     }
 
-    /// 面板打开时关闭(批注/截图模式需要全页面交互),关闭后广播状态同步工具栏
+    /// 面板打开时收起(批注/截图模式需要全页面交互;仅收起不退出刚开启的模式)
     fn close_panel_if_open(app: &AppHandle, state: &State<UiState>) {
-        let mut open = state.panel_open.lock().unwrap();
-        if *open {
-            *open = false;
-            drop(open);
-            if let Some(win) = app.get_window("main") {
-                let size = win.inner_size().unwrap_or_default();
-                let scale = win.scale_factor().unwrap_or(1.0);
-                let _ = ui::apply_layout(app, size, scale);
-            }
-            ui::emit_tabs_changed(app);
+        let open = *state.panel_open.lock().unwrap();
+        if open {
+            ui::collapse_panel(app);
         }
     }
 
-    /// 记录入列(批注/截图共用):追加记录 + 推送面板 + 覆盖层画标记
+    /// 记录入列(批注/截图共用):附带当前页面地址,推送面板;页面不再绘制标点(地址/滚动定位不准)
     fn push_record(
         app: &AppHandle,
         state: &State<UiState>,
@@ -325,11 +369,13 @@ impl Annotator {
         note: &str,
         image: Option<String>,
     ) {
+        let url = ui::active_tab_url(app);
         let mut records = state.records.lock().unwrap();
         let index = records.len() as u32 + 1;
         records.push(AnnotationRecord {
             index,
             typ: typ.to_string(),
+            url,
             selector: selector.to_string(),
             rect,
             note: note.to_string(),
@@ -340,31 +386,6 @@ impl Annotator {
         if let Some(panel) = ui::panel_webview(app) {
             let _ = panel.emit("records-changed", list);
         }
-        let marks_js = Self::build_marks_js(app, state);
-        let _ = ui::eval_overlay(
-            app,
-            &format!("window.__btOverlay._marks = {marks_js}; window.__btOverlay.redraw([], {marks_js})"),
-        );
-    }
-
-    /// 从状态生成标记 JS 数组(批注/截图都在区域左上角标编号)
-    fn build_marks_js(app: &AppHandle, state: &State<UiState>) -> String {
-        let records = state.records.lock().unwrap();
-        let items: Vec<String> = records
-            .iter()
-            .map(|r| {
-                let color = if r.typ == RECORD_SCREENSHOT { SHOT_COLOR } else { MARK_COLOR };
-                format!(
-                    "{{x:{},y:{},w:24,h:24,index:{},color:{}}}",
-                    r.rect.0,
-                    r.rect.1.saturating_sub(24),
-                    r.index,
-                    color
-                )
-            })
-            .collect();
-        let _ = app;
-        format!("[{}]", items.join(","))
     }
 }
 

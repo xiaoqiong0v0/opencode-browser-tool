@@ -6,9 +6,6 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
-    "test": "npm run build && tsx test/integration.test.ts",
-    "open": "npm run build && tsx test/open.ts",
-    "open:long": "npm run build && tsx test/open-long.ts",
     "build:frontend": "cd frontend && npm install && npm run build"
   },
   "keywords": [
@@ -21,21 +18,16 @@
   "license": "ISC",
   "type": "module",
   "files": [
-    "dist",
-    "bin"
+    "dist"
   ],
   "dependencies": {
-    "@xiaoqiong0v0/opencode-plugin-logger": "^1.0.2",
-    "adm-zip": "^0.6.0"
+    "@xiaoqiong0v0/opencode-plugin-logger": "^1.0.2"
   },
   "peerDependencies": {
     "@opencode-ai/plugin": "^1.18.4"
   },
   "devDependencies": {
-    "@types/adm-zip": "^0.5.8",
     "@types/node": "^26.1.1",
-    "esbuild": "^0.28.1",
-    "tsx": "^4.23.1",
     "typescript": "^7.0.2"
   },
   "publishConfig": {

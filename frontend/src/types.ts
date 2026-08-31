@@ -27,6 +27,7 @@ export interface AnnotationRecord {
   index: number;
   /** annotate(批注) / screenshot(截图) */
   type: RecordType;
+  url: string;
   selector: string;
   rect: { x: number; y: number; w: number; h: number };
   note: string;
@@ -43,6 +44,8 @@ export interface OverlayApi {
   showNoteInput(x: number, y: number, selector: string): void;
   /** 设置覆盖层模式:annotate(批注) / shot(截图) / none */
   setMode(mode: "none" | "annotate" | "shot"): void;
+  /** 隐藏批注弹框(退出批注模式/关闭面板时调用) */
+  hideNotePop(): void;
   /** 显示截图预览(dataUrl) + 底部工具栏 */
   showShotPreview(dataUrl: string): void;
   /** 隐藏截图预览 */

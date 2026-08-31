@@ -8,8 +8,6 @@ import { applyTheme, getTheme, initTheme, saveTheme } from "./theme";
 
 /** DOM 引用集合 */
 interface PanelDoms {
-  btnAnnotate: HTMLButtonElement;
-  btnShot: HTMLButtonElement;
   btnSend: HTMLButtonElement;
   btnDevtools: HTMLButtonElement;
   btnPanelClose: HTMLButtonElement;
@@ -25,8 +23,6 @@ class Panel {
 
   constructor() {
     this.doms = {
-      btnAnnotate: document.getElementById("btn-annotate") as HTMLButtonElement,
-      btnShot: document.getElementById("btn-shot") as HTMLButtonElement,
       btnSend: document.getElementById("btn-send") as HTMLButtonElement,
       btnDevtools: document.getElementById("btn-devtools") as HTMLButtonElement,
       btnPanelClose: document.getElementById("btn-panel-close") as HTMLButtonElement,
@@ -38,34 +34,24 @@ class Panel {
   }
 
   private bindEvents(): void {
-    // 双 tab 切换:AI 功能区 / 配置区
+    // 双 tab 切换:AI 功能区 / 配置区(导航样式)
     const tabAi = document.getElementById("tab-ai") as HTMLButtonElement;
     const tabConfig = document.getElementById("tab-config") as HTMLButtonElement;
-    const paneAi = document.getElementById("tab-ai-pane") as HTMLDivElement;
-    const paneConfig = document.getElementById("tab-config-pane") as HTMLDivElement;
-    const switchTab = (which: "ai" | "config") => {
-      tabAi.classList.toggle("active", which === "ai");
-      tabConfig.classList.toggle("active", which === "config");
-      paneAi.hidden = which !== "ai";
-      paneConfig.hidden = which !== "config";
-    };
-    tabAi.addEventListener("click", () => switchTab("ai"));
-    tabConfig.addEventListener("click", () => switchTab("config"));
+    this.switchTab("ai");
+    tabAi.addEventListener("click", () => this.switchTab("ai"));
+    tabConfig.addEventListener("click", () => this.switchTab("config"));
+    // 每次打开面板默认回到 AI 功能页(tabs-changed 广播面板开关状态)
+    void listen<{ panel_open: boolean }>("tabs-changed", (e) => {
+      if (e.payload?.panel_open) this.switchTab("ai");
+    });
 
-    // 顶部功能按钮:批注/截图(进入模式后自动收起面板,模式状态由 annotate-state 同步)
-    this.doms.btnAnnotate.addEventListener("click", () => {
-      void invoke<boolean>("panel_cmd", { cmd: "toggle-annotate" }).then(() => this.closePanel());
-    });
-    this.doms.btnShot.addEventListener("click", () => {
-      void invoke<boolean>("panel_cmd", { cmd: "toggle-shot" }).then(() => this.closePanel());
-    });
-    // 底部发送按钮:发送所有记录(批注+截图)
+    // 底部发送按钮:发送所有记录(批注+截图),结果用统一 toast 通知
     this.doms.btnSend.addEventListener("click", () => {
       void invoke<boolean>("panel_cmd", { cmd: "send-all" }).then((sent) => {
-        const el = document.getElementById("send-result");
-        if (el) {
-          el.textContent = sent ? "已发送所有记录" : "无记录可发送";
-          el.className = sent ? "send-ok" : "send-empty";
+        if (sent) {
+          this.notify("已发送所有记录", "ok");
+        } else {
+          this.notify("无记录可发送", "bad");
         }
       });
     });
@@ -106,16 +92,23 @@ class Panel {
       this.records = e.payload || [];
       this.render();
     });
-    // Rust 推送模式状态(批注/截图按钮激活态)
+    // Rust 推送模式状态(批注/截图按钮已移至工具栏,面板无需同步)
     void listen<{ annotate: boolean; shot: boolean }>("annotate-state", (e) => {
-      this.syncMode(e.payload);
+      // 保留监听占位(工具栏处理激活态)
+      void e;
     });
   }
 
-  /** 同步批注/截图按钮激活态 */
-  private syncMode(m: { annotate: boolean; shot: boolean }): void {
-    this.doms.btnAnnotate.classList.toggle("active", !!m.annotate);
-    this.doms.btnShot.classList.toggle("active", !!m.shot);
+  /** 切换顶部导航 tab(AI 功能区 / 配置区) */
+  private switchTab(which: "ai" | "config"): void {
+    const tabAi = document.getElementById("tab-ai") as HTMLButtonElement;
+    const tabConfig = document.getElementById("tab-config") as HTMLButtonElement;
+    const paneAi = document.getElementById("tab-ai-pane") as HTMLDivElement;
+    const paneConfig = document.getElementById("tab-config-pane") as HTMLDivElement;
+    tabAi.classList.toggle("active", which === "ai");
+    tabConfig.classList.toggle("active", which === "config");
+    paneAi.hidden = which !== "ai";
+    paneConfig.hidden = which !== "config";
   }
 
   /** 调用本地 HTTP 服务 API */
@@ -132,10 +125,21 @@ class Panel {
 
   /** 关闭面板:面板内操作(批注/截图/设备/开发者工具等)执行后统一收起 */
   private closePanel(): void {
-    void invoke<boolean>("toolbar_toggle_panel");
+    void invoke("toolbar_close_panel");
   }
 
-  /** 渲染记录列表(区分批注/截图,截图带缩略图) */
+  /** 统一通知气泡(与批注/截图一致),type: ok|bad|err */
+  private notify(message: string, type?: string): void {
+    const el = document.getElementById("toast") as HTMLDivElement;
+    el.textContent = message;
+    el.className = "show " + (["ok", "bad", "err"].includes(type || "") ? type : "ok");
+    clearTimeout((el as unknown as { _t?: number })._t);
+    (el as unknown as { _t?: number })._t = window.setTimeout(() => {
+      el.className = "";
+    }, 3000);
+  }
+
+  /** 渲染记录列表(区分批注/截图,截图带缩略图;点击弹出详情) */
   private render(): void {
     const el = this.doms.records;
     el.innerHTML = "";
@@ -160,6 +164,12 @@ class Panel {
       head.appendChild(tag);
       head.appendChild(title);
       item.appendChild(head);
+      if (r.url) {
+        const urlEl = document.createElement("div");
+        urlEl.className = "rec-url";
+        urlEl.textContent = r.url;
+        item.appendChild(urlEl);
+      }
       if (r.note) {
         const note = document.createElement("div");
         note.className = "rec-note";
@@ -169,7 +179,7 @@ class Panel {
       if (r.type === "screenshot" && r.image) {
         const img = document.createElement("img");
         img.className = "rec-thumb";
-        img.src = r.image;
+        img.src = toDataUrl(r.image);
         img.alt = "screenshot";
         item.appendChild(img);
       }
@@ -184,13 +194,6 @@ class Panel {
       this.render();
     } catch (e) {
       console.error("[panel] init failed:", e);
-    }
-    // 恢复批注/截图按钮激活态
-    try {
-      const m = await invoke<{ annotate: boolean; shot: boolean }>("panel_mode");
-      this.syncMode(m);
-    } catch (e) {
-      console.error("[panel] load mode failed:", e);
     }
     // 加载设备列表
     try {
@@ -207,6 +210,7 @@ class Panel {
         opt.textContent = `${d.name} (${d.width}x${d.height})`;
         this.doms.deviceSelect.appendChild(opt);
       }
+      // 默认不选中任何设备(placeholder 提示"设备预设...",用户选择后才应用)
     } catch (e) {
       console.error("[panel] load devices failed:", e);
     }
@@ -216,6 +220,11 @@ class Panel {
 const panel = new Panel();
 void panel.init();
 void initTheme();
-// lucide 图标替换(批注/截图/发送/关闭),key 需用 PascalCase(lucide 内部转 PascalCase 查表)
+// lucide 图标替换(批注/截图/发送/关闭)
 createIcons({ icons: { PenLine, Camera, Send, X } });
 console.log("[panel] ready");
+
+/** 截图 base64 转可显示 data URL(裸 base64 需补前缀) */
+function toDataUrl(base64: string): string {
+  return base64.startsWith("data:") ? base64 : `data:image/png;base64,${base64}`;
+}

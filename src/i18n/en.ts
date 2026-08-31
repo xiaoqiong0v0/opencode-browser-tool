@@ -117,7 +117,6 @@ const en: LocaleStrings = {
       "Check if a previously expected HTTP response has been received. Call this after bt_expect_response.",
     "tool.assert_response.arg.id": "The id used in bt_expect_response",
 
-    "tool.navigate.arg.headless": "Run browser in headless mode (no visible window). Default: false (headed)",
     "tool.show_notification.desc": "Show a notification on the browser page",
     "tool.show_notification.arg.message": "Notification message",
     "tool.show_notification.arg.type": "Type: ok (green), bad (orange), err (red)",
@@ -145,8 +144,6 @@ const en: LocaleStrings = {
     "msg.tab.new": "New tab opened: {url}",
     "msg.tab.closed": "Closed tab #{idx}",
     "msg.tab.closed_current": "Closed current tab",
-    "msg.click_switch.done": "Clicked and switched to new tab: {url}",
-    "msg.click_switch.clicked": "Clicked: {selector}",
     "msg.wait_selector.found": "Element appeared",
     "msg.record.sent": " (sent)",
     "msg.browser.installing": "Installing {browser} ({progress}). Please try bt_navigate again in a moment.",
