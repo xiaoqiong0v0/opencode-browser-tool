@@ -1,23 +1,116 @@
-import { existsSync, rmSync } from "fs";
-import { join } from "path";
+import { parseArgs } from "node:util";
 import { loadConfig, getConfig, getBrowsersDir } from "./config/index.js";
 import { registerLocale, t } from "./i18n/index.js";
 import en from "./i18n/en.js";
 import zh from "./i18n/zh.js";
-import { configureService, ensureService, openWindow, isRunning, stopService, service } from "./client.js";
-import type { Plugin } from "@opencode-ai/plugin";
+import { configureService, openWindow, isRunning, stopService, service } from "./client.js";
+import { tool, type Plugin } from "@opencode-ai/plugin";
 import createLogger from "@xiaoqiong0v0/opencode-plugin-logger";
 
 const log = createLogger("browser-tool");
 const _t = (k: string) => t(k);
-const _tf = (key: string, vars?: Record<string, string>) => {
-  let s = t(key);
-  if (vars) for (const [vk, vv] of Object.entries(vars)) s = s.replace(`{${vk}}`, vv);
-  return s;
+
+/** CLI 命令参数定义:flag=参数名,type=类型(string/boolean) */
+type CmdArg = { flag: string; type?: "string" | "boolean" };
+/** CLI 命令定义:usage=参数用法,descKey=命令描述 i18n 键(cli.cmd.*),args=可解析的 flag 表,run=执行 */
+type CmdDef = {
+  usage: string;
+  descKey: string;
+  args?: CmdArg[];
+  run: (a: any) => Promise<any>;
 };
-const _exec = (fn: (a: any) => Promise<any>) => async (a: any, ctx?: any) => {
-  return fn({ ...a, _sessionId: ctx?.sessionID || "" });
+
+/** 命令表:bt_cli 按 command 分发;命令描述全部走 i18n 键,帮助按 toolLang 本地化 */
+const COMMANDS: Record<string, CmdDef> = {
+  navigate: { usage: "--url", descKey: "cli.cmd.navigate", args: [{ flag: "url" }], run: async (a) => {
+    const r = await service.navigate(a);
+    if (r.installError) return `Installation failed: ${r.error}. Retry.`;
+    return r.installing ? `Installing ${r.installing} (${r.progress}). Try again.` : `Navigated to: ${r.url}`;
+  } },
+  click: { usage: "--selector", descKey: "cli.cmd.click", args: [{ flag: "selector" }], run: async (a) => { await service.click(a); return "Clicked"; } },
+  fill: { usage: "--selector --value", descKey: "cli.cmd.fill", args: [{ flag: "selector" }, { flag: "value" }], run: async (a) => { await service.fill(a); return "Filled"; } },
+  clear: { usage: "--selector", descKey: "cli.cmd.clear", args: [{ flag: "selector" }], run: async (a) => { await service.clear(a); return "Cleared"; } },
+  select: { usage: "--selector --value", descKey: "cli.cmd.select", args: [{ flag: "selector" }, { flag: "value" }], run: async (a) => { await service.select(a); return "Selected"; } },
+  hover: { usage: "--selector", descKey: "cli.cmd.hover", args: [{ flag: "selector" }], run: async (a) => { await service.hover(a); return "Hovered"; } },
+  drag: { usage: "--sourceSelector --targetSelector", descKey: "cli.cmd.drag", args: [{ flag: "sourceSelector" }, { flag: "targetSelector" }], run: async (a) => { await service.drag(a); return "Dragged"; } },
+  press_key: { usage: "--key [--selector]", descKey: "cli.cmd.press_key", args: [{ flag: "key" }, { flag: "selector" }], run: async (a) => { await service.pressKey(a); return `Pressed: ${a.key}`; } },
+  upload_file: { usage: "--selector --filePath", descKey: "cli.cmd.upload_file", args: [{ flag: "selector" }, { flag: "filePath" }], run: async (a) => { await service.uploadFile(a); return "Uploaded"; } },
+  screenshot: { usage: "[--selector]", descKey: "cli.cmd.screenshot", args: [{ flag: "selector" }], run: async (a) => {
+    const r = await service.screenshot(a);
+    return { output: `Screenshot taken${a.selector ? ` (element: ${a.selector})` : " (full page)"}`, attachments: [{ type: "file", mime: r.mime || "image/png", data: r.base64, url: "" }] };
+  } },
+  evaluate: { usage: "--script", descKey: "cli.cmd.evaluate", args: [{ flag: "script" }], run: async (a) => JSON.stringify(await service.evaluate(a), null, 2) },
+  get_visible_text: { usage: "[--selector]", descKey: "cli.cmd.get_visible_text", args: [{ flag: "selector" }], run: async (a) => (await service.visibleText(a))?.text || "(no visible text)" },
+  get_visible_html: { usage: "[--selector --removeScripts --removeComments --maxLength]", descKey: "cli.cmd.get_visible_html", args: [{ flag: "selector" }, { flag: "removeScripts", type: "boolean" }, { flag: "removeComments", type: "boolean" }, { flag: "maxLength" }], run: async (a) => await service.visibleHtml(a) },
+  console_logs: { usage: "[--type --search --limit --clear]", descKey: "cli.cmd.console_logs", args: [{ flag: "type" }, { flag: "search" }, { flag: "limit" }, { flag: "clear", type: "boolean" }], run: async (a) => { const r = await service.consoleLogs(a); return (r.logs || []).join("\n") || "(no logs)"; } },
+  go_back: { usage: "", descKey: "cli.cmd.go_back", run: async () => { const r = await service.goBack(); return `Went back, current URL: ${r.url}`; } },
+  go_forward: { usage: "", descKey: "cli.cmd.go_forward", run: async () => { const r = await service.goForward(); return `Went forward, current URL: ${r.url}`; } },
+  resize: { usage: "--width --height", descKey: "cli.cmd.resize", args: [{ flag: "width" }, { flag: "height" }], run: async (a) => { await service.resize(a); return "Resized"; } },
+  set_device: { usage: "[--name]", descKey: "cli.cmd.set_device", args: [{ flag: "name" }], run: async (a) => {
+    if (!a.name) {
+      const list = await service.deviceList();
+      return ["Available device presets:", "", ...(list.devices || []).map((d: any) => `  ${d.name}  ${d.width}x${d.height}${d.ua ? `  ${d.ua.slice(0, 60)}...` : "  (default UA)"}`)].join("\n");
+    }
+    const r = await service.device({ name: a.name });
+    return `Device preset applied: ${r.device} (${r.width}x${r.height})\nUser-Agent: ${r.ua}`;
+  } },
+  devtools: { usage: "[--action]", descKey: "cli.cmd.devtools", args: [{ flag: "action" }], run: async (a) => { const r = await service.devtools({ action: a.action || "toggle" }); return r.open ? "Devtools opened" : "Devtools closed"; } },
+  reload: { usage: "", descKey: "cli.cmd.reload", run: async () => { const r = await service.reload(); return `Page reloaded: ${r.url}`; } },
+  open_window: { usage: "", descKey: "cli.cmd.open_window", run: async () => { await openWindow(); return "Browser window opened"; } },
+  close: { usage: "", descKey: "cli.cmd.close", run: async () => { if (!isRunning()) return "Browser already closed"; await service.close(); await stopService(); return "Browser closed"; } },
+  show_notification: { usage: "--message [--type]", descKey: "cli.cmd.show_notification", args: [{ flag: "message" }, { flag: "type" }], run: async (a) => { await service.notify(a); return "Notification shown"; } },
+  scroll: { usage: "[--direction --amount]", descKey: "cli.cmd.scroll", args: [{ flag: "direction" }, { flag: "amount" }], run: async (a) => { await service.scroll(a); return `Scrolled ${a.direction || "down"} by ${a.amount || 300}px`; } },
+  wait_for_selector: { usage: "--selector [--timeout]", descKey: "cli.cmd.wait_for_selector", args: [{ flag: "selector" }, { flag: "timeout" }], run: async (a) => { await service.waitForSelector(a); return "Element appeared"; } },
+  click_and_switch_tab: { usage: "--selector", descKey: "cli.cmd.click_and_switch_tab", args: [{ flag: "selector" }], run: async (a) => { const r = await service.clickSwitchTab(a); return `Clicked ${a.selector}, current URL: ${r.url || ""}`; } },
+  iframe_click: { usage: "--iframeSelector --selector", descKey: "cli.cmd.iframe_click", args: [{ flag: "iframeSelector" }, { flag: "selector" }], run: async (a) => { await service.iframeClick(a); return "Clicked in iframe"; } },
+  iframe_fill: { usage: "--iframeSelector --selector --value", descKey: "cli.cmd.iframe_fill", args: [{ flag: "iframeSelector" }, { flag: "selector" }, { flag: "value" }], run: async (a) => { await service.iframeFill(a); return "Filled in iframe"; } },
+  save_as_pdf: { usage: "", descKey: "cli.cmd.save_as_pdf", run: async () => { await service.pdf(); return "PDF saved"; } },
+  get_browser_status: { usage: "", descKey: "cli.cmd.get_browser_status", run: async () => {
+    const s = await service.status();
+    if (s.installing && Object.keys(s.installing).length > 0) return `Installing ${Object.entries(s.installing).map(([b, p]) => `${b} (${p})`).join(", ")}.`;
+    if (!s.open) return "Browser is not open. Use command=open_window or navigate.";
+    return `Browser is open\nTitle: ${s.title}\nURL: ${s.url}\nTabs: ${s.tabs}`;
+  } },
+  list_tabs: { usage: "", descKey: "cli.cmd.list_tabs", run: async () => { const res = await service.tabs(); const list = res?.tabs || []; if (!list.length) return "(no tabs)"; return `Tabs (${list.length}):\n${list.map((p: any, i: number) => `[${i}] ${p.url || p.title}`).join("\n")}`; } },
+  switch_tab: { usage: "--index", descKey: "cli.cmd.switch_tab", args: [{ flag: "index" }], run: async (a) => { const r = await service.switchTab(a); return `Switched to tab #${a.index}: ${r.url}`; } },
+  new_tab: { usage: "--url", descKey: "cli.cmd.new_tab", args: [{ flag: "url" }], run: async (a) => { const r = await service.newTab(a); return `New tab opened: ${r.url}`; } },
+  close_tab: { usage: "[--index]", descKey: "cli.cmd.close_tab", args: [{ flag: "index" }], run: async (a) => { await service.closeTab(a); return a.index !== undefined ? `Closed tab #${a.index}` : "Closed current tab"; } },
+  get_element_state: { usage: "--selector", descKey: "cli.cmd.get_element_state", args: [{ flag: "selector" }], run: async (a) => { const r: any = await service.elementState(a); if (!r || !r.exists) return `Element not found: ${a.selector}`; return `Element <${r.tag}>: ${a.selector}\nVisible: ${r.visible}${r.text ? `\nText: ${r.text}` : ""}\nRect: ${r.rect.x},${r.rect.y} ${r.rect.w}x${r.rect.h}`; } },
+  scroll_to_element: { usage: "--selector", descKey: "cli.cmd.scroll_to_element", args: [{ flag: "selector" }], run: async (a) => { await service.scrollToElement(a); return "Scrolled to element"; } },
+  get_dropdown_options: { usage: "--selector", descKey: "cli.cmd.get_dropdown_options", args: [{ flag: "selector" }], run: async (a) => { const r: any = await service.dropdownOptions(a); if (!r) return `Select not found: ${a.selector}`; return r.map((o: any) => `${o.selected ? "* " : "  "}${o.value}: ${o.text}`).join("\n"); } },
+  custom_user_agent: { usage: "--userAgent", descKey: "cli.cmd.custom_user_agent", args: [{ flag: "userAgent" }], run: async (a) => { await service.userAgent(a); return "User-Agent set"; } },
+  expect_response: { usage: "--url", descKey: "cli.cmd.expect_response", args: [{ flag: "url" }], run: async (a) => { await service.expectResponse({ urlPattern: a.url }); return `Now expecting response matching: ${a.url}. Use command=assert_response to check.`; } },
+  assert_response: { usage: "--id", descKey: "cli.cmd.assert_response", args: [{ flag: "id" }], run: async (a) => { const r = await service.assertResponse({ id: a.id }); return r.matched ? `Response matched: ${r.url} (${r.status})` : r.error || "No response yet"; } },
+  get_accessibility_tree: { usage: "[--selector --maxDepth]", descKey: "cli.cmd.get_accessibility_tree", args: [{ flag: "selector" }, { flag: "maxDepth" }], run: async (a) => { const s = await service.accessibility(a); return s ? formatNode(s, 0, a.maxDepth ?? 8) : "(no accessibility info)"; } },
+  list_records: { usage: "", descKey: "cli.cmd.list_records", run: async () => { try { const records = await service.annotateRecords(); if (!records || !records.length) return "(no records)"; return records.map((r: any) => { const rect = r.rect ? ` rect=(${r.rect[0]},${r.rect[1]},${r.rect[2]},${r.rect[3]})` : ""; return `[${r.index}] ${r.selector}${rect}${r.note ? ` note="${r.note}"` : ""}`; }).join("\n"); } catch { return "(no records)"; } } },
+  read_record_content: { usage: "--id", descKey: "cli.cmd.read_record_content", args: [{ flag: "id" }], run: async (a) => { try { const records = await service.annotateRecords(); const rec = (records || []).find((r: any) => r.index === a.id); if (!rec) return `(record #${a.id} not found)`; return `#${rec.index} ${rec.selector}\nrect: ${JSON.stringify(rec.rect)}\nnote: ${rec.note || "(none)"}`; } catch { return "(no records)"; } } },
+  fake_audio: { usage: "--kind [--data --freq --durMs --notes --digits --loop]", descKey: "cli.cmd.fake_audio", args: [{ flag: "kind" }, { flag: "data" }, { flag: "freq" }, { flag: "durMs" }, { flag: "notes" }, { flag: "digits" }, { flag: "loop", type: "boolean" }], run: async (a) => { const r = await service.mediaAudio(a); return `Fake mic audio: ${r.injected}`; } },
+  fake_video: { usage: "--kind [--data --url --loop]", descKey: "cli.cmd.fake_video", args: [{ flag: "kind" }, { flag: "data" }, { flag: "url" }, { flag: "loop", type: "boolean" }], run: async (a) => { const r = await service.mediaVideo(a); return `Fake camera video: ${r.injected}`; } },
 };
+
+/** 帮助全文(command=help 或未知命令时返回;命令描述与结构按 toolLang 本地化) */
+function buildHelp(): string {
+  const lines = Object.entries(COMMANDS).map(
+    ([k, v]) => `  ${k.padEnd(22)} ${v.usage.padEnd(42)} ${_t(v.descKey)}`,
+  );
+  const examples = [_t("cli.example.1"), _t("cli.example.2"), _t("cli.example.3"), _t("cli.example.4")]
+    .map((e) => `  ${e}`)
+    .join("\n");
+  return `${_t("cli.header")}\n\n${_t("cli.usage")}\n\n${_t("cli.commands")}\n${lines.join("\n")}\n\n${_t("cli.examples")}\n${examples}`;
+}
+
+/** 描述内嵌的紧凑命令索引(模型无需先调 help 即可用) */
+const DESC_INDEX = Object.entries(COMMANDS).map(([k, v]) => `${k} ${v.usage}`).join(" | ");
+
+/** 解析 --flag 风格字符串参数(基于 node:util.parseArgs,未知 flag 报错) */
+function parseFlagArgs(raw: string, def: CmdDef): Record<string, any> {
+  const tokens = raw.trim().split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return {};
+  const options: Record<string, any> = {};
+  for (const arg of def.args || []) options[arg.flag] = { type: arg.type || "string" };
+  const { values } = parseArgs({ args: tokens, options, allowPositionals: true });
+  return values;
+}
 
 export const opencodeBrowserTool: Plugin = async ({ client, worktree }) => {
   registerLocale("en", en);
@@ -27,7 +120,7 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree }) => {
 
   try {
     log.loaded();
-    // 懒启动:仅保存启动参数,不立即弹窗;bt_open_window 或首次调工具时启动
+    // 懒启动:仅保存启动参数,不立即弹窗;open_window 或首次调工具时启动
     configureService({
       nodePath: config.nodePath || "",
       browsersPath: getBrowsersDir(),
@@ -47,482 +140,49 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree }) => {
       },
       tool: filterDisabled(
         {
-          bt_navigate: {
-            description: _t("tool.navigate.desc"),
+          bt_cli: tool({
+            description: _t("tool.cli.desc") + "\n" + DESC_INDEX,
             args: {
-              url: { type: "string", description: _t("tool.navigate.arg.url") },
+              command: tool.schema.string().describe(_t("tool.cli.arg.command")),
+              args: tool.schema.string().optional().describe(_t("tool.cli.arg.args")),
             },
-            execute: _exec(async (a) => {
-              const r = await service.navigate(a);
-              if (r.installError) return `Installation failed: ${r.error}. Call bt_navigate again to retry.`;
-              return r.installing
-                ? _tf("msg.browser.installing", { browser: r.installing, progress: r.progress || "" })
-                : _tf("msg.navigate.done", { url: r.url });
-            }),
-          },
-          bt_click: {
-            description: _t("tool.click.desc"),
-            args: { selector: { type: "string", description: _t("tool.click.arg.selector") } },
-            execute: _exec(async (a) => {
-              await service.click(a);
-              return "Clicked";
-            }),
-          },
-          bt_fill: {
-            description: _t("tool.fill.desc"),
-            args: {
-              selector: { type: "string", description: _t("tool.fill.arg.selector") },
-              value: { type: "string", description: _t("tool.fill.arg.value") },
-            },
-            execute: _exec(async (a) => {
-              await service.fill(a);
-              return "Filled";
-            }),
-          },
-          bt_clear: {
-            description: _t("tool.clear.desc"),
-            args: { selector: { type: "string", description: _t("tool.clear.arg.selector") } },
-            execute: _exec(async (a) => {
-              await service.clear(a);
-              return "Cleared";
-            }),
-          },
-          bt_select: {
-            description: _t("tool.select.desc"),
-            args: {
-              selector: { type: "string", description: _t("tool.select.arg.selector") },
-              value: { type: "string", description: _t("tool.select.arg.value") },
-            },
-            execute: _exec(async (a) => {
-              await service.select(a);
-              return "Selected";
-            }),
-          },
-          bt_hover: {
-            description: _t("tool.hover.desc"),
-            args: { selector: { type: "string", description: _t("tool.hover.arg.selector") } },
-            execute: _exec(async (a) => {
-              await service.hover(a);
-              return "Hovered";
-            }),
-          },
-          bt_drag: {
-            description: _t("tool.drag.desc"),
-            args: {
-              sourceSelector: { type: "string", description: _t("tool.drag.arg.sourceSelector") },
-              targetSelector: { type: "string", description: _t("tool.drag.arg.targetSelector") },
-            },
-            execute: _exec(async (a) => {
-              await service.drag(a);
-              return "Dragged";
-            }),
-          },
-          bt_press_key: {
-            description: _t("tool.press_key.desc"),
-            args: {
-              key: { type: "string", description: _t("tool.press_key.arg.key") },
-              selector: { type: "string", description: _t("tool.press_key.arg.selector") },
-            },
-            execute: _exec(async (a) => {
-              await service.pressKey(a);
-              return _tf("msg.press_key.done", { key: a.key });
-            }),
-          },
-          bt_upload_file: {
-            description: _t("tool.upload_file.desc"),
-            args: {
-              selector: { type: "string", description: _t("tool.upload_file.arg.selector") },
-              filePath: { type: "string", description: _t("tool.upload_file.arg.filePath") },
-            },
-            execute: _exec(async (a) => {
-              await service.uploadFile(a);
-              return "Uploaded";
-            }),
-          },
-          bt_screenshot: {
-            description: _t("tool.screenshot.desc"),
-            args: { selector: { type: "string", description: _t("tool.screenshot.arg.selector") } },
-            execute: _exec(async (a) => {
-              const r = await service.screenshot(a);
-              // 与批注/截图推送一致:file part 带 data(裸 base64)
-              return {
-                output: `Screenshot taken${a.selector ? ` (element: ${a.selector})` : " (full page)"}`,
-                attachments: [{ type: "file", mime: r.mime || "image/png", data: r.base64, url: "" }],
-              };
-            }),
-          },
-          bt_evaluate: {
-            description: _t("tool.evaluate.desc"),
-            args: { script: { type: "string", description: _t("tool.evaluate.arg.script") } },
-            execute: _exec(async (a) => {
-              const r = await service.evaluate(a);
-              return JSON.stringify(r, null, 2);
-            }),
-          },
-          bt_get_visible_text: {
-            description: _t("tool.get_visible_text.desc"),
-            args: { selector: { type: "string", description: _t("tool.get_visible_text.arg.selector") } },
-            execute: _exec(async (a) => {
-              const r = await service.visibleText(a);
-              return r?.text || "(no visible text)";
-            }),
-          },
-          bt_get_visible_html: {
-            description: _t("tool.get_visible_html.desc"),
-            args: {
-              selector: { type: "string", description: _t("tool.get_visible_html.arg.selector") },
-              removeScripts: { type: "boolean", description: _t("tool.get_visible_html.arg.removeScripts") },
-              removeComments: { type: "boolean", description: _t("tool.get_visible_html.arg.removeComments") },
-              maxLength: { type: "number", description: _t("tool.get_visible_html.arg.maxLength") },
-            },
-            execute: _exec(async (a) => await service.visibleHtml(a)),
-          },
-          bt_console_logs: {
-            description: _t("tool.console_logs.desc"),
-            args: {
-              type: { type: "string", description: _t("tool.console_logs.arg.type") },
-              search: { type: "string", description: _t("tool.console_logs.arg.search") },
-              limit: { type: "number", description: _t("tool.console_logs.arg.limit") },
-              clear: { type: "boolean", description: _t("tool.console_logs.arg.clear") },
-            },
-            execute: _exec(async (a) => {
-              const r = await service.consoleLogs(a);
-              const logs: string[] = r.logs || [];
-              return logs.join("\n") || "(no logs)";
-            }),
-          },
-          bt_go_back: {
-            description: _t("tool.go_back.desc"),
-            args: {},
-            execute: _exec(async () => {
-              const r = await service.goBack();
-              return `Went back, current URL: ${r.url}`;
-            }),
-          },
-          bt_go_forward: {
-            description: _t("tool.go_forward.desc"),
-            args: {},
-            execute: _exec(async () => {
-              const r = await service.goForward();
-              return `Went forward, current URL: ${r.url}`;
-            }),
-          },
-          bt_resize: {
-            description: _t("tool.resize.desc"),
-            args: {
-              width: { type: "number", description: _t("tool.resize.arg.width") },
-              height: { type: "number", description: _t("tool.resize.arg.height") },
-            },
-            execute: _exec(async (a) => {
-              await service.resize(a);
-              return "Resized";
-            }),
-          },
-          bt_set_device: {
-            description: _t("tool.set_device.desc"),
-            args: { name: { type: "string", description: _t("tool.set_device.arg.name") } },
-            execute: _exec(async (a) => {
-              if (!a.name) {
-                const list = await service.deviceList();
-                const lines = ["Available device presets:", ""];
-                for (const d of list.devices)
-                  lines.push(`  ${d.name}  ${d.width}x${d.height}${d.ua ? `  ${d.ua.slice(0, 60)}...` : "  (default UA)"}`);
-                return lines.join("\n");
+            async execute(a: any, context: any) {
+              const { command, args, cmd: cmdAlias, ...rest } = a;
+              const cmdName = command || cmdAlias;
+              // command 省略/help → 返回完整帮助
+              if (!cmdName || cmdName === "help" || cmdName === "--help" || cmdName === "-h") return buildHelp();
+              const def = COMMANDS[cmdName];
+              if (!def) return `${_t("cli.unknown").replace("{cmd}", cmdName)}\n\n${buildHelp()}`;
+              let params: Record<string, any> = { ...rest };
+              if (typeof args === "string") {
+                try {
+                  params = { ...params, ...parseFlagArgs(args, def) };
+                } catch (e: any) {
+                  return `${_t("cli.invalid_args").replace("{cmd}", cmdName).replace("{msg}", e.message)}\n\nUsage: bt_cli({ command: "${cmdName}", args: ${def.usage} })`;
+                }
+              } else if (args && typeof args === "object") {
+                params = { ...params, ...args };
               }
-              const r = await service.device({ name: a.name });
-              return _tf("msg.device.set", {
-                name: r.device,
-                size: `${r.width}x${r.height}`,
-                ua: r.ua === "(default)" ? "(default)" : r.ua,
-              });
-            }),
-          },
-          bt_devtools: {
-            description: _t("tool.devtools.desc"),
-            args: { action: { type: "string", description: _t("tool.devtools.arg.action") } },
-            execute: _exec(async (a) => {
-              const r = await service.devtools({ action: a.action || "toggle" });
-              return r.open ? _t("msg.devtools.open") : _t("msg.devtools.closed");
-            }),
-          },
-          bt_set_media_mode: {
-            description: _t("tool.set_media_mode.desc"),
-            args: { mode: { type: "string", description: _t("tool.set_media_mode.arg.mode") } },
-            execute: _exec(async (a) => {
-              const r = await service.mediaMode(a);
-              return _tf("msg.media_mode.set", { mode: r.mode });
-            }),
-          },
-          bt_set_fake_audio: {
-            description: _t("tool.set_fake_audio.desc"),
-            args: {
-              kind: { type: "string", description: _t("tool.set_fake_audio.arg.kind") },
-              data: { type: "string", description: _t("tool.set_fake_audio.arg.data") },
-              freq: { type: "number", description: _t("tool.set_fake_audio.arg.freq") },
-              durMs: { type: "number", description: _t("tool.set_fake_audio.arg.durMs") },
-              notes: { type: "array", description: _t("tool.set_fake_audio.arg.notes") },
-              digits: { type: "string", description: _t("tool.set_fake_audio.arg.digits") },
-              loop: { type: "boolean", description: _t("tool.set_fake_audio.arg.loop") },
-            },
-            execute: _exec(async (a) => {
-              const r = await service.mediaAudio(a);
-              return _tf("msg.media_audio.injected", { kind: r.injected });
-            }),
-          },
-          bt_set_fake_video: {
-            description: _t("tool.set_fake_video.desc"),
-            args: {
-              kind: { type: "string", description: _t("tool.set_fake_video.arg.kind") },
-              data: { type: "string", description: _t("tool.set_fake_video.arg.data") },
-              url: { type: "string", description: _t("tool.set_fake_video.arg.url") },
-              loop: { type: "boolean", description: _t("tool.set_fake_video.arg.loop") },
-            },
-            execute: _exec(async (a) => {
-              const r = await service.mediaVideo(a);
-              return _tf("msg.media_video.injected", { kind: r.injected });
-            }),
-          },
-          bt_reload: {
-            description: _t("tool.reload.desc"),
-            args: {},
-            execute: _exec(async () => {
-              const r = await service.reload();
-              return `Page reloaded: ${r.url}`;
-            }),
-          },
-          bt_open_window: {
-            description: _t("tool.open_window.desc"),
-            args: {},
-            execute: _exec(async () => {
-              await openWindow();
-              return "Browser window opened";
-            }),
-          },
-          bt_close: {
-            description: _t("tool.close.desc"),
-            args: {},
-            execute: _exec(async () => {
-              if (!isRunning()) return "Browser already closed";
-              await service.close();
-              // 服务进程已退出,重置状态(下次 bt_open_window 可重新启动)
-              await stopService();
-              return "Browser closed";
-            }),
-          },
-          bt_show_notification: {
-            description: _t("tool.show_notification.desc"),
-            args: {
-              message: { type: "string", description: _t("tool.show_notification.arg.message") },
-              type: { type: "string", description: _t("tool.show_notification.arg.type") },
-            },
-            execute: _exec(async (a) => {
-              await service.notify(a);
-              return "Notification shown";
-            }),
-          },
-          bt_scroll: {
-            description: _t("tool.scroll.desc"),
-            args: {
-              direction: { type: "string", description: _t("tool.scroll.arg.direction") },
-              amount: { type: "number", description: _t("tool.scroll.arg.amount") },
-            },
-            execute: _exec(async (a) => {
-              await service.scroll(a);
-              return _tf("msg.scroll.done", { dir: a.direction || "down", amount: String(a.amount || 300) });
-            }),
-          },
-          bt_wait_for_selector: {
-            description: _t("tool.wait_for_selector.desc"),
-            args: {
-              selector: { type: "string", description: _t("tool.wait_for_selector.arg.selector") },
-              timeout: { type: "number", description: _t("tool.wait_for_selector.arg.timeout") },
-            },
-            execute: _exec(async (a) => {
-              await service.waitForSelector(a);
-              return _t("msg.wait_selector.found");
-            }),
-          },
-          bt_click_and_switch_tab: {
-            description: _t("tool.click_and_switch_tab.desc"),
-            args: { selector: { type: "string", description: _t("tool.click_and_switch_tab.arg.selector") } },
-            execute: _exec(async (a) => {
-              const r = await service.clickSwitchTab(a);
-              // V5 真多标签:target=_blank 链接点击后新开标签并自动切换,返回当前 url
-              return `Clicked ${a.selector}, current URL: ${r.url || ""}`;
-            }),
-          },
-          bt_iframe_click: {
-            description: _t("tool.iframe_click.desc"),
-            args: {
-              iframeSelector: { type: "string", description: _t("tool.iframe_click.arg.iframeSelector") },
-              selector: { type: "string", description: _t("tool.iframe_click.arg.selector") },
-            },
-            execute: _exec(async (a) => {
-              await service.iframeClick(a);
-              return "Clicked in iframe";
-            }),
-          },
-          bt_iframe_fill: {
-            description: _t("tool.iframe_fill.desc"),
-            args: {
-              iframeSelector: { type: "string", description: _t("tool.iframe_fill.arg.iframeSelector") },
-              selector: { type: "string", description: _t("tool.iframe_fill.arg.selector") },
-              value: { type: "string", description: _t("tool.iframe_fill.arg.value") },
-            },
-            execute: _exec(async (a) => {
-              await service.iframeFill(a);
-              return "Filled in iframe";
-            }),
-          },
-          bt_save_as_pdf: {
-            description: _t("tool.save_as_pdf.desc"),
-            args: {},
-            execute: _exec(async () => {
-              await service.pdf();
-              return "PDF saved";
-            }),
-          },
-          bt_get_browser_status: {
-            description: _t("tool.browser_status.desc"),
-            args: {},
-            execute: _exec(async () => {
-              const s = await service.status();
-              if (s.installing && Object.keys(s.installing).length > 0) {
-                const info = Object.entries(s.installing)
-                  .map(([b, p]) => `${b} (${p})`)
-                  .join(", ");
-                return _tf("msg.browser.installing", { browser: info, progress: "" });
-              }
-              if (!s.open) return _t("msg.browser.closed");
-              return _tf("msg.browser.open", { title: s.title, url: s.url, tabs: String(s.tabs) });
-            }),
-          },
-          bt_list_tabs: {
-            description: _t("tool.list_tabs.desc"),
-            args: {},
-            execute: _exec(async () => {
-              const res = (await service.tabs()) as any;
-              const list: any[] = res?.tabs || [];
-              if (list.length === 0) return "(no tabs)";
-              return `Tabs (${list.length}):\n${list.map((p: any, i: number) => `[${i}] ${p.url || p.title}`).join("\n")}`;
-            }),
-          },
-          bt_switch_tab: {
-            description: _t("tool.switch_tab.desc"),
-            args: { index: { type: "number", description: _t("tool.switch_tab.arg.index") } },
-            execute: _exec(async (a) => {
-              const r = await service.switchTab(a);
-              return _tf("msg.tab.switched", { idx: String(a.index), url: r.url });
-            }),
-          },
-          bt_new_tab: {
-            description: _t("tool.new_tab.desc"),
-            args: { url: { type: "string", description: _t("tool.new_tab.arg.url") } },
-            execute: _exec(async (a) => {
-              const r = await service.newTab(a);
-              return _tf("msg.tab.new", { url: r.url });
-            }),
-          },
-          bt_close_tab: {
-            description: _t("tool.close_tab.desc"),
-            args: { index: { type: "number", description: _t("tool.close_tab.arg.index") } },
-            execute: _exec(async (a) => {
-              await service.closeTab(a);
-              return a.index !== undefined
-                ? _tf("msg.tab.closed", { idx: String(a.index) })
-                : _t("msg.tab.closed_current");
-            }),
-          },
-          bt_get_element_state: {
-            description: _t("tool.element_state.desc"),
-            args: { selector: { type: "string", description: _t("tool.element_state.arg.selector") } },
-            execute: _exec(async (a) => {
-              const r: any = await service.elementState(a);
-              if (!r || !r.exists) return _tf("msg.element.not_found", { selector: a.selector });
-              return `Element <${r.tag}>: ${a.selector}\nVisible: ${r.visible}${r.text ? `\nText: ${r.text}` : ""}\nRect: ${r.rect.x},${r.rect.y} ${r.rect.w}x${r.rect.h}`;
-            }),
-          },
-          bt_scroll_to_element: {
-            description: _t("tool.scroll_to_element.desc"),
-            args: { selector: { type: "string", description: _t("tool.scroll_to_element.arg.selector") } },
-            execute: _exec(async (a) => {
-              await service.scrollToElement(a);
-              return "Scrolled to element";
-            }),
-          },
-          bt_get_dropdown_options: {
-            description: _t("tool.dropdown_options.desc"),
-            args: { selector: { type: "string", description: _t("tool.dropdown_options.arg.selector") } },
-            execute: _exec(async (a) => {
-              const r = (await service.dropdownOptions(a)) as any[];
-              if (!r) return _tf("msg.select.not_found", { selector: a.selector });
-              return r.map((o: any) => `${o.selected ? "* " : "  "}${o.value}: ${o.text}`).join("\n");
-            }),
-          },
-          bt_custom_user_agent: {
-            description: _t("tool.user_agent.desc"),
-            args: { userAgent: { type: "string", description: _t("tool.user_agent.arg.userAgent") } },
-            execute: _exec(async (a) => {
-              await service.userAgent(a);
-              return "User-Agent set";
-            }),
-          },
-          bt_expect_response: {
-            description: _t("tool.expect_response.desc"),
-            args: { url: { type: "string", description: _t("tool.expect_response.arg.url") } },
-            execute: _exec(async (a) => {
-              await service.expectResponse({ urlPattern: a.url });
-              return `Now expecting response matching: ${a.url}. Use bt_assert_response with the same pattern to check.`;
-            }),
-          },
-          bt_assert_response: {
-            description: _t("tool.assert_response.desc"),
-            args: { id: { type: "string", description: _t("tool.assert_response.arg.id") } },
-            execute: _exec(async (a) => {
-              const r = await service.assertResponse({ id: a.id });
-              if (r.matched) return `Response matched: ${r.url} (${r.status})`;
-              return r.error || "No response yet";
-            }),
-          },
-          bt_get_accessibility_tree: {
-            description: _t("tool.accessibility_tree.desc"),
-            args: {
-              selector: { type: "string", description: _t("tool.accessibility_tree.arg.selector") },
-              maxDepth: { type: "number", description: _t("tool.accessibility_tree.arg.maxDepth") },
-            },
-            execute: _exec(async (a) => {
-              const s = await service.accessibility(a);
-              if (!s) return "(no accessibility info)";
-              return formatNode(s, 0, a.maxDepth ?? 8);
-            }),
-          },
-          bt_list_records: {
-            description: "List all annotation records in the panel",
-            args: {},
-            async execute() {
+              // 透传会话 ID(会话隔离用)
+              params._sessionId = context?.sessionID || "";
               try {
-                const records = await service.annotateRecords();
-                if (!records || records.length === 0) return "(no records)";
-                return records.map((r: any) => {
-                  const rect = r.rect ? ` rect=(${r.rect[0]},${r.rect[1]},${r.rect[2]},${r.rect[3]})` : "";
-                  return `[${r.index}] ${r.selector}${rect}${r.note ? ` note="${r.note}"` : ""}`;
-                }).join("\n");
-              } catch { return "(no records)"; }
+                return await def.run(params);
+              } catch (e: any) {
+                return `${_t("cli.failed").replace("{cmd}", cmdName).replace("{msg}", e.message || e)}`;
+              }
             },
-          },
-          bt_read_record_content: {
-            description: _t("tool.read_record.desc"),
-            args: { id: { type: "number", description: _t("tool.read_record.arg.id") } },
-          async execute(a: any) {
-            // V5:批注记录在 shell 侧,读取记录信息(截图内容后续支持)
-            try {
-              const records = await service.annotateRecords();
-              const rec = (records || []).find((r: any) => r.index === a.id);
-              if (!rec) return `(record #${a.id} not found)`;
-              return `#${rec.index} ${rec.selector}\nrect: ${JSON.stringify(rec.rect)}\nnote: ${rec.note || "(none)"}`;
-            } catch { return "(no records)"; }
-          },
-        },
+          }),
+          // 切真实设备属敏感操作,单独保留工具以维持 ask 权限
+          bt_set_media_mode: tool({
+            description: _t("tool.set_media_mode.desc"),
+            args: {
+              mode: tool.schema.enum(["simulate", "real"]).optional().describe(_t("tool.set_media_mode.arg.mode")),
+            },
+            async execute(a: any, context: any) {
+              const r = await service.mediaMode({ ...a, _sessionId: context?.sessionID || "" });
+              return `Media mode: ${r.mode}`;
+            },
+          }),
         },
         config.disabledTools,
       ),
