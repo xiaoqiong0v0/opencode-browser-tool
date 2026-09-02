@@ -74,6 +74,10 @@ impl App {
             "/api/devtools" => self.devtools(&body).await,
             // 媒体设备模式(simulate=模拟 / real=真实)
             "/api/media/mode" => self.media_mode(&body).await,
+            // fake 麦克风音频注入(模拟音频输入)
+            "/api/media/audio" => self.media_audio(&body).await,
+            // fake 摄像头画面注入(模拟视频输入)
+            "/api/media/video" => self.media_video(&body).await,
             _ => Err(format!("Not found: POST {url}")),
         }
     }
@@ -726,6 +730,110 @@ impl App {
             }
             Some(other) => Err(format!("invalid mode: {other} (simulate/real)")),
         }
+    }
+
+    /// 向页面 fake 麦克风注入声音(模拟音频输入)
+    /// body: { kind: tone|seq|dtmf|noise|audio|ambient|stop, ... }
+    async fn media_audio(&self, body: &Value) -> Result<Value, String> {
+        let kind = body.get("kind").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let js = match kind.as_str() {
+            "tone" => {
+                let freq = body.get("freq").and_then(|v| v.as_f64()).unwrap_or(440.0);
+                let dur = body.get("durMs").and_then(|v| v.as_f64()).unwrap_or(200.0);
+                format!("(window.__btFakeMic?window.__btFakeMic.tone({freq},{dur}):0)")
+            }
+            "seq" => {
+                let notes = body.get("notes").cloned().unwrap_or_else(|| json!([]));
+                format!("(window.__btFakeMic?window.__btFakeMic.seq({notes}):0)")
+            }
+            "dtmf" => {
+                let digits = body.get("digits").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                format!("(window.__btFakeMic?window.__btFakeMic.dtmf({digits:?}):0)")
+            }
+            "noise" => {
+                let dur = body.get("durMs").and_then(|v| v.as_f64()).unwrap_or(400.0);
+                format!("(window.__btFakeMic?window.__btFakeMic.noise({dur}):0)")
+            }
+            "audio" => {
+                let data = body.get("data").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if data.is_empty() {
+                    return Err("data (base64 audio) is required for kind=audio".into());
+                }
+                // loop=true 循环播放,false(默认)单次
+                let loop_ = body.get("loop").and_then(|v| v.as_bool()).unwrap_or(false);
+                format!("(window.__btFakeMic?window.__btFakeMic.inject({data:?},{loop_}):0)")
+            }
+            "ambient" => "(window.__btFakeMic?window.__btFakeMic.ambient():0)".to_string(),
+            "stop" => "(window.__btFakeMic?window.__btFakeMic.stop():0)".to_string(),
+            "" => return Err("kind is required (tone/seq/dtmf/noise/audio/ambient/stop)".into()),
+            other => {
+                return Err(format!("unknown kind: {other} (tone/seq/dtmf/noise/audio/ambient/stop)"))
+            }
+        };
+        // 同步所有页面 webview(切换标签后注入目标保持一致)
+        let handle = self.handle.clone();
+        tokio::task::block_in_place(move || {
+            let state = handle.state::<crate::ui::UiState>();
+            let labels: Vec<String> = state
+                .tabs
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|t| t.webview.clone())
+                .collect();
+            for label in labels {
+                if let Some(w) = handle.get_webview(&label) {
+                    let _ = w.eval(&js);
+                }
+            }
+        });
+        Ok(json!({ "injected": kind }))
+    }
+
+    /// 向页面 fake 摄像头注入画面(模拟视频输入)
+    /// body: { kind: image|video|auto|stop, ... }
+    async fn media_video(&self, body: &Value) -> Result<Value, String> {
+        let kind = body.get("kind").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let js = match kind.as_str() {
+            "image" => {
+                let data = body.get("data").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if data.is_empty() {
+                    return Err("data (base64 image) is required for kind=image".into());
+                }
+                format!("(window.__btFakeCam?window.__btFakeCam.setImage({data:?}):0)")
+            }
+            "video" => {
+                let url = body.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if url.is_empty() {
+                    return Err("url is required for kind=video".into());
+                }
+                // loop=true(默认)循环播放,false 播完冻结末帧
+                let loop_ = body.get("loop").and_then(|v| v.as_bool()).unwrap_or(true);
+                format!("(window.__btFakeCam?window.__btFakeCam.setVideo({url:?},{loop_}):0)")
+            }
+            "auto" => "(window.__btFakeCam?window.__btFakeCam.setAuto():0)".to_string(),
+            "stop" => "(window.__btFakeCam?window.__btFakeCam.stop():0)".to_string(),
+            "" => return Err("kind is required (image/video/auto/stop)".into()),
+            other => return Err(format!("unknown kind: {other} (image/video/auto/stop)")),
+        };
+        // 同步所有页面 webview(切换标签后注入目标保持一致)
+        let handle = self.handle.clone();
+        tokio::task::block_in_place(move || {
+            let state = handle.state::<crate::ui::UiState>();
+            let labels: Vec<String> = state
+                .tabs
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|t| t.webview.clone())
+                .collect();
+            for label in labels {
+                if let Some(w) = handle.get_webview(&label) {
+                    let _ = w.eval(&js);
+                }
+            }
+        });
+        Ok(json!({ "injected": kind }))
     }
 
     /// 批注模式开关(需 block_in_place:webview show/hide 需主线程,直接调用会与 tokio 死锁)

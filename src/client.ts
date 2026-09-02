@@ -156,6 +156,8 @@ export const service = {
   deviceList: cmd("device/list"),
   devtools: cmd("devtools"),
   mediaMode: cmd("media/mode"),
+  mediaAudio: cmd("media/audio"),
+  mediaVideo: cmd("media/video"),
   close: cmd("close"),
   newTab: cmd("tabs/new"),
   switchTab: cmd("tabs/switch"),

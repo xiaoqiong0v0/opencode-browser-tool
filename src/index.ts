@@ -253,6 +253,35 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree }) => {
               return _tf("msg.media_mode.set", { mode: r.mode });
             }),
           },
+          bt_set_fake_audio: {
+            description: _t("tool.set_fake_audio.desc"),
+            args: {
+              kind: { type: "string", description: _t("tool.set_fake_audio.arg.kind") },
+              data: { type: "string", description: _t("tool.set_fake_audio.arg.data") },
+              freq: { type: "number", description: _t("tool.set_fake_audio.arg.freq") },
+              durMs: { type: "number", description: _t("tool.set_fake_audio.arg.durMs") },
+              notes: { type: "array", description: _t("tool.set_fake_audio.arg.notes") },
+              digits: { type: "string", description: _t("tool.set_fake_audio.arg.digits") },
+              loop: { type: "boolean", description: _t("tool.set_fake_audio.arg.loop") },
+            },
+            execute: _exec(async (a) => {
+              const r = await service.mediaAudio(a);
+              return _tf("msg.media_audio.injected", { kind: r.injected });
+            }),
+          },
+          bt_set_fake_video: {
+            description: _t("tool.set_fake_video.desc"),
+            args: {
+              kind: { type: "string", description: _t("tool.set_fake_video.arg.kind") },
+              data: { type: "string", description: _t("tool.set_fake_video.arg.data") },
+              url: { type: "string", description: _t("tool.set_fake_video.arg.url") },
+              loop: { type: "boolean", description: _t("tool.set_fake_video.arg.loop") },
+            },
+            execute: _exec(async (a) => {
+              const r = await service.mediaVideo(a);
+              return _tf("msg.media_video.injected", { kind: r.injected });
+            }),
+          },
           bt_reload: {
             description: _t("tool.reload.desc"),
             args: {},

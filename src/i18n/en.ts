@@ -71,6 +71,23 @@ const en: LocaleStrings = {
       "Switch camera/microphone mode: 'simulate' (fake devices, default) or 'real' (real devices, falls back to simulate if unavailable). Call without mode to query the current mode.",
     "tool.set_media_mode.arg.mode": "Mode: simulate or real (omit to query current)",
 
+    "tool.set_fake_audio.desc":
+      "Inject audio into the fake microphone (simulated audio input). Kinds: tone (freq+durMs), seq (notes), dtmf (digits), noise (durMs), audio (base64 data), ambient (restart default random sounds), stop.",
+    "tool.set_fake_audio.arg.kind": "Kind: tone / seq / dtmf / noise / audio / ambient / stop",
+    "tool.set_fake_audio.arg.data": "Base64 audio (WAV/MP3/OGG) for kind=audio",
+    "tool.set_fake_audio.arg.freq": "Tone frequency in Hz (kind=tone)",
+    "tool.set_fake_audio.arg.durMs": "Duration in ms (kind=tone/noise)",
+    "tool.set_fake_audio.arg.notes": "Note sequence [[freq,durMs] or [f1,f2,durMs], ...] (kind=seq)",
+    "tool.set_fake_audio.arg.digits": "DTMF digits string (kind=dtmf)",
+    "tool.set_fake_audio.arg.loop": "Loop audio playback (kind=audio; default false = play once)",
+
+    "tool.set_fake_video.desc":
+      "Inject frames into the fake camera (simulated video input). Kinds: image (base64 data, stops scene rotation), video (url, loops), auto (restore default scene rotation), stop (freeze current frame).",
+    "tool.set_fake_video.arg.kind": "Kind: image / video / auto / stop",
+    "tool.set_fake_video.arg.data": "Base64 image (PNG/JPEG) for kind=image",
+    "tool.set_fake_video.arg.url": "Video URL or data URL for kind=video",
+    "tool.set_fake_video.arg.loop": "Loop video playback (kind=video; default true, false = play once then freeze)",
+
     "tool.reload.desc": "Reload the current page",
     "tool.clear.desc": "Clear an input field",
     "tool.clear.arg.selector": "CSS selector for the input field",
@@ -156,6 +173,8 @@ const en: LocaleStrings = {
     "msg.devtools.open": "Developer tools opened",
     "msg.devtools.closed": "Developer tools closed",
     "msg.media_mode.set": "Media mode: {mode}",
+    "msg.media_audio.injected": "Fake mic audio: {kind}",
+    "msg.media_video.injected": "Fake camera video: {kind}",
   },
 
   panel: {

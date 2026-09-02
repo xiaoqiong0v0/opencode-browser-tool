@@ -71,6 +71,23 @@ const zh: LocaleStrings = {
       "切换摄像头/麦克风模式：simulate（模拟设备，默认）或 real（真实设备，无设备自动回退模拟）。不带参数时查询当前模式。",
     "tool.set_media_mode.arg.mode": "模式：simulate 或 real（省略则查询当前）",
 
+    "tool.set_fake_audio.desc":
+      "向 fake 麦克风注入声音（模拟音频输入）。kind：tone（freq+durMs）、seq（notes）、dtmf（digits）、noise（durMs）、audio（base64 音频 data）、ambient（恢复默认随机音效）、stop（停止）。",
+    "tool.set_fake_audio.arg.kind": "类型：tone / seq / dtmf / noise / audio / ambient / stop",
+    "tool.set_fake_audio.arg.data": "base64 音频（WAV/MP3/OGG），kind=audio 时使用",
+    "tool.set_fake_audio.arg.freq": "音调频率 Hz（kind=tone）",
+    "tool.set_fake_audio.arg.durMs": "时长毫秒（kind=tone/noise）",
+    "tool.set_fake_audio.arg.notes": "音符序列 [[freq,durMs] 或 [f1,f2,durMs],...]（kind=seq）",
+    "tool.set_fake_audio.arg.digits": "DTMF 拨号数字串（kind=dtmf）",
+    "tool.set_fake_audio.arg.loop": "循环播放（kind=audio；默认 false=单次）",
+
+    "tool.set_fake_video.desc":
+      "向 fake 摄像头注入画面（模拟视频输入）。kind：image（base64 图片 data，停止场景轮换）、video（url，循环播放）、auto（恢复默认场景轮换）、stop（冻结当前帧）。",
+    "tool.set_fake_video.arg.kind": "类型：image / video / auto / stop",
+    "tool.set_fake_video.arg.data": "base64 图片（PNG/JPEG），kind=image 时使用",
+    "tool.set_fake_video.arg.url": "视频 url 或 dataURL，kind=video 时使用",
+    "tool.set_fake_video.arg.loop": "循环播放（kind=video；默认 true，false=播完冻结末帧）",
+
     "tool.reload.desc": "刷新当前页面",
     "tool.clear.desc": "清空输入框",
     "tool.clear.arg.selector": "输入框的 CSS 选择器",
@@ -151,6 +168,8 @@ const zh: LocaleStrings = {
     "msg.devtools.open": "开发者工具已打开",
     "msg.devtools.closed": "开发者工具已关闭",
     "msg.media_mode.set": "媒体设备模式：{mode}",
+    "msg.media_audio.injected": "fake 麦克风已注入：{kind}",
+    "msg.media_video.injected": "fake 摄像头已注入：{kind}",
   },
 
   panel: {
