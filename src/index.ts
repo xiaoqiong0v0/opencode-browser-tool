@@ -325,12 +325,23 @@ function filterDisabled(tools: Record<string, any>, disabled?: string[]): Record
   return result;
 }
 
-/** 轮询批注发送队列:面板"发送全部"/截图"发送"后,拉取记录推送当前对话 */
+/** 轮询批注发送队列:面板"发送全部"/截图"发送"后,拉取记录推送当前对话
+ * 注意:插件函数会随会话/切目录多次执行,轮询器必须进程级单例,
+ * 否则同一进程会累积多个 interval 空转(server 与 TUI 进程各一份,互不共享)
+ */
+let annotateTimer: any = null;
+let annotateClient: any = null;
+
 function startAnnotatePoller(client: any, log: any): void {
+  // 更新 client 引用(插件重载后使用最新 client),但只启动一个轮询器
+  annotateClient = client;
+  if (annotateTimer) return;
   const POLL_MS = 2000;
   const timer = setInterval(async () => {
     // 服务未启动/已关闭:跳过本次轮询(窗口打开后再恢复推送)
     if (!isRunning()) return;
+    const c = annotateClient;
+    if (!c) return;
     try {
       const r = await service.annotateConsumeSent();
       const records = r?.records || [];
@@ -352,9 +363,9 @@ function startAnnotatePoller(client: any, log: any): void {
       const text = lines.join("\n");
       const bodyParts: any[] = [{ type: "text", text }];
       for (const p of parts) bodyParts.push(p);
-      const sessions = await client.session.list();
+      const sessions = await c.session.list();
       if (sessions?.data?.length) {
-        await client.session.prompt({
+        await c.session.prompt({
           path: { id: sessions.data[0].id },
           body: { noReply: false, parts: bodyParts },
         });
@@ -362,10 +373,12 @@ function startAnnotatePoller(client: any, log: any): void {
     } catch {
       // 服务未就绪/已退出,停止轮询
       clearInterval(timer);
+      annotateTimer = null;
     }
   }, POLL_MS);
   // 不阻塞进程退出
   if (typeof (timer as any).unref === "function") (timer as any).unref();
+  annotateTimer = timer;
 }
 
 // Export default for npm loader
