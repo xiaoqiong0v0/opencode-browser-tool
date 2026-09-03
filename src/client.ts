@@ -27,13 +27,18 @@ let serviceProcess: any = null;
 let servicePort = 0;
 let serviceReady = false;
 /** 服务启动参数(configureService 保存,ensureService 懒启动时使用) */
-let serviceConfig: { nodePath: string; browsersPath?: string; sessionIsolation?: boolean; browserType?: string } | null = null;
+let serviceConfig: { nodePath: string; browsersPath?: string; sessionIsolation?: boolean; browserType?: string; userDataDir?: string } | null = null;
 /** 正在启动中的 Promise(并发保护,多个工具同时调用只启动一次) */
 let starting: Promise<void> | null = null;
 
 /** 保存服务启动参数(插件加载时调用,不立即启动窗口) */
-export function configureService(opts: { nodePath: string; browsersPath?: string; sessionIsolation?: boolean; browserType?: string }): void {
+export function configureService(opts: { nodePath: string; browsersPath?: string; sessionIsolation?: boolean; browserType?: string; userDataDir?: string }): void {
   serviceConfig = opts;
+}
+
+/** 运行时切换用户数据目录(下次 ensureService 重启时生效) */
+export function setUserDataDir(dir: string): void {
+  if (serviceConfig) serviceConfig.userDataDir = dir;
 }
 
 /** 懒启动服务:未启动则 spawn bt-shell(弹窗);已启动直接返回;并发时复用同一个 Promise */
@@ -46,6 +51,7 @@ export async function ensureService(): Promise<void> {
     serviceConfig.browsersPath,
     serviceConfig.sessionIsolation,
     serviceConfig.browserType,
+    serviceConfig.userDataDir,
   ).finally(() => {
     starting = null;
   });
@@ -71,6 +77,7 @@ export async function startService(
   browsersPath?: string,
   sessionIsolation?: boolean,
   browserType?: string,
+  userDataDir?: string,
 ): Promise<void> {
   const log = createLogger("opencode-browser-tool");
   const shell = resolveShellBinary();
@@ -79,6 +86,8 @@ export async function startService(
   const args = ["--browsers-path", browsersPath || "", "--port", String(port)];
   if (browserType) args.push("--browser", browserType);
   if (sessionIsolation) args.push("--session-isolation");
+  // 多用户配置:userDataDir 指向独立 WebView2 用户数据目录
+  if (userDataDir) args.push("--user-data-dir", userDataDir);
   serviceProcess = spawn(shell, args, { stdio: ["ignore", "pipe", "pipe"] });
 
   // 等待服务就绪(轮询端口)

@@ -63,6 +63,9 @@ const zh: LocaleStrings = {
     "cli.cmd.read_record_content": "按 id 读取批注记录",
     "cli.cmd.fake_audio": "向 fake 麦克风注入音频（tone/seq/dtmf/noise/audio/ambient/stop）",
     "cli.cmd.fake_video": "向 fake 摄像头注入画面（image/video/auto/stop）",
+    "cli.cmd.profile": "列出/切换/删除用户配置（--set <name> 重启浏览器；--delete 删除非 default、非当前激活配置）",
+    "cli.cmd.exports": "显示导出目录 + Edge/Chrome 密码/书签导出引导",
+    "cli.cmd.lookup": "在密码 CSV 中查找站点，返回 @file: 路径（密码不进上下文）",
 
     "tool.set_media_mode.desc":
       "切换摄像头/麦克风模式：simulate（模拟设备，默认）或 real（真实设备，无设备自动回退模拟）。不带参数时查询当前模式。",

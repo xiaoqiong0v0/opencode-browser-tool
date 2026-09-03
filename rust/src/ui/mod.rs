@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use serde::Serialize;
 use tauri::window::WindowBuilder;
 use tauri::webview::WebviewBuilder;
-use tauri::{AppHandle, Manager, WebviewUrl};
+use tauri::{AppHandle, Manager, Runtime, WebviewUrl};
 
 /// 页面 Webview 标签
 pub const PAGE_WEBVIEW: &str = "page";
@@ -22,7 +22,6 @@ pub const OVERLAY_WEBVIEW: &str = "overlay";
 pub const PANEL_WEBVIEW: &str = "panel";
 /// 工具栏 Webview 标签
 pub const TOOLBAR_WEBVIEW: &str = "toolbar";
-
 /// 面板宽度(逻辑像素,覆盖式浮层)
 pub const PANEL_WIDTH: f64 = 280.0;
 /// 顶部工具栏高度(逻辑像素,两行:标签行 + 地址栏行)
@@ -111,6 +110,8 @@ pub struct UiState {
     pub shot_mode: Mutex<bool>,
     /// 媒体设备模式:simulate(默认,模拟摄像头/麦克风) / real(真实设备,无设备自动回退模拟)
     pub media_mode: Mutex<String>,
+    /// WebView2 用户数据目录(多用户配置隔离,来自 --user-data-dir;None=默认目录)
+    pub user_data_dir: Mutex<Option<String>>,
     /// 主题模式:auto(跟随系统) / light / dark
     pub theme: Mutex<String>,
 }
@@ -131,6 +132,7 @@ impl UiState {
             pending_shot: Mutex::new(None),
             shot_mode: Mutex::new(false),
             media_mode: Mutex::new("simulate".into()),
+            user_data_dir: Mutex::new(None),
             theme: Mutex::new("auto".into()),
         }
     }
@@ -549,9 +551,20 @@ const MEDIA_FAKE_JS: &str = r##"
 })();
 "##;
 
+/// 按需给 WebviewBuilder 设置用户数据目录(多用户配置隔离;None 用默认目录)
+/// 同目录的多个 webview 会共享同一 WebView2 environment,页面/工具栏等统一走同一用户配置
+fn with_data_dir<R: Runtime>(builder: WebviewBuilder<R>, dir: &Option<String>) -> WebviewBuilder<R> {
+    match dir {
+        Some(d) => builder.data_directory(std::path::PathBuf::from(d.as_str())),
+        None => builder,
+    }
+}
+
 /// 创建主窗口 + 四 Webview(工具栏/页面/覆盖层/面板)
 /// 布局以窗口实际物理尺寸为准(避免 DPI 感知时序导致窗口与子 webview 缩放不一致)
 pub fn create_ui(app: &AppHandle) -> tauri::Result<()> {
+    // 用户数据目录(多用户配置):所有 webview 共用同一目录 → 共享同一用户配置
+    let data_dir = app.state::<UiState>().user_data_dir.lock().unwrap().clone();
     // 主窗口(逻辑 1100x700:150% DPI 下物理 1650x1050,适配常见 1920x1080 屏幕)
     // 最小尺寸 500x400(逻辑像素),防止窗口拖到过小导致布局崩溃
     // 背景深色避免启动时白屏闪烁
@@ -568,7 +581,7 @@ pub fn create_ui(app: &AppHandle) -> tauri::Result<()> {
     // 1. 工具栏 Webview(顶部横条:标签 + 地址栏 + 面板开关)
     // 创建后先隐藏,布局定位完成后再显示,避免初始 100x100 在左上角闪现
     let toolbar = window.add_child(
-        WebviewBuilder::new(TOOLBAR_WEBVIEW, WebviewUrl::App("toolbar.html".into())),
+        with_data_dir(WebviewBuilder::new(TOOLBAR_WEBVIEW, WebviewUrl::App("toolbar.html".into())), &data_dir),
         tauri::PhysicalPosition::new(0, 0),
         tauri::PhysicalSize::new(100, 100),
     )?;
@@ -580,12 +593,15 @@ pub fn create_ui(app: &AppHandle) -> tauri::Result<()> {
     for i in 1..=MAX_TABS {
         let label = format!("{PAGE_WEBVIEW}-{i}");
         let w = window.add_child(
-            WebviewBuilder::new(
-                &label,
-                // 初始加载自定义新标签页(背景跟随主题,不依赖 webview 默认背景)
-                WebviewUrl::App("newtab.html".into()),
-            )
-            .initialization_script(format!("{PAGE_BRIDGE_JS}{MEDIA_FAKE_JS}")),
+            with_data_dir(
+                WebviewBuilder::new(
+                    &label,
+                    // 初始加载自定义新标签页(背景跟随主题,不依赖 webview 默认背景)
+                    WebviewUrl::App("newtab.html".into()),
+                )
+                .initialization_script(format!("{PAGE_BRIDGE_JS}{MEDIA_FAKE_JS}")),
+                &data_dir,
+            ),
             tauri::PhysicalPosition::new(0, 0),
             tauri::PhysicalSize::new(100, 100),
         )?;
@@ -612,9 +628,12 @@ pub fn create_ui(app: &AppHandle) -> tauri::Result<()> {
 
     // 3. 覆盖层 Webview(透明,叠加在页面区)
     let overlay = window.add_child(
-        WebviewBuilder::new(OVERLAY_WEBVIEW, WebviewUrl::App("overlay.html".into()))
-            .transparent(true)
-            .disable_drag_drop_handler(),
+        with_data_dir(
+            WebviewBuilder::new(OVERLAY_WEBVIEW, WebviewUrl::App("overlay.html".into()))
+                .transparent(true)
+                .disable_drag_drop_handler(),
+            &data_dir,
+        ),
         tauri::PhysicalPosition::new(0, 0),
         tauri::PhysicalSize::new(100, 100),
     )?;
@@ -623,7 +642,7 @@ pub fn create_ui(app: &AppHandle) -> tauri::Result<()> {
 
     // 4. 面板 Webview(覆盖式浮层,默认隐藏,由工具栏按钮切换)
     window.add_child(
-        WebviewBuilder::new(PANEL_WEBVIEW, WebviewUrl::App("index.html".into())),
+        with_data_dir(WebviewBuilder::new(PANEL_WEBVIEW, WebviewUrl::App("index.html".into())), &data_dir),
         tauri::PhysicalPosition::new(100, 0),
         tauri::PhysicalSize::new(100, 100),
     )?;
@@ -753,11 +772,16 @@ pub fn active_page_webview(app: &AppHandle) -> Option<tauri::webview::Webview> {
 pub fn create_tab_webview(app: &AppHandle, id: u32) -> Result<tauri::webview::Webview, String> {
     // add_child 定义在 tauri::Window(需 get_window,而非 get_webview_window)
     let window = app.get_window("main").ok_or("main window not found")?;
+    // 用户数据目录与预创建 webview 保持一致(共享同一 WebView2 environment)
+    let data_dir = app.state::<UiState>().user_data_dir.lock().unwrap().clone();
     let label = format!("{PAGE_WEBVIEW}-{id}");
     let w = window
         .add_child(
-            WebviewBuilder::new(&label, WebviewUrl::App("newtab.html".into()))
-                .initialization_script(format!("{PAGE_BRIDGE_JS}{MEDIA_FAKE_JS}")),
+            with_data_dir(
+                WebviewBuilder::new(&label, WebviewUrl::App("newtab.html".into()))
+                    .initialization_script(format!("{PAGE_BRIDGE_JS}{MEDIA_FAKE_JS}")),
+                &data_dir,
+            ),
             tauri::PhysicalPosition::new(0, 0),
             tauri::PhysicalSize::new(100, 100),
         )

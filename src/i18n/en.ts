@@ -63,6 +63,9 @@ const en: LocaleStrings = {
     "cli.cmd.read_record_content": "Read an annotation record by id",
     "cli.cmd.fake_audio": "Inject audio into fake mic (tone/seq/dtmf/noise/audio/ambient/stop)",
     "cli.cmd.fake_video": "Inject frames into fake camera (image/video/auto/stop)",
+    "cli.cmd.profile": "List/switch/delete user profiles (--set <name> restarts browser; --delete removes a non-default, non-active profile)",
+    "cli.cmd.exports": "Show export dir + how to export Edge/Chrome passwords/bookmarks",
+    "cli.cmd.lookup": "Find a password in a CSV export, return @file: path (not in context)",
 
     "tool.set_media_mode.desc":
       "Switch camera/microphone mode: 'simulate' (fake devices, default) or 'real' (real devices, falls back to simulate if unavailable). Call without mode to query the current mode.",

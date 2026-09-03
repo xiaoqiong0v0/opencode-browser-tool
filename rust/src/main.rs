@@ -11,10 +11,11 @@ use bt_shell::ui::{self, AnnotationRecord};
 use tauri::{Listener, Manager, State};
 
 /// 解析命令行参数(兼容旧 Node 服务协议)
-fn parse_args() -> (String, u16) {
+fn parse_args() -> (String, u16, Option<String>) {
     let args: Vec<String> = std::env::args().collect();
     let mut browsers_path = String::new();
     let mut port: u16 = 0;
+    let mut user_data_dir: Option<String> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -30,11 +31,17 @@ fn parse_args() -> (String, u16) {
                     port = args[i].parse().unwrap_or(0);
                 }
             }
+            "--user-data-dir" => {
+                i += 1;
+                if i < args.len() {
+                    user_data_dir = Some(args[i].clone());
+                }
+            }
             _ => {}
         }
         i += 1;
     }
-    (browsers_path, port)
+    (browsers_path, port, user_data_dir)
 }
 
 /// 面板拉取批注记录
@@ -326,7 +333,7 @@ fn main() {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
 
-    let (browsers_path, port) = parse_args();
+    let (browsers_path, port, user_data_dir) = parse_args();
 
     tauri::Builder::default()
         .manage(ui::UiState::new())
@@ -349,6 +356,11 @@ fn main() {
             toolbar_reload
         ])
         .setup(move |app| {
+            // 设置用户数据目录(多用户配置隔离),再创建 Webview(create_ui 据此设置 data_directory)
+            {
+                let state = app.state::<ui::UiState>();
+                *state.user_data_dir.lock().unwrap() = user_data_dir.clone();
+            }
             // 创建三 Webview 布局
             ui::create_ui(app.handle())?;
 

@@ -17,6 +17,8 @@ export interface PluginConfig {
   toolLang: Lang;
   disabledTools?: string[];
   sessionIsolation?: boolean;
+  /** 缓存根目录(默认 ~/.opencode/plugins-cache/opencode-browser-tool) */
+  cacheDir?: string;
 }
 
 const defaults: PluginConfig = { panelLang: "en", toolLang: "en" };
@@ -41,6 +43,51 @@ export function getPluginDataDir(): string {
 /** 获取浏览器缓存目录 */
 export function getBrowsersDir(): string {
   return _config.browsersPath || resolve(getPluginDataDir(), "browsers");
+}
+
+/** 插件缓存根目录(用户配置/导出/临时文件,默认 ~/.opencode/plugins-cache/opencode-browser-tool) */
+export function getCacheDir(): string {
+  return _config.cacheDir || resolve(getOpenCodeDataDir(), "plugins-cache", PLUGIN_NAME);
+}
+
+/** 多用户配置目录(user-data/<profile>,每个 profile 独立 WebView2 用户数据) */
+export function getProfilesDir(): string {
+  return resolve(getCacheDir(), "user-data");
+}
+
+/** 某个配置的 WebView2 用户数据目录 */
+export function getProfileDir(name: string): string {
+  return resolve(getProfilesDir(), name);
+}
+
+/** 导出目录(用户从 Edge/Chrome 导出的密码 CSV / 书签 HTML) */
+export function getExportsDir(): string {
+  return resolve(getCacheDir(), "exports");
+}
+
+/** 临时目录(密码临时文件,用完即删) */
+export function getTmpDir(): string {
+  return resolve(getCacheDir(), "tmp");
+}
+
+/** active profile 状态文件 */
+function activeProfileFile(): string {
+  return resolve(getCacheDir(), "active-profile");
+}
+
+/** 获取当前激活配置(默认 "default";不存在时回落默认) */
+export function getActiveProfile(): string {
+  try {
+    const v = readFileSync(activeProfileFile(), "utf-8").trim();
+    if (v) return v;
+  } catch {}
+  return "default";
+}
+
+/** 持久化当前激活配置 */
+export function setActiveProfile(name: string): void {
+  mkdirSync(getCacheDir(), { recursive: true });
+  writeFileSync(activeProfileFile(), name, "utf-8");
 }
 
 /** 加载配置：环境变量 > 项目配置 > 全局配置 > 默认值 */
@@ -84,6 +131,7 @@ function applyConfigFile(config: PluginConfig, filePath: string): void {
     if (fileConfig.toolLang && isValidLang(fileConfig.toolLang)) config.toolLang = fileConfig.toolLang;
     if (fileConfig.disabledTools) config.disabledTools = fileConfig.disabledTools;
     if (fileConfig.sessionIsolation !== undefined) config.sessionIsolation = fileConfig.sessionIsolation;
+    if (fileConfig.cacheDir !== undefined) config.cacheDir = fileConfig.cacheDir;
   } catch {}
 }
 
@@ -124,6 +172,10 @@ function generateDefaultConfig(filePath: string): void {
 
   // 浏览器缓存目录（可选，不设则使用插件数据目录）
   // "browsersPath": "D:/browsers/chromium",
+
+  // 缓存根目录（可选，默认 ~/.opencode/plugins-cache/opencode-browser-tool）
+  // 下设 user-data/<profile> 用户配置、exports 导出、tmp 临时密码文件
+  // "cacheDir": "D:/browser-cache",
 
   // 禁用的工具列表（可选，工具名不加 bt_ 前缀）
   // "disabledTools": ["close", "custom_user_agent"],

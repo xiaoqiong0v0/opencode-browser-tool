@@ -1,10 +1,15 @@
+import { readFileSync, writeFileSync, readdirSync, unlinkSync, mkdirSync, rmSync, existsSync } from "fs";
+import { resolve } from "path";
 import stringArgv from "string-argv";
 import { parseArgs } from "node:util";
-import { loadConfig, getConfig, getBrowsersDir } from "./config/index.js";
+import {
+  loadConfig, getConfig, getBrowsersDir, getCacheDir, getProfilesDir, getProfileDir,
+  getExportsDir, getTmpDir, getActiveProfile, setActiveProfile,
+} from "./config/index.js";
 import { registerLocale, t } from "./i18n/index.js";
 import en from "./i18n/en.js";
 import zh from "./i18n/zh.js";
-import { configureService, openWindow, isRunning, stopService, service } from "./client.js";
+import { configureService, setUserDataDir, ensureService, openWindow, isRunning, stopService, service } from "./client.js";
 import { tool, type Plugin } from "@opencode-ai/plugin";
 import createLogger from "@xiaoqiong0v0/opencode-plugin-logger";
 
@@ -87,6 +92,64 @@ const COMMANDS: Record<string, CmdDef> = {
   read_record_content: { usage: "--id", descKey: "cli.cmd.read_record_content", args: [{ flag: "id" }], run: async (a) => { try { const records = await service.annotateRecords(); const rec = (records || []).find((r: any) => r.index === a.id); if (!rec) return `(record #${a.id} not found)`; return `#${rec.index} ${rec.selector}\nrect: ${JSON.stringify(rec.rect)}\nnote: ${rec.note || "(none)"}`; } catch { return "(no records)"; } } },
   fake_audio: { usage: "--kind [--data --freq --durMs --notes --digits --loop]", descKey: "cli.cmd.fake_audio", args: [{ flag: "kind" }, { flag: "data" }, { flag: "freq" }, { flag: "durMs" }, { flag: "notes" }, { flag: "digits" }, { flag: "loop", type: "boolean" }], run: async (a) => { const r = await service.mediaAudio(a); return `Fake mic audio: ${r.injected}`; } },
   fake_video: { usage: "--kind [--data --url --loop]", descKey: "cli.cmd.fake_video", args: [{ flag: "kind" }, { flag: "data" }, { flag: "url" }, { flag: "loop", type: "boolean" }], run: async (a) => { const r = await service.mediaVideo(a); return `Fake camera video: ${r.injected}`; } },
+  profile: { usage: "[--set <name> | --delete <name>]", descKey: "cli.cmd.profile", args: [{ flag: "set" }, { flag: "delete" }], run: async (a) => {
+    mkdirSync(getProfilesDir(), { recursive: true });
+    const active = getActiveProfile();
+    if (a.delete) {
+      const name = String(a.delete);
+      if (name === "default") return "Cannot delete the default profile";
+      if (name === active) return "Cannot delete the active profile; switch to another first (profile --set <name>)";
+      const dir = getProfileDir(name);
+      if (!existsSync(dir)) return `Profile not found: ${name}`;
+      rmSync(dir, { recursive: true, force: true });
+      return `Deleted profile: ${name}`;
+    }
+    if (a.set) {
+      const name = String(a.set);
+      // 目标配置目录不存在则创建(允许 "profile --set <新名>" 直接新建并切换)
+      mkdirSync(getProfileDir(name), { recursive: true });
+      setActiveProfile(name);
+      setUserDataDir(getProfileDir(name));
+      // 切换配置:重启服务使新 user-data-dir 生效(丢当前标签可接受)
+      await stopService();
+      await ensureService();
+      return `Switched to profile: ${name} (browser restarted)`;
+    }
+    // 列出 user-data 下的配置目录
+    const dirs = readdirSync(getProfilesDir(), { withFileTypes: true })
+      .filter((d) => d.isDirectory())
+      .map((d) => d.name);
+    const list = dirs.map((d) => `${d === active ? "*" : " "} ${d}`).join("\n") || "(no profiles yet)";
+    return `Profiles:\n${list}\n\nActive: ${active}\nSwitch: profile --set <name> (restarts browser, current tabs lost)\nDelete: profile --delete <name> (not default/active)`;
+  } },
+  exports: { usage: "", descKey: "cli.cmd.exports", run: async () => {
+    const dir = getExportsDir();
+    mkdirSync(dir, { recursive: true });
+    return `Export directory: ${dir}\n\nHow to export from Edge/Chrome:\n  Passwords: Settings → Profiles → Passwords → ⋯ → Export passwords (CSV)\n  Bookmarks: Settings → Bookmarks → Export (HTML)\nPlace the exported files in the directory above, then the model can read them.\n\nRead passwords without leaking into context:\n  lookup --csv <file.csv> --url <site>\n  fill --selector <input> --value @file:<path>`;
+  } },
+  lookup: { usage: "--csv <path> --url <site>", descKey: "cli.cmd.lookup", args: [{ flag: "csv" }, { flag: "url" }], run: async (a) => {
+    const csv = a.csv;
+    const url = a.url;
+    if (!csv || !url) return "Usage: lookup --csv <path> --url <site>";
+    // 解析密码 CSV(name,url,username,password[,note]),按 url 子串匹配
+    const lines = readFileSync(csv, "utf-8").split(/\r?\n/).filter((l) => l.trim());
+    for (const line of lines.slice(1)) {
+      const cols = splitCsvLine(line);
+      if (cols.length < 4) continue;
+      const rowUrl = cols[1] || "";
+      if (rowUrl.toLowerCase().includes(String(url).toLowerCase())) {
+        const username = cols[2] || "";
+        const password = cols[3] || "";
+        // 密码写入临时文件,返回 @file: 引用(不进上下文);用完即删
+        const tmpDir = getTmpDir();
+        mkdirSync(tmpDir, { recursive: true });
+        const tmp = resolve(tmpDir, `secret-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.tmp`);
+        writeFileSync(tmp, password, "utf-8");
+        return `Found: ${username} @ ${rowUrl}\nUse: fill --selector <input> --value @file:${tmp}\n(password in temp file, deleted after use)`;
+      }
+    }
+    return `No entry found for: ${url}`;
+  } },
 };
 
 /** 帮助全文(command=help 或未知命令时返回;命令描述与结构按 toolLang 本地化) */
@@ -112,6 +175,25 @@ function parseFlagArgs(tokens: string[], def: CmdDef): Record<string, any> {
   return values;
 }
 
+/** 简单 CSV 行解析(处理引号包裹的字段,Edge/Chrome 密码导出格式) */
+function splitCsvLine(line: string): string[] {
+  const out: string[] = [];
+  let cur = "";
+  let inQ = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inQ) {
+      if (ch === '"') {
+        if (line[i + 1] === '"') { cur += '"'; i++; } else inQ = false;
+      } else cur += ch;
+    } else if (ch === '"') inQ = true;
+    else if (ch === ",") { out.push(cur); cur = ""; }
+    else cur += ch;
+  }
+  out.push(cur);
+  return out;
+}
+
 export const opencodeBrowserTool: Plugin = async ({ client, worktree }) => {
   registerLocale("en", en);
   registerLocale("zh", zh);
@@ -126,6 +208,8 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree }) => {
       browsersPath: getBrowsersDir(),
       sessionIsolation: config.sessionIsolation,
       browserType: config.browserType,
+      // 多用户配置:默认用当前激活配置的独立 WebView2 用户数据目录
+      userDataDir: getProfileDir(getActiveProfile()),
     });
 
     // 轮询批注发送队列(面板"发送全部" → 推送到对话)
@@ -163,6 +247,25 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree }) => {
                   params = parseFlagArgs(tokens, def);
                 } catch (e: any) {
                   return `${_t("cli.invalid_args").replace("{cmd}", cmdName).replace("{msg}", e.message)}\n\nUsage: bt_cli({ args: "${cmdName} ${def.usage}" })`;
+                }
+              }
+              // @file: 引用解析:值以 @file:<path> 开头时读文件内容作为实际值
+              // (密码等敏感值不进 LLM 上下文,如 fill --value @file:C:\...\secret.tmp)
+              // 仅删除临时目录(getTmpDir)内的文件,避免误删用户文件
+              const tmpDir = resolve(getTmpDir());
+              for (const key of Object.keys(params)) {
+                const v = params[key];
+                if (typeof v === "string" && v.startsWith("@file:")) {
+                  const p = v.slice(6);
+                  try {
+                    params[key] = readFileSync(p, "utf-8").replace(/\r?\n$/, "");
+                    // 用完即删(仅限 lookup 生成的临时密码文件)
+                    if (resolve(p).startsWith(tmpDir)) {
+                      unlinkSync(p);
+                    }
+                  } catch (e: any) {
+                    return `Cannot read @file: ${p}: ${e.message}`;
+                  }
                 }
               }
               // 透传会话 ID(会话隔离用)
