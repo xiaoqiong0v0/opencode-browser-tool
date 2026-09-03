@@ -3,18 +3,17 @@ import type { LocaleStrings } from "./types.js";
 const en: LocaleStrings = {
   tool: {
     "tool.cli.desc":
-      "Browser automation via a CLI-style dispatcher: call with command + args. Omit command or use command=help to list all commands.",
-    "tool.cli.arg.command": "Command name (omit or 'help' to list all commands)",
-    "tool.cli.arg.args": "Command params: JSON object (recommended) or --flag style string, e.g. \"--url https://...\"",
+      "Browser automation via a CLI-style dispatcher: pass a single command string, e.g. \"navigate --url https://...\" or \"help\". Omit to list all commands.",
+    "tool.cli.arg.args": "Command line string: \"<command> [--flag value ...]\", e.g. \"navigate --url https://...\" (\"help\" lists all)",
 
     "cli.header": "bt_cli — browser automation CLI",
-    "cli.usage": "Usage: bt_cli({ command, args })\n  command  sub-command name (omit or \"help\" to list all)\n  args     params: JSON object (recommended) or --flag string\n           JSON object: { \"url\": \"https://...\" }\n           string:      \"--url https://...\"",
+    "cli.usage": "Usage: bt_cli({ args })\n  args  single command line string: \"<command> [--flag value ...]\"",
     "cli.commands": "Commands:",
     "cli.examples": "Examples:",
-    "cli.example.1": "bt_cli({ command: \"help\" })",
-    "cli.example.2": "bt_cli({ command: \"navigate\", args: { url: \"https://example.com\" } })",
-    "cli.example.3": "bt_cli({ command: \"click\", args: \"--selector #submit\" })",
-    "cli.example.4": "bt_cli({ command: \"fill\", args: { selector: \"#q\", value: \"hello\" } })",
+    "cli.example.1": "bt_cli({ args: \"help\" })",
+    "cli.example.2": "bt_cli({ args: \"navigate --url https://example.com\" })",
+    "cli.example.3": "bt_cli({ args: \"click --selector #submit\" })",
+    "cli.example.4": "bt_cli({ args: \"fill --selector #q --value \\\"hello world\\\"\" })",
     "cli.unknown": "Unknown command: {cmd}",
     "cli.invalid_args": "Invalid args for {cmd}: {msg}",
     "cli.failed": "Command {cmd} failed: {msg}",

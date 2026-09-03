@@ -3,18 +3,17 @@ import type { LocaleStrings } from "./types.js";
 const zh: LocaleStrings = {
   tool: {
     "tool.cli.desc":
-      "CLI 风格的浏览器自动化控制：command + args。省略 command 或用 command=help 列出全部命令。",
-    "tool.cli.arg.command": "命令名（省略或 help 列出全部命令）",
-    "tool.cli.arg.args": "命令参数：JSON 对象（推荐）或 --flag 风格字符串，如 \"--url https://...\"",
+      "CLI 风格的浏览器自动化控制：单个字符串命令行，如 \"navigate --url https://...\" 或 \"help\"。省略列出全部命令。",
+    "tool.cli.arg.args": "命令行字符串：\"<command> [--flag 值 ...]\"，如 \"navigate --url https://...\"（\"help\" 列出全部）",
 
     "cli.header": "bt_cli — 浏览器自动化 CLI",
-    "cli.usage": "用法: bt_cli({ command, args })\n  command  子命令名（省略或用 \"help\" 列出全部）\n  args     参数：JSON 对象（推荐）或 --flag 风格字符串\n           JSON 对象: { \"url\": \"https://...\" }\n           字符串:    \"--url https://...\"",
+    "cli.usage": "用法: bt_cli({ args })\n  args  单个命令行字符串: \"<command> [--flag 值 ...]\"",
     "cli.commands": "子命令：",
     "cli.examples": "示例：",
-    "cli.example.1": "bt_cli({ command: \"help\" })",
-    "cli.example.2": "bt_cli({ command: \"navigate\", args: { url: \"https://example.com\" } })",
-    "cli.example.3": "bt_cli({ command: \"click\", args: \"--selector #submit\" })",
-    "cli.example.4": "bt_cli({ command: \"fill\", args: { selector: \"#q\", value: \"hello\" } })",
+    "cli.example.1": "bt_cli({ args: \"help\" })",
+    "cli.example.2": "bt_cli({ args: \"navigate --url https://example.com\" })",
+    "cli.example.3": "bt_cli({ args: \"click --selector #submit\" })",
+    "cli.example.4": "bt_cli({ args: \"fill --selector #q --value \\\"hello world\\\"\" })",
     "cli.unknown": "未知命令: {cmd}",
     "cli.invalid_args": "参数无效 {cmd}: {msg}",
     "cli.failed": "命令 {cmd} 失败: {msg}",

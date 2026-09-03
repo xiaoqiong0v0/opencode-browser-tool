@@ -1,3 +1,4 @@
+import stringArgv from "string-argv";
 import { parseArgs } from "node:util";
 import { loadConfig, getConfig, getBrowsersDir } from "./config/index.js";
 import { registerLocale, t } from "./i18n/index.js";
@@ -102,9 +103,8 @@ function buildHelp(): string {
 /** 描述内嵌的紧凑命令索引(模型无需先调 help 即可用) */
 const DESC_INDEX = Object.entries(COMMANDS).map(([k, v]) => `${k} ${v.usage}`).join(" | ");
 
-/** 解析 --flag 风格字符串参数(基于 node:util.parseArgs,未知 flag 报错) */
-function parseFlagArgs(raw: string, def: CmdDef): Record<string, any> {
-  const tokens = raw.trim().split(/\s+/).filter(Boolean);
+/** 解析 --flag 风格参数(基于 node:util.parseArgs,未知 flag 报错;tokens 已由 string-argv 正确分词) */
+function parseFlagArgs(tokens: string[], def: CmdDef): Record<string, any> {
   if (tokens.length === 0) return {};
   const options: Record<string, any> = {};
   for (const arg of def.args || []) options[arg.flag] = { type: arg.type || "string" };
@@ -143,25 +143,27 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree }) => {
           bt_cli: tool({
             description: _t("tool.cli.desc") + "\n" + DESC_INDEX,
             args: {
-              command: tool.schema.string().describe(_t("tool.cli.arg.command")),
+              // 单字符串命令行: "<command> [--flag value ...]", 如 "navigate --url https://..." / "help"
               args: tool.schema.string().optional().describe(_t("tool.cli.arg.args")),
             },
             async execute(a: any, context: any) {
-              const { command, args, cmd: cmdAlias, ...rest } = a;
-              const cmdName = command || cmdAlias;
-              // command 省略/help → 返回完整帮助
-              if (!cmdName || cmdName === "help" || cmdName === "--help" || cmdName === "-h") return buildHelp();
+              // 单字符串命令行: "<command> [--flag value ...]",如 "navigate --url https://..."
+              const raw = (typeof a?.args === "string" ? a.args : "").trim();
+              if (!raw || raw === "help" || raw === "--help" || raw === "-h") return buildHelp();
+              // string-argv 正确分词(处理引号/转义),命令名取第一个 token
+              const tokens = stringArgv(raw);
+              const cmdName = tokens.shift();
+              if (!cmdName) return buildHelp();
               const def = COMMANDS[cmdName];
               if (!def) return `${_t("cli.unknown").replace("{cmd}", cmdName)}\n\n${buildHelp()}`;
-              let params: Record<string, any> = { ...rest };
-              if (typeof args === "string") {
+              // 剩余 token 交给 parseArgs 解析(未知 flag 会抛错,返回用法提示自愈)
+              let params: Record<string, any> = {};
+              if (tokens.length > 0) {
                 try {
-                  params = { ...params, ...parseFlagArgs(args, def) };
+                  params = parseFlagArgs(tokens, def);
                 } catch (e: any) {
-                  return `${_t("cli.invalid_args").replace("{cmd}", cmdName).replace("{msg}", e.message)}\n\nUsage: bt_cli({ command: "${cmdName}", args: ${def.usage} })`;
+                  return `${_t("cli.invalid_args").replace("{cmd}", cmdName).replace("{msg}", e.message)}\n\nUsage: bt_cli({ args: "${cmdName} ${def.usage}" })`;
                 }
-              } else if (args && typeof args === "object") {
-                params = { ...params, ...args };
               }
               // 透传会话 ID(会话隔离用)
               params._sessionId = context?.sessionID || "";
