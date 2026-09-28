@@ -262,6 +262,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "futures-util",
+ "gtk",
  "reqwest",
  "serde",
  "serde_json",
@@ -270,6 +271,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tower-http 0.7.0",
+ "webkit2gtk",
  "webview2-com",
  "windows",
 ]

@@ -6,6 +6,9 @@ pub mod annotate;
 /// 新窗口拦截(Windows:target=_blank → 新标签页)
 #[cfg(windows)]
 pub mod new_window;
+/// Linux 子 webview 绝对定位垫片(tauri/wry 在 Linux 用 GtkBox 导致 set_bounds 失效)
+#[cfg(target_os = "linux")]
+pub mod linux_layout;
 
 use std::sync::Mutex;
 
@@ -575,6 +578,9 @@ pub fn create_ui(app: &AppHandle) -> tauri::Result<()> {
         .background_color(tauri::window::Color(20, 20, 20, 255))
         // 无系统标题栏(窗口控制按钮移到工具栏标签行右侧,布局更紧凑)
         .decorations(false)
+        // Linux: 开启窗口透明(RGBA visual + app_paintable)。WebKitGTK 下若顶层窗口没有
+        // RGBA visual,覆盖层 webview 的 transparent 背景会被合成为不透明黑,遮罩盖住页面
+        .transparent(cfg!(target_os = "linux"))
         .build()?;
 
     // 1. 工具栏 Webview(顶部横条:标签 + 地址栏 + 面板开关)
@@ -647,6 +653,33 @@ pub fn create_ui(app: &AppHandle) -> tauri::Result<()> {
         tauri::PhysicalSize::new(100, 100),
     )?;
 
+    // Linux: tauri/wry 把子 webview pack 进窗口 GtkBox(expand),set_position/set_size 失效;
+    // 统一迁移到自建 gtk::Fixed 后,apply_layout 才能用 move_/set_size_request 绝对定位。
+    // 必须覆盖全部预创建 webview(含隐藏的 page-2..MAX_TABS),否则后续切换标签时它们仍留在
+    // GtkBox 中均分空间,导致布局错乱。
+    #[cfg(target_os = "linux")]
+    {
+        let mut labels: Vec<String> = Vec::with_capacity(MAX_TABS as usize + 3);
+        labels.push(TOOLBAR_WEBVIEW.to_string());
+        for i in 1..=MAX_TABS {
+            labels.push(format!("{PAGE_WEBVIEW}-{i}"));
+        }
+        labels.push(OVERLAY_WEBVIEW.to_string());
+        labels.push(PANEL_WEBVIEW.to_string());
+        let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        linux_layout::reparent(app, &refs);
+        // reparent 可能让 GTK 子控件重新显示,恢复 overlay/panel 的默认隐藏状态
+        if let Some(w) = app.get_webview(OVERLAY_WEBVIEW) {
+            let _ = w.hide();
+        }
+        if let Some(w) = app.get_webview(PANEL_WEBVIEW) {
+            let _ = w.hide();
+        }
+        // 无装饰窗口在 Wayland 下无边框可拖拽:在 Fixed 外层套 Overlay 并叠加边缘热区,
+        // 按下时 begin_resize_drag(Wayland → xdg_toplevel.resize,X11 → WM)
+        linux_layout::install_resize_grips(app, TOOLBAR_WEBVIEW);
+    }
+
     // 初始布局按窗口实际尺寸重排
     let size = window.inner_size()?;
     let scale = window.scale_factor().unwrap_or(1.0);
@@ -674,6 +707,29 @@ pub fn create_ui(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+/// 设置子 webview 边界(Windows: tauri 原生 set_position/set_size;Linux: gtk::Fixed 绝对定位)
+/// 参数:app tauri 应用句柄;label webview 标签;x/y 左上角坐标(物理像素);w/h 尺寸(物理像素)
+/// 返回值:Windows 分支透传 tauri 设置失败的错误;其余平台恒 Ok
+fn set_webview_bounds(app: &AppHandle, label: &str, x: i32, y: i32, w: i32, h: i32) -> tauri::Result<()> {
+    #[cfg(windows)]
+    {
+        if let Some(wv) = app.get_webview(label) {
+            wv.set_position(tauri::PhysicalPosition::new(x, y))?;
+            wv.set_size(tauri::PhysicalSize::new(w.max(0) as u32, h.max(0) as u32))?;
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux_layout::place(app, label, x, y, w, h);
+    }
+    // 其他平台(理论不支持):保持空实现,避免未使用参数告警
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = (app, label, x, y, w, h);
+    }
+    Ok(())
+}
+
 /// 重排 webview 的边界
 /// 工具栏占顶部固定高度;所有页面 Webview(每标签一个)占工具栏下方全宽;
 /// 覆盖层叠加在页面区;面板为右侧覆盖式浮层(关闭时尺寸归零)
@@ -685,10 +741,7 @@ pub fn apply_layout(app: &AppHandle, size: tauri::PhysicalSize<u32>, scale: f64)
     let page_h = size.height as i32 - toolbar_h;
 
     // 1. 工具栏 Webview(顶部横条)
-    if let Some(w) = app.get_webview(TOOLBAR_WEBVIEW) {
-        w.set_position(tauri::PhysicalPosition::new(0, 0))?;
-        w.set_size(tauri::PhysicalSize::new(page_w.max(0) as u32, toolbar_h.max(0) as u32))?;
-    }
+    set_webview_bounds(app, TOOLBAR_WEBVIEW, 0, 0, page_w.max(0), toolbar_h.max(0))?;
 
     // 2. 所有页面 Webview(每标签一个,定位到工具栏下方全宽)
     {
@@ -701,33 +754,29 @@ pub fn apply_layout(app: &AppHandle, size: tauri::PhysicalSize<u32>, scale: f64)
             .filter_map(|t| t.webview.clone())
             .collect();
         for label in labels {
-            if let Some(w) = app.get_webview(&label) {
-                w.set_position(tauri::PhysicalPosition::new(0, toolbar_h.max(0)))?;
-                w.set_size(tauri::PhysicalSize::new(page_w.max(0) as u32, page_h.max(0) as u32))?;
-            }
+            set_webview_bounds(app, &label, 0, toolbar_h.max(0), page_w.max(0), page_h.max(0))?;
         }
     }
 
     // 3. 覆盖层 Webview(透明,叠加在页面区)
-    if let Some(w) = app.get_webview(OVERLAY_WEBVIEW) {
-        w.set_position(tauri::PhysicalPosition::new(0, toolbar_h.max(0)))?;
-        w.set_size(tauri::PhysicalSize::new(page_w.max(0) as u32, page_h.max(0) as u32))?;
-    }
+    set_webview_bounds(app, OVERLAY_WEBVIEW, 0, toolbar_h.max(0), page_w.max(0), page_h.max(0))?;
 
     // 4. 面板 Webview(右侧覆盖浮层,panel_open 关闭时尺寸归零隐藏)
-    if let Some(w) = app.get_webview(PANEL_WEBVIEW) {
+    {
         let open = app.state::<UiState>().panel_open.lock().unwrap().clone();
         let (px, pw) = if open {
             (page_w - panel_w, panel_w)
         } else {
             (page_w, 0)
         };
-        w.set_position(tauri::PhysicalPosition::new(px.max(0), toolbar_h.max(0)))?;
-        w.set_size(tauri::PhysicalSize::new(pw.max(0) as u32, page_h.max(0) as u32))?;
+        set_webview_bounds(app, PANEL_WEBVIEW, px.max(0), toolbar_h.max(0), pw.max(0), page_h.max(0))?;
     }
     // 覆盖层/面板重新置顶:动态创建的页面 webview 会排在它们之上,导致切换标签后面板被盖
     #[cfg(windows)]
     bring_webviews_to_top(app);
+    // Linux: gtk::Fixed 中子控件顺序即 z 序,把 overlay/panel 重新 put 到末尾以置顶
+    #[cfg(target_os = "linux")]
+    bring_webviews_to_top_linux(app);
     Ok(())
 }
 
@@ -751,6 +800,16 @@ pub fn bring_webviews_to_top(app: &AppHandle) {
                 }
             });
         }
+    }
+}
+
+/// 覆盖层/面板置顶(Linux):把 overlay/panel 重新 put 回 gtk::Fixed(后 put 者在上),
+/// 避免动态创建的页面 webview 排在它们之上盖住浮层
+#[cfg(target_os = "linux")]
+fn bring_webviews_to_top_linux(app: &AppHandle) {
+    // 先 overlay 后 panel,panel 最终在最上
+    for label in [OVERLAY_WEBVIEW, PANEL_WEBVIEW] {
+        linux_layout::raise(app, label);
     }
 }
 
@@ -797,6 +856,12 @@ pub fn create_tab_webview(app: &AppHandle, id: u32) -> Result<tauri::webview::We
     // 注册媒体权限放行(摄像头/麦克风统一 Allow)
     #[cfg(windows)]
     crate::control::media::setup(app, &w);
+    // Linux: 新页面 webview 迁入 gtk::Fixed 绝对定位,并重新置顶浮层(避免新页面盖住 overlay/panel)
+    #[cfg(target_os = "linux")]
+    {
+        linux_layout::reparent(app, &[label.as_str()]);
+        bring_webviews_to_top_linux(app);
+    }
     // 应用布局(定位到页面区)
     if let Some(win) = app.get_window("main") {
         if let Ok(size) = win.inner_size() {

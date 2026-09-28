@@ -1,15 +1,12 @@
 //! 响应捕获:通过 WebView2 原生事件收集页面所有 HTTP 响应的 URL/状态码
 //! 供 expect-response / assert-response 两个端点查询/断言(只读捕获,不拦截)
+//! 捕获依赖 WebView2(仅 Windows);响应历史查询 clear/find 跨平台保留
 use std::sync::Mutex;
 
 use tauri::AppHandle;
-use windows::core::Interface;
-use webview2_com::Microsoft::Web::WebView2::Win32::{
-    ICoreWebView2, ICoreWebView2_2, ICoreWebView2WebResourceResponseReceivedEventArgs,
-};
-use webview2_com::WebResourceResponseReceivedEventHandler;
 
 /// 注册 token 存储,防止事件处理器被回收(否则响应捕获失效)
+#[cfg(windows)]
 static RESPONSE_TOKENS: Mutex<Vec<i64>> = Mutex::new(Vec::new());
 
 /// 响应历史(按注册顺序,最新在末尾)
@@ -22,8 +19,15 @@ pub struct ResponseEntry {
     pub status: i32,
 }
 
-/// 注册响应捕获(每个 page webview 创建后调用一次)
+/// 注册响应捕获(每个 page webview 创建后调用一次;仅 Windows 支持)
+#[cfg(windows)]
 pub fn setup(app: &AppHandle, webview: &tauri::webview::Webview) {
+    use windows::core::Interface;
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        ICoreWebView2, ICoreWebView2_2, ICoreWebView2WebResourceResponseReceivedEventArgs,
+    };
+    use webview2_com::WebResourceResponseReceivedEventHandler;
+
     let _ = app;
     webview
         .with_webview(move |platform_webview| {
