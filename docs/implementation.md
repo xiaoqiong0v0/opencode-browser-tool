@@ -17,13 +17,14 @@
 - [x] V5.10 工具补齐：expect/assert 网络响应捕获、可访问性树、插件取字段修复
 - [x] 插件工具 42 个参数与 Rust 端点对齐（唯一不可用：bt_save_as_pdf）
 - [x] 依赖清理：移除 adm-zip/esbuild/tsx 旧 Playwright 残留与 test/ 目录；lucide 移 devDependencies
+- [x] 截图 Linux 分支：WebKitGTK `WebView::snapshot`（Visible 区域）+ cairo 裁剪 → PNG base64
 
 ### 关键经验
 - `eval_with_callback` 自动 JSON 序列化 JS 返回值，表达式直接返回对象（勿双重 stringify）
 - release 模式 Tauri GUI 无控制台，HTTP 端口需 `--port` 显式指定 + 轮询就绪
 - 覆盖层 show/hide 控制鼠标拦截（批注模式拦截，普通模式穿透）
 - Windows 必须显式 `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)`，否则窗口被虚拟化缩放与 WebView2 布局错位
-- 截图平台分支：Windows CDP（webview2-com 版本须与 tauri 对齐 0.38.2）
+- 截图平台分支：Windows CDP（webview2-com 版本须与 tauri 对齐 0.38.2）；Linux WebKitGTK `WebView::snapshot` 只有 `Visible`/`FullDocument` 两种区域、**无矩形参数**，clip 需先截 Visible 再用 cairo 偏移裁剪（`set_source_surface` + `paint`）；`Surface::write_to_png` 位于 cairo-rs 的 `png` feature 下而 gtk 0.18 未启用，故 Linux target 需显式加 `cairo-rs = { version = "0.18", features = ["png"] }`；截图调用方都在后台线程，`with_webview` 在非主线程仅投递消息到 GTK 主线程，主线程阻塞 `recv_timeout` 会死锁、后台线程不会
 - 动态创建的 page webview 会盖在 overlay/panel 之上 → Windows SetWindowPos(HWND_TOP) 置顶
 - 页面 file:// 的 tauri IPC emit 被拒（Origin 非法）→ 新窗口拦截用 WebView2 原生事件而非页面 JS
 - AX 树解析：过滤 generic 容器自身但透传子树，否则只剩根节点
@@ -33,6 +34,6 @@
 
 ## 待办
 
-- 截图平台分支（Linux WebKitGTK snapshot / macOS）
+- 截图平台分支（macOS WKWebView snapshot）
 - 新窗口拦截 / 响应捕获 / 可访问性树 的 Linux/macOS 分支
 - Linux/macOS 实机验证

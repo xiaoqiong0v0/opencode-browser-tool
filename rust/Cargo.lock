@@ -261,6 +261,8 @@ name = "bt-shell"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
+ "cairo-rs",
  "futures-util",
  "gtk",
  "reqwest",
