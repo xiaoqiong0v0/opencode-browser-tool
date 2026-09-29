@@ -137,7 +137,6 @@ impl App {
             "/api/expect-response" => self.expect_response(&body).await,
             "/api/assert-response" => self.assert_response(&body).await,
             "/api/notify" => self.notify(&body).await,
-            "/api/pdf" => self.pdf().await,
             "/api/user-agent" => self.set_user_agent(&body).await,
             "/api/panel-config" => Ok(json!({ "ok": true })),
             "/api/close-session" => Ok(json!({ "closed": true })),
@@ -641,10 +640,6 @@ impl App {
             Some(entry) => Ok(json!({ "matched": true, "url": entry.url, "status": entry.status })),
             None => Ok(json!({ "matched": false, "error": "no response matched the pattern yet" })),
         }
-    }
-
-    async fn pdf(&self) -> Result<Value, String> {
-        Err("pdf not supported on webview".into())
     }
 
     /// 运行时修改页面 User-Agent(Windows 通过 ICoreWebView2Settings2,其他平台报错)

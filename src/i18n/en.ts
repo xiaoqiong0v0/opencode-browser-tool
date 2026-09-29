@@ -46,7 +46,6 @@ const en: LocaleStrings = {
     "cli.cmd.click_and_switch_tab": "Click a link and switch to the new tab",
     "cli.cmd.iframe_click": "Click an element inside an iframe",
     "cli.cmd.iframe_fill": "Fill an input inside an iframe",
-    "cli.cmd.save_as_pdf": "Save the page as PDF (unsupported on webview)",
     "cli.cmd.get_browser_status": "Check if browser is open and current page",
     "cli.cmd.list_tabs": "List all open tabs",
     "cli.cmd.switch_tab": "Switch to a tab by index",

@@ -46,7 +46,6 @@ const zh: LocaleStrings = {
     "cli.cmd.click_and_switch_tab": "点击链接并切换到新标签",
     "cli.cmd.iframe_click": "在 iframe 内点击元素",
     "cli.cmd.iframe_fill": "在 iframe 内填写输入框",
-    "cli.cmd.save_as_pdf": "保存页面为 PDF（webview 不支持）",
     "cli.cmd.get_browser_status": "检查浏览器是否打开及当前页面",
     "cli.cmd.list_tabs": "列出所有打开的标签",
     "cli.cmd.switch_tab": "按索引切换标签",

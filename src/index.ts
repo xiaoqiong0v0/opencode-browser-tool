@@ -70,7 +70,6 @@ const COMMANDS: Record<string, CmdDef> = {
   click_and_switch_tab: { usage: "--selector", descKey: "cli.cmd.click_and_switch_tab", args: [{ flag: "selector" }], run: async (a) => { const r = await service.clickSwitchTab(a); return `Clicked ${a.selector}, current URL: ${r.url || ""}`; } },
   iframe_click: { usage: "--iframeSelector --selector", descKey: "cli.cmd.iframe_click", args: [{ flag: "iframeSelector" }, { flag: "selector" }], run: async (a) => { await service.iframeClick(a); return "Clicked in iframe"; } },
   iframe_fill: { usage: "--iframeSelector --selector --value", descKey: "cli.cmd.iframe_fill", args: [{ flag: "iframeSelector" }, { flag: "selector" }, { flag: "value" }], run: async (a) => { await service.iframeFill(a); return "Filled in iframe"; } },
-  save_as_pdf: { usage: "", descKey: "cli.cmd.save_as_pdf", run: async () => { await service.pdf(); return "PDF saved"; } },
   get_browser_status: { usage: "", descKey: "cli.cmd.get_browser_status", run: async () => {
     const s = await service.status();
     if (s.installing && Object.keys(s.installing).length > 0) return `Installing ${Object.entries(s.installing).map(([b, p]) => `${b} (${p})`).join(", ")}.`;

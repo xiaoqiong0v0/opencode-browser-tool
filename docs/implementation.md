@@ -15,7 +15,7 @@
 - [x] V5.8 批注/截图双模式：遮罩式选区裁剪、保存需说明、发送后清空、记录卡片化、面板 toast
 - [x] V5.9 真多标签接 HTTP + 新窗口拦截（target=_blank → 新标签）+ z-order 置顶
 - [x] V5.10 工具补齐：expect/assert 网络响应捕获、可访问性树、插件取字段修复
-- [x] 插件工具 42 个参数与 Rust 端点对齐（唯一不可用：bt_save_as_pdf）
+- [x] 插件命令与 Rust 端点已全部对齐，无不可用项
 - [x] 依赖清理：移除 adm-zip/esbuild/tsx 旧 Playwright 残留与 test/ 目录；lucide 移 devDependencies
 - [x] 截图 Linux 分支：WebKitGTK `WebView::snapshot`（Visible 区域）+ cairo 裁剪 → PNG base64
 

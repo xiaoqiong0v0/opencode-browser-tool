@@ -82,7 +82,7 @@ opencode（Bun）
 | **信息** | `bt_screenshot`, `bt_evaluate`, `bt_get_visible_text`, `bt_get_visible_html`, `bt_console_logs`, `bt_get_browser_status`, `bt_get_element_state`, `bt_get_dropdown_options`, `bt_list_records`, `bt_expect_response`, `bt_assert_response`, `bt_get_accessibility_tree` |
 | **滚动/等待** | `bt_scroll`, `bt_scroll_to_element`, `bt_wait_for_selector`, `bt_resize`, `bt_set_device` |
 | **设备/工具** | `bt_custom_user_agent`, `bt_devtools`（开发者工具开关） |
-| **其他** | `bt_save_as_pdf`, `bt_show_notification`, `bt_read_record_content` |
+| **其他** | `bt_show_notification`, `bt_read_record_content` |
 
 ### 工具参数
 
@@ -115,7 +115,6 @@ opencode（Bun）
 | `bt_click_and_switch_tab` | `selector`(string) 必填 | 点击元素；若触发新标签则自动切换，返回当前 URL |
 | `bt_iframe_click` | `iframeSelector`, `selector`(string) 必填 | 在 iframe 中点击（仅同源可访问） |
 | `bt_iframe_fill` | `iframeSelector`, `selector`, `value`(string) 必填 | 在 iframe 中输入（仅同源可访问） |
-| `bt_save_as_pdf` | 无 | ⚠ 当前架构不支持，调用明确报错 |
 | `bt_get_browser_status` | 无 | 返回 open/url/title/tabs 数量 |
 | `bt_list_tabs` | 无 | 列出标签页（索引+URL） |
 | `bt_switch_tab` | `index`(number) 必填 | 按位置（0 起）切换标签 |
@@ -130,8 +129,6 @@ opencode（Bun）
 | `bt_get_accessibility_tree` | `selector`, `maxDepth`(number) | 返回页面可访问性树（role/name/value 嵌套结构） |
 | `bt_list_records` | 无 | 列出批注/截图记录（索引/标签/说明） |
 | `bt_read_record_content` | `id`(number) 必填 | 读取单条记录详情 |
-
-> 架构限制：`bt_save_as_pdf`（PDF 导出）在 Tauri WebView 架构下无法实现，调用会明确报错而非假成功。
 
 ## 设备预设
 

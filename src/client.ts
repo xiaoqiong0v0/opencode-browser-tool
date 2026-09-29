@@ -229,7 +229,6 @@ export const service = {
   userAgent: cmd("user-agent"),
   accessibility: cmd("accessibility"),
   notify: cmd("notify"),
-  pdf: cmd("pdf"),
   consoleLogs: cmd("console-logs"),
   expectResponse: cmd("expect-response"),
   assertResponse: cmd("assert-response"),
