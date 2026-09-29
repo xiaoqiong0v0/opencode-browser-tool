@@ -30,7 +30,26 @@ opencode 插件：Tauri 多 Webview 浏览器外壳 + 零注入视觉元素选�
 环境变量（优先级最高）：
 - `BT_LANG` — 同时设置 panelLang 和 toolLang
 - `BT_BROWSERS_PATH` — 浏览器缓存目录
-- `BT_SHELL_PATH` — 指定 Rust shell 二进制路径（开发用）
+- `BT_SHELL_URL` — **附着模式**：连接到已运行的 shell（完整基地址，如 `http://127.0.0.1:18280`），优先级最高
+- `BT_SHELL_PORT` — **附着模式**：仅指定端口，等价于 `http://127.0.0.1:<port>`
+- `BT_SHELL_PATH` — **启动模式**：指定要 spawn 的 Rust shell 二进制路径（开发用）
+
+> **附着模式 vs 启动模式**：设置了 `BT_SHELL_URL`（优先）或 `BT_SHELL_PORT` 时进入附着模式——插件**不 spawn** 任何进程，直接连接该地址的外部 shell；两者都未设置时按启动模式 spawn 本地二进制（`BT_SHELL_PATH` 可覆盖查找路径）。附着模式下 `bt_close` 只关闭浏览器窗口并断开连接，**不会**结束外部 shell 进程（进程不归插件管理）。
+
+**WSL / Linux 附着示例**（shell 跑在 WSL，插件跑在 Windows 宿主）：
+
+```bash
+# WSL 内：构建并启动 Linux 版 shell，监听 18280
+cd rust && cargo build --release
+./target/release/bt-shell --port 18280
+```
+
+```bash
+# Windows 宿主：设置环境变量后重启 opencode（WSL2 支持从宿主经 localhost 访问）
+set BT_SHELL_URL=http://127.0.0.1:18280
+```
+
+⚠ WSL 内启动 shell 时**不要**设置 `WEBKIT_DISABLE_DMABUF_RENDERER` / `WEBKIT_DISABLE_COMPOSITING_MODE`——它们会破坏透明合成（覆盖层渲染成黑块/透出桌面），详见 [docs/linux-support.md](./docs/linux-support.md)。
 
 ## 架构（V5）
 
@@ -48,6 +67,7 @@ opencode（Bun）
 - 浏览器渲染引擎（WebView2 / WebKitGTK / WKWebView，随平台）直接绘制到插件窗口
 - 页面零注入残留脚本，弹框类元素可正常批注
 - 所有工具调用通过 `POST http://127.0.0.1:PORT/api/{command}` 通信
+- 除 spawn 本地 shell 外，也可用 `BT_SHELL_URL` / `BT_SHELL_PORT` **附着到已运行的 shell**（不 spawn，适用于 shell 跑在 WSL/Linux、插件跑在 Windows）
 - 跨平台：Windows / Linux / macOS
 - 真多标签：每标签独立 page Webview，切换不重载；`target=_blank` / `window.open` 链接通过 WebView2 原生事件拦截并打开为新标签
 - 窗口无标题栏，自定义窗口按钮在标签行右侧；最小尺寸 500×400（逻辑像素）

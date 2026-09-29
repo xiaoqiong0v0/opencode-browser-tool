@@ -6,26 +6,48 @@ import createLogger from "@xiaoqiong0v0/opencode-plugin-logger";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-// Rust 二进制查找:dist/bin/bt-shell-{platform} 或环境变量覆盖
+/** 就绪轮询超时(ms) */
+const READY_TIMEOUT_MS = 20000;
+/** 就绪轮询间隔(ms) */
+const READY_POLL_INTERVAL_MS = 300;
+
+// Rust 二进制查找:dist/bin/bt-shell-{platform} 或环境变量覆盖(仅启动模式使用)
 function resolveShellBinary(): string {
   const platform = process.platform === "win32" ? "win-x64" : "linux-x64";
+  const bin = process.platform === "win32" ? "bt-shell.exe" : "bt-shell";
+  const cargoTargetDir = process.env.CARGO_TARGET_DIR;
   const candidates = [
     process.env.BT_SHELL_PATH,
     resolve(__dirname, "bin", `bt-shell-${platform}.exe`),
     resolve(__dirname, "bin", `bt-shell-${platform}`),
-    resolve(__dirname, "..", "rust", "target", "release", process.platform === "win32" ? "bt-shell.exe" : "bt-shell"),
-    resolve(__dirname, "..", "rust", "target", "debug", process.platform === "win32" ? "bt-shell.exe" : "bt-shell"),
+    resolve(__dirname, "..", "rust", "target", "release", bin),
+    resolve(__dirname, "..", "rust", "target", "debug", bin),
+    // 尊重自定义 target 目录(WSL 内用 CARGO_TARGET_DIR 构建时)
+    cargoTargetDir ? resolve(cargoTargetDir, "release", bin) : undefined,
+    cargoTargetDir ? resolve(cargoTargetDir, "debug", bin) : undefined,
   ];
   for (const c of candidates) {
     if (c && existsSync(c)) return c;
   }
   // 默认:开发环境用 cargo target 产物(release 优先)
-  return resolve(__dirname, "..", "rust", "target", "release", process.platform === "win32" ? "bt-shell.exe" : "bt-shell");
+  return resolve(__dirname, "..", "rust", "target", "release", bin);
+}
+
+/** 解析附着模式目标地址:BT_SHELL_URL 优先,其次 BT_SHELL_PORT;均未设置返回 null */
+function resolveAttachBaseUrl(): string | null {
+  const url = process.env.BT_SHELL_URL?.trim();
+  if (url) return url.replace(/\/+$/, "");
+  const port = process.env.BT_SHELL_PORT?.trim();
+  if (port) return `http://127.0.0.1:${port}`;
+  return null;
 }
 
 let serviceProcess: any = null;
-let servicePort = 0;
+/** 完整基地址(启动模式 http://127.0.0.1:<port>,附着模式 BT_SHELL_URL) */
+let serviceBaseUrl = "";
 let serviceReady = false;
+/** 附着模式:连接外部已运行 shell,不 spawn 也不 kill */
+let attachMode = false;
 /** 服务启动参数(configureService 保存,ensureService 懒启动时使用) */
 let serviceConfig: { nodePath: string; browsersPath?: string; sessionIsolation?: boolean; browserType?: string; userDataDir?: string } | null = null;
 /** 正在启动中的 Promise(并发保护,多个工具同时调用只启动一次) */
@@ -44,15 +66,21 @@ export function setUserDataDir(dir: string): void {
 /** 懒启动服务:未启动则 spawn bt-shell(弹窗);已启动直接返回;并发时复用同一个 Promise */
 export async function ensureService(): Promise<void> {
   if (serviceReady) return;
-  if (!serviceConfig) throw new Error("Service not configured");
   if (starting) return starting;
-  starting = startService(
-    serviceConfig.nodePath,
-    serviceConfig.browsersPath,
-    serviceConfig.sessionIsolation,
-    serviceConfig.browserType,
-    serviceConfig.userDataDir,
-  ).finally(() => {
+
+  // 附着模式:连接外部已运行的 shell,不 spawn
+  const attachUrl = resolveAttachBaseUrl();
+  if (attachUrl) {
+    starting = attachToService(attachUrl).finally(() => {
+      starting = null;
+    });
+    return starting;
+  }
+
+  // 启动模式:懒启动本地 shell
+  const cfg = serviceConfig;
+  if (!cfg) throw new Error("Service not configured");
+  starting = startService(cfg.nodePath, cfg.browsersPath, cfg.sessionIsolation, cfg.browserType, cfg.userDataDir).finally(() => {
     starting = null;
   });
   return starting;
@@ -62,7 +90,7 @@ async function callApi(path: string, body?: any, sessionId?: string): Promise<an
   // 懒启动:首次调用工具时自动打开窗口
   await ensureService();
   const payload = { ...(body || {}), _sessionId: sessionId || "" };
-  const res = await fetch(`http://127.0.0.1:${servicePort}${path}`, {
+  const res = await fetch(`${serviceBaseUrl}${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -70,6 +98,39 @@ async function callApi(path: string, body?: any, sessionId?: string): Promise<an
   const json = await res.json();
   if (!json.success) throw new Error(json.error || "Service error");
   return json.data;
+}
+
+/** 轮询等待服务就绪(READY_TIMEOUT_MS 超时);超时抛出给定提示 */
+async function waitForReady(baseUrl: string, timeoutMessage: string): Promise<void> {
+  const deadline = Date.now() + READY_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(`${baseUrl}/api/status`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      if (res.ok) return;
+    } catch {
+      // 服务未启动,继续等待
+    }
+    await new Promise((r) => setTimeout(r, READY_POLL_INTERVAL_MS));
+  }
+  throw new Error(timeoutMessage);
+}
+
+/** 附着到外部已运行的 shell(不 spawn):等待就绪后记录 base URL */
+async function attachToService(baseUrl: string): Promise<void> {
+  const log = createLogger("opencode-browser-tool");
+  attachMode = true;
+  log.info(`Attaching to existing bt-shell at ${baseUrl} (no spawn)`);
+  await waitForReady(
+    baseUrl,
+    `External bt-shell not ready at ${baseUrl}. Check BT_SHELL_URL/BT_SHELL_PORT and that the shell is running.`,
+  );
+  serviceBaseUrl = baseUrl;
+  serviceReady = true;
+  log.info(`Attached to existing bt-shell at ${baseUrl}`);
 }
 
 export async function startService(
@@ -80,6 +141,7 @@ export async function startService(
   userDataDir?: string,
 ): Promise<void> {
   const log = createLogger("opencode-browser-tool");
+  attachMode = false;
   const shell = resolveShellBinary();
   // 显式指定端口(release 模式 GUI 程序无控制台,无法解析 stdout)
   const port = 18000 + Math.floor(Math.random() * 1000);
@@ -91,37 +153,27 @@ export async function startService(
   serviceProcess = spawn(shell, args, { stdio: ["ignore", "pipe", "pipe"] });
 
   // 等待服务就绪(轮询端口)
-  const deadline = Date.now() + 20000;
-  while (Date.now() < deadline) {
-    try {
-      const res = await fetch(`http://127.0.0.1:${port}/api/status`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: "{}",
-      });
-      if (res.ok) {
-        servicePort = port;
-        serviceReady = true;
-        log.info(`Shell service ready on port ${port} (${shell})`);
-        return;
-      }
-    } catch {
-      // 服务未启动,继续等待
-    }
-    await new Promise((r) => setTimeout(r, 300));
-  }
-  throw new Error("Service timeout: bt-shell did not start. Build it with: cd rust && cargo build --release");
+  const baseUrl = `http://127.0.0.1:${port}`;
+  await waitForReady(baseUrl, "Service timeout: bt-shell did not start. Build it with: cd rust && cargo build --release");
+  serviceBaseUrl = baseUrl;
+  serviceReady = true;
+  log.info(`Shell service ready on port ${port} (${shell})`);
 }
 
 export async function stopService(): Promise<void> {
-  if (serviceProcess) {
+  const log = createLogger("opencode-browser-tool");
+  if (attachMode) {
+    // 附着模式:外部 shell 进程不归插件管,只清空本地状态
+    log.info("Detached from external bt-shell (process left running)");
+  } else if (serviceProcess) {
     try {
       serviceProcess.kill("SIGTERM");
     } catch {}
     serviceProcess = null;
   }
   serviceReady = false;
-  servicePort = 0;
+  serviceBaseUrl = "";
+  attachMode = false;
 }
 
 /** 打开浏览器窗口(未启动则启动;已启动幂等) */
