@@ -66,10 +66,13 @@ class Panel {
           this.closePanel();
         });
     });
-    // 开发者工具开关(操作后关闭面板)
+    // 开发者工具开关(用后端返回的真实状态同步按钮激活态,操作后关闭面板)
     this.doms.btnDevtools.addEventListener("click", () => {
       void this.api("/api/devtools", { action: "toggle" })
-        .then(() => this.closePanel())
+        .then((resp: { open?: boolean }) => {
+          this.doms.btnDevtools.classList.toggle("active", !!resp?.open);
+          this.closePanel();
+        })
         .catch((e) => {
           console.error("[panel] devtools failed:", e);
           this.closePanel();

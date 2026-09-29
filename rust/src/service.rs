@@ -652,42 +652,52 @@ impl App {
     }
 
     /// 打开/关闭开发者工具
-    /// 注:wry 的 is_devtools_open/close_devtools 在 webview2 上为空实现,
-    /// 因此开关状态由 UiState 自行维护,close 仅标记状态(窗口需手动关闭)
+    /// Linux(webkitgtk):wry 的 is_devtools_open 返回真实状态,用户在 devtools 窗口里点 ×
+    /// 关闭后标记不会失同步,动作以真实状态为准,动作结果写回 UiState.devtools_open。
+    /// Windows(webview2):wry 的 is_devtools_open 恒 false、close_devtools 为空实现,
+    /// 无法探测/关闭,沿用 UiState 本地标记(close 仅标记状态,窗口需手动关闭)。
     async fn devtools(&self, body: &Value) -> Result<Value, String> {
         let action = body.get("action").and_then(|v| v.as_str()).unwrap_or("toggle").to_string();
         let state = self.handle.state::<crate::ui::UiState>();
         let mut open = state.devtools_open.lock().unwrap();
         let handle = self.handle.clone();
-        tokio::task::block_in_place(|| {
+        let now_open = tokio::task::block_in_place(|| {
             let page = ui::active_page_webview(&handle).ok_or("page webview not ready")?;
-            match action.as_str() {
+            // Linux 用 webview 真实状态;其他平台探测不到,退回本地标记
+            #[cfg(target_os = "linux")]
+            let actual = page.is_devtools_open();
+            #[cfg(not(target_os = "linux"))]
+            let actual = *open;
+
+            let open_now = match action.as_str() {
                 "open" => {
-                    if !*open {
+                    if !actual {
                         page.open_devtools();
-                        *open = true;
                     }
+                    true
                 }
                 "close" => {
-                    if *open {
+                    if actual {
                         page.close_devtools();
-                        *open = false;
                     }
+                    false
                 }
                 "toggle" => {
-                    if *open {
+                    if actual {
                         page.close_devtools();
-                        *open = false;
+                        false
                     } else {
                         page.open_devtools();
-                        *open = true;
+                        true
                     }
                 }
                 other => return Err(format!("unknown action: {other} (open/close/toggle)")),
-            }
-            Ok::<(), String>(())
+            };
+            Ok::<bool, String>(open_now)
         })?;
-        Ok(json!({ "open": *open }))
+        // 动作后的真实结果写回本地标记,保持返回结构 { "open": bool }
+        *open = now_open;
+        Ok(json!({ "open": now_open }))
     }
 
     /// 查询/切换媒体设备模式(simulate=模拟设备 / real=真实设备)
