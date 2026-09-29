@@ -36,6 +36,8 @@ pub struct TabState {
     pub id: u32,
     pub url: String,
     pub title: String,
+    /// 标签图标地址(页面 <link rel=icon> 或 origin/favicon.ico;空串表示无)
+    pub icon: String,
     /// 对应独立页面 Webview 的 label(真多标签,每标签一个 webview)
     #[serde(skip)]
     pub webview: Option<String>,
@@ -128,7 +130,7 @@ impl UiState {
             devtools_open: Mutex::new(false),
             service_port: Mutex::new(0),
             panel_open: Mutex::new(false),
-            tabs: Mutex::new(vec![TabState { id: 1, url: "about:blank".into(), title: "新标签页".into(), webview: None }]),
+            tabs: Mutex::new(vec![TabState { id: 1, url: "about:blank".into(), title: "新标签页".into(), icon: String::new(), webview: None }]),
             active_tab: Mutex::new(1),
             next_tab_id: Mutex::new(2),
             pending_click: Mutex::new(None),
@@ -668,11 +670,9 @@ pub fn create_ui(app: &AppHandle) -> tauri::Result<()> {
         labels.push(PANEL_WEBVIEW.to_string());
         let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
         linux_layout::reparent(app, &refs);
-        // reparent 可能让 GTK 子控件重新显示,恢复 overlay/panel 的默认隐藏状态
+        // reparent 可能让 GTK 子控件重新显示,恢复 overlay 的默认隐藏状态
+        // (panel 不 hide:与 Windows 一致,靠"关闭时宽度为 0"隐藏,否则打开时无人 show 它)
         if let Some(w) = app.get_webview(OVERLAY_WEBVIEW) {
-            let _ = w.hide();
-        }
-        if let Some(w) = app.get_webview(PANEL_WEBVIEW) {
             let _ = w.hide();
         }
         // 无装饰窗口在 Wayland 下无边框可拖拽:在 Fixed 外层套 Overlay 并叠加边缘热区,
@@ -770,6 +770,16 @@ pub fn apply_layout(app: &AppHandle, size: tauri::PhysicalSize<u32>, scale: f64)
             (page_w, 0)
         };
         set_webview_bounds(app, PANEL_WEBVIEW, px.max(0), toolbar_h.max(0), pw.max(0), page_h.max(0))?;
+        // Linux: 面板改用显式 show/hide(仅靠宽度归零时,Wayland 侧输入区域不会随 resize 恢复,
+        // 会表现为"面板可见但点不动、事件穿透到下层页面")
+        #[cfg(target_os = "linux")]
+        if let Some(w) = app.get_webview(PANEL_WEBVIEW) {
+            if open {
+                let _ = w.show();
+            } else {
+                let _ = w.hide();
+            }
+        }
     }
     // 覆盖层/面板重新置顶:动态创建的页面 webview 会排在它们之上,导致切换标签后面板被盖
     #[cfg(windows)]
@@ -803,15 +813,11 @@ pub fn bring_webviews_to_top(app: &AppHandle) {
     }
 }
 
-/// 覆盖层/面板置顶(Linux):把 overlay/panel 重新 put 回 gtk::Fixed(后 put 者在上),
-/// 避免动态创建的页面 webview 排在它们之上盖住浮层
+/// 覆盖层/面板置顶(Linux):不采用 Windows 的 remove+put 方案
+/// (remove+put 会触发 GTK 重新挂载/WebKit 表面重建,WSLg 下曾观察到整窗渲染异常;
+///  且 overlay/panel 在切换标签/新建标签时都会先关闭并存显式管理可见性,无需每帧置顶)
 #[cfg(target_os = "linux")]
-fn bring_webviews_to_top_linux(app: &AppHandle) {
-    // 先 overlay 后 panel,panel 最终在最上
-    for label in [OVERLAY_WEBVIEW, PANEL_WEBVIEW] {
-        linux_layout::raise(app, label);
-    }
-}
+fn bring_webviews_to_top_linux(_app: &AppHandle) {}
 
 /// 获取激活标签的页面 Webview(真多标签:按 active_tab 的 webview label)
 pub fn active_page_webview(app: &AppHandle) -> Option<tauri::webview::Webview> {
@@ -877,6 +883,17 @@ pub fn overlay_webview(app: &AppHandle) -> Option<tauri::webview::Webview> {
     app.get_webview(OVERLAY_WEBVIEW)
 }
 
+/// 显示覆盖层 webview(Linux 下同时置顶,保证盖住之后新建标签创建的页面 webview)
+/// 参数:app tauri 应用句柄
+/// 说明:置顶仅在显示时做一次,不放进 apply_layout(其 remove+put 成本高,resize 时不必重复)
+pub fn show_overlay(app: &AppHandle) {
+    if let Some(w) = overlay_webview(app) {
+        let _ = w.show();
+    }
+    #[cfg(target_os = "linux")]
+    linux_layout::raise(app, OVERLAY_WEBVIEW);
+}
+
 /// 获取面板 Webview
 pub fn panel_webview(app: &AppHandle) -> Option<tauri::webview::Webview> {
     app.get_webview(PANEL_WEBVIEW)
@@ -927,6 +944,9 @@ pub fn open_panel(app: &AppHandle) {
             let _ = apply_layout(app, size, scale);
         }
     }
+    // 面板置顶:新建标签会把页面 webview 追加到 Fixed 末尾,可能盖住面板
+    #[cfg(target_os = "linux")]
+    linux_layout::raise(app, PANEL_WEBVIEW);
     let _ = eval_overlay(app, "window.__btOverlay.showMask()");
     emit_tabs_changed(app);
 }
@@ -1076,7 +1096,7 @@ pub fn open_new_tab(app: &AppHandle, url: &str) -> Result<(), String> {
             t.title = "新标签页".into();
             t.webview = Some(label);
         } else {
-            tabs.push(TabState { id, url: url.clone(), title: "新标签页".into(), webview: Some(label) });
+            tabs.push(TabState { id, url: url.clone(), title: "新标签页".into(), icon: String::new(), webview: Some(label) });
         }
         *state.active_tab.lock().unwrap() = id;
     }
@@ -1149,7 +1169,7 @@ pub fn close_tab(app: &AppHandle, id: u32) -> Result<(), String> {
             *n += 1;
             nid
         };
-        tabs.push(TabState { id: nid, url: NEWTAB_URL.to_string(), title: "新标签页".into(), webview: None });
+        tabs.push(TabState { id: nid, url: NEWTAB_URL.to_string(), title: "新标签页".into(), icon: String::new(), webview: None });
         new_active = nid;
     } else {
         // 优先激活右侧标签,否则左侧

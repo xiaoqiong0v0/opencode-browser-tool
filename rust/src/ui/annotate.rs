@@ -86,14 +86,10 @@ impl Annotator {
         let shot = *state.shot_mode.lock().unwrap();
         if annotate {
             let _ = ui::eval_overlay(app, "window.__btOverlay.setMode('annotate')");
-            if let Some(overlay) = ui::overlay_webview(app) {
-                let _ = overlay.show();
-            }
+            ui::show_overlay(app);
         } else if shot {
             let _ = ui::eval_overlay(app, "window.__btOverlay.setMode('shot')");
-            if let Some(overlay) = ui::overlay_webview(app) {
-                let _ = overlay.show();
-            }
+            ui::show_overlay(app);
         } else {
             let _ = ui::eval_overlay(app, "window.__btOverlay.setMode('none')");
             if let Some(overlay) = ui::overlay_webview(app) {

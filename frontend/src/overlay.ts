@@ -67,6 +67,8 @@ class OverlayRenderer implements OverlayApi {
   /** 设置覆盖层模式(由 Rust 调用) */
   setMode(mode: OverlayMode): void {
     this.mode = mode;
+    // 批注模式:鼠标变十字准心(提示可点击选取元素);退出时恢复默认
+    document.body.classList.toggle("annotate", mode === "annotate");
     this.selStart = null;
     this.sel = null;
     this.dragHandle = null;

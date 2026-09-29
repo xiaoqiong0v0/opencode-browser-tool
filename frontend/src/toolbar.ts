@@ -1,6 +1,22 @@
 // 工具栏 Webview 入口:标签(伪多标签) + 地址栏导航 + 批注/截图/面板按钮
 // 与 Rust 通过 Tauri invoke 通信
-import { createIcons, Camera, PenLine } from "lucide";
+import {
+  createIcons,
+  ArrowLeft,
+  ArrowRight,
+  Camera,
+  ChevronLeft,
+  ChevronRight,
+  Copy,
+  Globe,
+  Minus,
+  PenLine,
+  Plus,
+  RotateCw,
+  Settings,
+  Square,
+  X,
+} from "lucide";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
@@ -10,6 +26,7 @@ interface TabItem {
   id: number;
   url: string;
   title: string;
+  icon: string;
 }
 
 interface ToolbarState {
@@ -17,6 +34,24 @@ interface ToolbarState {
   active: number;
   panel_open: boolean;
 }
+
+/** lucide 图标集合:静态按钮 + 动态渲染(标签图标/标签关闭/窗口最大化还原)共用 */
+const ICONS = {
+  ArrowLeft,
+  ArrowRight,
+  Camera,
+  ChevronLeft,
+  ChevronRight,
+  Copy,
+  Globe,
+  Minus,
+  PenLine,
+  Plus,
+  RotateCw,
+  Settings,
+  Square,
+  X,
+};
 
 class Toolbar {
   private tabsEl: HTMLDivElement;
@@ -128,7 +163,9 @@ class Toolbar {
     const maxBtn = document.getElementById("win-max") as HTMLDivElement;
     const updateMaxIcon = async () => {
       try {
-        maxBtn.textContent = (await win.isMaximized()) ? "❐" : "□";
+        // 还原=copy 图标,最大化=square 图标;动态改写后需重新替换为内联 SVG
+        maxBtn.innerHTML = (await win.isMaximized()) ? '<i data-lucide="copy"></i>' : '<i data-lucide="square"></i>';
+        createIcons({ icons: ICONS });
       } catch {
         // 权限或查询失败时保持默认图标
       }
@@ -151,18 +188,20 @@ class Toolbar {
       const top = document.createElement("div");
       top.className = "tab-top";
 
-      // 页面图标:取 URL 域名 favicon,失败显示默认图标
+      // 页面图标:用页面自身图标地址(tab.icon),为空时显示默认 globe 图标
       const fav = document.createElement("span");
       fav.className = "tab-fav";
-      fav.textContent = "🌐";
-      const host = this.hostOf(t.url);
-      if (host) {
+      if (t.icon) {
         const img = document.createElement("img");
-        img.src = `https://www.google.com/s2/favicons?domain=${encodeURIComponent(host)}&sz=32`;
+        img.src = t.icon;
         img.style.cssText = "width:14px;height:14px";
-        img.onerror = () => { fav.textContent = "🌐"; };
-        fav.textContent = "";
+        img.onerror = () => {
+          fav.innerHTML = '<i data-lucide="globe"></i>';
+          createIcons({ icons: ICONS });
+        };
         fav.appendChild(img);
+      } else {
+        fav.innerHTML = '<i data-lucide="globe"></i>';
       }
       top.appendChild(fav);
 
@@ -173,7 +212,7 @@ class Toolbar {
 
       const close = document.createElement("span");
       close.className = "tab-close";
-      close.textContent = "×";
+      close.innerHTML = '<i data-lucide="x"></i>';
       close.addEventListener("click", (e) => {
         e.stopPropagation();
         void invoke("toolbar_close_tab", { id: t.id }).then(() => void this.refresh());
@@ -194,15 +233,8 @@ class Toolbar {
       });
       this.tabsEl.appendChild(chip);
     }
-  }
-
-  /** 从 URL 提取域名(用于 favicon),无效返回空 */
-  private hostOf(url: string): string {
-    try {
-      return new URL(url).hostname;
-    } catch {
-      return "";
-    }
+    // 动态生成的标签图标/关闭按钮替换为内联 SVG(静态按钮在模块底部已替换)
+    createIcons({ icons: ICONS });
   }
 }
 
@@ -213,6 +245,6 @@ function isNewTabUrl(url: string): boolean {
 
 new Toolbar();
 void initTheme();
-// lucide 图标替换(批注/截图)
-createIcons({ icons: { PenLine, Camera } });
+// lucide 图标替换(静态按钮:批注/截图/新建/导航/窗口/面板/折叠)
+createIcons({ icons: ICONS });
 console.log("[toolbar] ready");

@@ -20,13 +20,15 @@
         font: 15px system-ui, -apple-system, "Segoe UI", sans-serif;
         user-select: none;
       }
-      .icon { font-size: 48px; margin-bottom: 14px; opacity: 0.8; }
+      /* 图标用 lucide 内联 SVG,尺寸与原先 48px 字号视觉一致 */
+      .icon { margin-bottom: 14px; opacity: 0.8; }
+      .icon svg { width: 48px; height: 48px; }
       .title { font-size: 16px; }
       .hint { margin-top: 6px; font-size: 12px; color: var(--fg-hint); }
     </style>
   </head>
   <body>
-    <div class="icon">🌐</div>
+    <div class="icon"><i data-lucide="globe"></i></div>
     <div class="title">新标签页</div>
     <div class="hint">在地址栏输入网址开始浏览</div>
     <script src="newtab.js"></script>

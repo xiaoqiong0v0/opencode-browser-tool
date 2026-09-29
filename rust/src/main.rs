@@ -84,9 +84,7 @@ fn panel_cmd(
             if *state.panel_open.lock().unwrap() {
                 ui::collapse_panel(&app);
             }
-            if let Some(overlay) = ui::overlay_webview(&app) {
-                let _ = overlay.show();
-            }
+            ui::show_overlay(&app);
             let _ = ui::eval_overlay(&app, "window.__btOverlay.setMode('shot')");
             let _ = ui::eval_overlay(&app, "window.__btOverlay.hideMask()");
             let app2 = app.clone();
@@ -161,21 +159,31 @@ fn panel_set_theme(app: tauri::AppHandle, state: State<'_, ui::UiState>, theme: 
 
 // ---- 标签状态统一管理:后台轮询检测变化,有变更才广播事件,前端只响应事件不轮询 ----
 
-/// 后台轮询:刷新激活标签的标题/URL(页面导航后 title 变化),返回是否有变化
+/// 页面图标地址 JS:优先 <link rel~="icon">,回退 origin/favicon.ico;无则返回空串
+/// (tauri:/about: 等内部页面不生成图标地址)
+const ICON_JS: &str = r#"(function(){try{var l=document.querySelector('link[rel~="icon"]');if(l&&l.href)return l.href;var p=location.protocol;var o=location.origin;if(o&&o!=='null'&&p!=='tauri:'&&p!=='about:')return o+'/favicon.ico';}catch(e){}return '';})()"#;
+
+/// 后台轮询:刷新激活标签的标题/URL/图标(页面导航后变化),返回是否有变化
 fn poll_tab_title(app: &tauri::AppHandle) -> bool {
     let state = app.state::<ui::UiState>();
     let active = *state.active_tab.lock().unwrap();
-    // 当前激活标签的 title/url 快照
+    // 当前激活标签的 title/url/icon 快照
     let before = state
         .tabs
         .lock()
         .unwrap()
         .iter()
         .find(|t| t.id == active)
-        .map(|t| (t.title.clone(), t.url.clone()));
+        .map(|t| (t.title.clone(), t.url.clone(), t.icon.clone()));
     // 从页面 webview 读取最新状态(阻塞线程 eval)
     let handle = app.clone();
     let page = tokio::task::block_in_place(move || control::page_state(&handle)).ok();
+    // 图标地址:同一阻塞上下文再 eval 一次(空串表示无图标)
+    let icon_handle = app.clone();
+    let icon = tokio::task::block_in_place(move || control::eval(&icon_handle, ICON_JS))
+        .ok()
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_default();
     let mut changed = false;
     if let Some(page) = page {
         let url = page["url"].as_str().unwrap_or("").to_string();
@@ -189,7 +197,11 @@ fn poll_tab_title(app: &tauri::AppHandle) -> bool {
             if !title.is_empty() {
                 t.title = title.clone();
             }
-            changed = before != Some((t.title.clone(), t.url.clone()));
+            // 仅在拿到非空图标时更新,避免页面短暂无图标时闪烁
+            if !icon.is_empty() {
+                t.icon = icon.clone();
+            }
+            changed = before != Some((t.title.clone(), t.url.clone(), t.icon.clone()));
         }
     }
     changed
@@ -287,9 +299,7 @@ fn toolbar_toggle_panel(app: tauri::AppHandle, state: State<'_, ui::UiState>) ->
             let _ = Annotator::toggle_shot(&app, &state);
         }
         // 显示透明覆盖层 + 面板滑入动画(遮罩盖页面区,点击遮罩关闭面板)
-        if let Some(overlay) = ui::overlay_webview(&app) {
-            let _ = overlay.show();
-        }
+        ui::show_overlay(&app);
         ui::open_panel(&app);
     } else {
         ui::close_panel(&app);

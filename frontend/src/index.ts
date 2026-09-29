@@ -1,6 +1,6 @@
 // 面板 Webview 入口:AI 功能区(批注/截图/记录/发送) + 配置区(设备/开发者工具/主题)
 // 与 Rust 通过 Tauri event/invoke 通信,设备/开发者工具走 HTTP /api/*
-import { createIcons, Camera, PenLine, Send, X } from "lucide";
+import { createIcons, Bot, Camera, PenLine, Send, Settings, Wrench, X } from "lucide";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { AnnotationRecord } from "./types";
@@ -220,8 +220,8 @@ class Panel {
 const panel = new Panel();
 void panel.init();
 void initTheme();
-// lucide 图标替换(批注/截图/发送/关闭)
-createIcons({ icons: { PenLine, Camera, Send, X } });
+// lucide 图标替换(tab/开发工具/批注/截图/发送/关闭)
+createIcons({ icons: { Bot, Settings, Wrench, PenLine, Camera, Send, X } });
 console.log("[panel] ready");
 
 /** 截图 base64 转可显示 data URL(裸 base64 需补前缀) */

@@ -44,9 +44,9 @@
       .win-btn:hover { background: var(--btn-hover); }
       #win-close:hover { background: #e81123; color: #fff; }
       .fold-btn {
-        flex-shrink: 0; width: 20px; height: 24px; border-radius: 4px;
+        flex-shrink: 0; width: 22px; height: 24px; border-radius: 5px;
         display: flex; align-items: center; justify-content: center;
-        color: var(--btn-fg); cursor: pointer; font-size: 12px;
+        color: var(--btn-fg); cursor: pointer; font-size: 12px; line-height: 1;
       }
       .fold-btn:hover { background: var(--btn-hover); }
       #tabs { display: flex; align-items: center; gap: 4px; overflow-x: auto; flex: 0 1 auto; margin-bottom: 0; }
@@ -95,7 +95,7 @@
       #btn-add {
         flex-shrink: 0; width: 22px; height: 24px; border-radius: 5px;
         display: flex; align-items: center; justify-content: center;
-        background: var(--btn-bg); color: var(--btn-fg); cursor: pointer; font-size: 15px;
+        background: var(--btn-bg); color: var(--btn-fg); cursor: pointer; font-size: 15px; line-height: 1;
       }
       #btn-add:hover { background: var(--btn-hover); }
       /* 第二行:导航 */
@@ -119,6 +119,7 @@
       #btn-panel {
         flex-shrink: 0; padding: 5px 10px; border: 1px solid var(--border); border-radius: 14px;
         background: var(--btn-bg); color: var(--btn-fg); cursor: pointer; font: 13px system-ui;
+        display: inline-flex; align-items: center; gap: 4px;
       }
       #btn-panel:hover { background: var(--btn-hover); }
       #btn-panel.active { background: var(--accent); color: #fff; border-color: var(--accent); }
@@ -131,29 +132,37 @@
       .tool-btn svg { width: 14px; height: 14px; }
       .tool-btn:hover { background: var(--btn-hover); }
       .tool-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+      /* lucide 图标尺寸:对齐各按钮原有符号的视觉大小,颜色随 currentColor 继承 */
+      .win-btn svg { width: 12px; height: 12px; }
+      .fold-btn svg { width: 14px; height: 14px; }
+      #btn-add svg { width: 14px; height: 14px; }
+      .nav-btn svg { width: 16px; height: 16px; }
+      .tab-fav svg { width: 12px; height: 12px; }
+      .tab-close svg { width: 12px; height: 12px; }
+      #btn-panel svg { width: 14px; height: 14px; }
     </style>
   </head>
   <body>
     <div id="tab-row" data-tauri-drag-region>
-      <div id="tab-scroll-left" class="fold-btn" title="更多标签">◀</div>
+      <div id="tab-scroll-left" class="fold-btn" title="更多标签"><i data-lucide="chevron-left"></i></div>
       <div id="tabs"></div>
-      <div id="tab-scroll-right" class="fold-btn" title="更多标签">▶</div>
-      <div id="btn-add" title="新建标签">+</div>
+      <div id="tab-scroll-right" class="fold-btn" title="更多标签"><i data-lucide="chevron-right"></i></div>
+      <div id="btn-add" title="新建标签"><i data-lucide="plus"></i></div>
       <div id="drag-zone" data-tauri-drag-region></div>
       <div id="win-btns">
-        <div id="win-min" class="win-btn" title="最小化">─</div>
-        <div id="win-max" class="win-btn" title="最大化">□</div>
-        <div id="win-close" class="win-btn" title="关闭">✕</div>
+        <div id="win-min" class="win-btn" title="最小化"><i data-lucide="minus"></i></div>
+        <div id="win-max" class="win-btn" title="最大化"><i data-lucide="square"></i></div>
+        <div id="win-close" class="win-btn" title="关闭"><i data-lucide="x"></i></div>
       </div>
     </div>
     <div id="nav-row">
-      <div id="btn-back" class="nav-btn" title="后退">←</div>
-      <div id="btn-forward" class="nav-btn" title="前进">→</div>
-      <div id="btn-reload" class="nav-btn" title="刷新">⟳</div>
+      <div id="btn-back" class="nav-btn" title="后退"><i data-lucide="arrow-left"></i></div>
+      <div id="btn-forward" class="nav-btn" title="前进"><i data-lucide="arrow-right"></i></div>
+      <div id="btn-reload" class="nav-btn" title="刷新"><i data-lucide="rotate-cw"></i></div>
       <input id="addr" placeholder="输入地址，回车导航" spellcheck="false" />
       <button id="btn-annotate" class="tool-btn" title="批注模式(点击元素标注)"><i data-lucide="pen-line"></i>批注</button>
       <button id="btn-shot" class="tool-btn" title="立即截图"><i data-lucide="camera"></i>截图</button>
-      <button id="btn-panel" title="功能面板">⚙ 面板</button>
+      <button id="btn-panel" title="功能面板"><i data-lucide="settings"></i>面板</button>
     </div>
     <script src="toolbar.js"></script>
   </body>
