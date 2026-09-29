@@ -685,12 +685,8 @@ pub fn create_ui(app: &AppHandle) -> tauri::Result<()> {
     let scale = window.scale_factor().unwrap_or(1.0);
     apply_layout(app, size, scale)?;
     // 布局定位完成后显示工具栏与初始标签 page-1(其余预创建 webview 保持隐藏)
-    if let Some(w) = app.get_webview(TOOLBAR_WEBVIEW) {
-        let _ = w.show();
-    }
-    if let Some(w) = app.get_webview("page-1") {
-        let _ = w.show();
-    }
+    let _ = show_webview(app, TOOLBAR_WEBVIEW);
+    let _ = show_webview(app, "page-1");
 
     // 监听窗口 resize/DPI 变化 → 重排 webview
     let handle = app.clone();
@@ -775,7 +771,8 @@ pub fn apply_layout(app: &AppHandle, size: tauri::PhysicalSize<u32>, scale: f64)
         #[cfg(target_os = "linux")]
         if let Some(w) = app.get_webview(PANEL_WEBVIEW) {
             if open {
-                let _ = w.show();
+                // show_webview 内含 poke+kick:规避 WSLg 下新显示 subsurface 要等输入事件才绘制的空白问题
+                let _ = show_webview(app, PANEL_WEBVIEW);
             } else {
                 let _ = w.hide();
             }
@@ -818,6 +815,50 @@ pub fn bring_webviews_to_top(app: &AppHandle) {
 ///  且 overlay/panel 在切换标签/新建标签时都会先关闭并存显式管理可见性,无需每帧置顶)
 #[cfg(target_os = "linux")]
 fn bring_webviews_to_top_linux(_app: &AppHandle) {}
+
+/// 主动驱动一次 webview 渲染(Linux/WSLg)
+/// GTK 侧 queue_draw 只刷新 UI 进程的缓存缓冲;WebKit 渲染进程只在 DOM 变化/输入/尺寸变化时
+/// 才产出新帧,导致新 show 出来的 webview(面板/覆盖层)要等鼠标移入才有画面。
+/// 这里用一次极小样式变化 + requestAnimationFrame 主动逼渲染进程出一帧。
+/// 参数:app tauri 应用句柄;label 目标 webview 标签
+#[cfg(target_os = "linux")]
+fn kick_render(app: &AppHandle, label: &str) {
+    const KICK_JS: &str = "(function(){var d=document.documentElement;\
+        d.style.opacity='0.999';\
+        requestAnimationFrame(function(){d.style.opacity='1';});})()";
+    if let Some(w) = app.get_webview(label) {
+        let _ = w.eval(KICK_JS);
+    }
+    // 首次驱动时页面/DOM 往往还没就绪(WSLg 软件渲染首帧更慢),延迟再补几次
+    let app = app.clone();
+    let label = label.to_string();
+    tauri::async_runtime::spawn(async move {
+        for ms in [250u64, 800, 1600] {
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            if let Some(w) = app.get_webview(&label) {
+                let _ = w.eval(KICK_JS);
+            }
+        }
+    });
+}
+
+/// 显示指定 webview(Windows 直接 show;Linux 额外驱动一次首帧渲染,
+/// 规避 WSLg 下新显示的 webview 要等鼠标移入才绘制首帧的问题)
+/// 参数:app tauri 应用句柄;label 目标 webview 标签
+/// 返回值:目标 webview 不存在时静默返回 Ok;show 失败时透传错误(与 tauri Webview::show 语义一致)
+pub fn show_webview(app: &AppHandle, label: &str) -> tauri::Result<()> {
+    let Some(w) = app.get_webview(label) else {
+        return Ok(());
+    };
+    w.show()?;
+    // Linux: 新显示的子 webview 需主动驱动一次首帧,否则 WSLg 下要等输入事件才有画面
+    #[cfg(target_os = "linux")]
+    {
+        linux_layout::poke(app, label);
+        kick_render(app, label);
+    }
+    Ok(())
+}
 
 /// 获取激活标签的页面 Webview(真多标签:按 active_tab 的 webview label)
 pub fn active_page_webview(app: &AppHandle) -> Option<tauri::webview::Webview> {
@@ -887,11 +928,14 @@ pub fn overlay_webview(app: &AppHandle) -> Option<tauri::webview::Webview> {
 /// 参数:app tauri 应用句柄
 /// 说明:置顶仅在显示时做一次,不放进 apply_layout(其 remove+put 成本高,resize 时不必重复)
 pub fn show_overlay(app: &AppHandle) {
-    if let Some(w) = overlay_webview(app) {
-        let _ = w.show();
-    }
+    // show_webview 内含 poke+kick;Windows 仅 show,Linux 额外驱动首帧
+    let _ = show_webview(app, OVERLAY_WEBVIEW);
+    // Linux: 置顶(raise 会 remove+put 重新 map,使 show_webview 里那次 kick 失效)
     #[cfg(target_os = "linux")]
     linux_layout::raise(app, OVERLAY_WEBVIEW);
+    // raise 之后必须再 kick 一次,重新逼渲染进程出帧
+    #[cfg(target_os = "linux")]
+    kick_render(app, OVERLAY_WEBVIEW);
 }
 
 /// 获取面板 Webview
@@ -1087,7 +1131,7 @@ pub fn open_new_tab(app: &AppHandle, url: &str) -> Result<(), String> {
         Some(w) => w,
         None => create_tab_webview(app, id)?,
     };
-    wv.show().map_err(|e| format!("show webview failed: {e}"))?;
+    show_webview(app, wv.label()).map_err(|e| format!("show webview failed: {e}"))?;
     // 记录标签并导航
     {
         let mut tabs = state.tabs.lock().unwrap();
@@ -1135,7 +1179,7 @@ pub fn switch_tab(app: &AppHandle, id: u32) -> Result<(), String> {
     }
     if let Some(l) = target_label {
         if let Some(w) = app.get_webview(&l) {
-            w.show().map_err(|e| format!("show webview failed: {e}"))?;
+            show_webview(app, w.label()).map_err(|e| format!("show webview failed: {e}"))?;
         }
     }
     *state.active_tab.lock().unwrap() = id;
@@ -1186,7 +1230,7 @@ pub fn close_tab(app: &AppHandle, id: u32) -> Result<(), String> {
             Some(w) => w,
             None => create_tab_webview(app, new_active)?,
         };
-        wv.show().map_err(|e| format!("show webview failed: {e}"))?;
+        show_webview(app, wv.label()).map_err(|e| format!("show webview failed: {e}"))?;
         {
             let mut tabs = state.tabs.lock().unwrap();
             if let Some(t) = tabs.iter_mut().find(|t| t.id == new_active) {
@@ -1197,7 +1241,7 @@ pub fn close_tab(app: &AppHandle, id: u32) -> Result<(), String> {
     // 显示目标 webview(若未隐藏则无操作)
     if let Some(l) = &target_label {
         if let Some(w) = app.get_webview(l) {
-            let _ = w.show();
+            let _ = show_webview(app, w.label());
         }
     }
     // 隐藏被关闭标签的 webview(保留实例,避免 z 序变化影响 overlay/panel)

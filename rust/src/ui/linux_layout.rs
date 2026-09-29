@@ -240,6 +240,28 @@ pub fn install_resize_grips(app: &tauri::AppHandle, label: &str) {
     });
 }
 
+/// 主动触发一次重排+重绘(仅 Linux)
+///
+/// 参数:app tauri 应用句柄;label webview 标签
+/// 说明:WSLg + WebKitGTK 软件渲染(Wayland)下,新 map 的 subsurface 需等输入事件才触发
+/// 帧回调/首帧提交,表现为"首次显示面板/覆盖层时不移动鼠标就一直空白"。这里 `queue_resize`
+/// + `queue_draw` 令 GTK 主动提交 damage;连同顶层窗口一起 `queue_draw`,确保合成器收到
+/// damage 并回帧,从而立即绘制首帧。
+pub fn poke(app: &tauri::AppHandle, label: &str) {
+    let Some(wv) = app.get_webview(label) else {
+        return;
+    };
+    let _ = wv.with_webview(|pw| {
+        let widget = pw.inner();
+        widget.queue_resize();
+        widget.queue_draw();
+        // 连同顶层窗口一起:确保合成器收到 damage 并回帧
+        if let Some(top) = widget.toplevel() {
+            top.queue_draw();
+        }
+    });
+}
+
 /// 读取当前主线程的 Fixed 句柄
 /// 返回值:已创建则 Some(Fixed),否则 None
 fn current_fixed() -> Option<gtk::Fixed> {
