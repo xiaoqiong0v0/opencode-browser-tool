@@ -12,32 +12,47 @@ use crate::ui;
 use serde_json::json;
 
 /// 获取可访问性树,返回 {role,name,value,children} 嵌套结构
-pub fn accessibility_tree(app: &AppHandle) -> Result<serde_json::Value, String> {
+/// selector 为 None/空:整页(行为不变);指定时返回该选择器对应元素的子树
+pub fn accessibility_tree(
+    app: &AppHandle,
+    selector: Option<&str>,
+) -> Result<serde_json::Value, String> {
     #[cfg(windows)]
     {
-        let raw = cdp_json(app)?;
-        // CDP 返回 { "nodes": [...] }
-        let v: serde_json::Value =
-            serde_json::from_str(&raw).map_err(|e| format!("parse cdp result: {e}"))?;
-        let nodes = v.get("nodes").and_then(|n| n.as_array()).cloned().unwrap_or_default();
-        build_tree(&nodes)
+        match selector {
+            // 有 selector:走 DOM 节点定位 + 部分 AX 树
+            Some(s) if !s.is_empty() => cdp_subtree(app, s),
+            // 无 selector:整页(原行为)
+            _ => {
+                let raw = cdp_call_json(app, "Accessibility.getFullAXTree", "{}")?;
+                // CDP 返回 { "nodes": [...] }
+                let v: serde_json::Value =
+                    serde_json::from_str(&raw).map_err(|e| format!("parse cdp result: {e}"))?;
+                let nodes = v.get("nodes").and_then(|n| n.as_array()).cloned().unwrap_or_default();
+                build_tree(&nodes)
+            }
+        }
     }
     #[cfg(target_os = "linux")]
     {
-        dom_accessibility_tree(app)
+        dom_accessibility_tree(app, selector)
     }
     #[cfg(not(any(windows, target_os = "linux")))]
     {
-        let _ = app;
+        let _ = (app, selector);
         Err("accessibility not implemented on this platform yet".into())
     }
 }
 
+/// 调用任意 CDP 方法并返回其结果 JSON
+/// jsonResult 即 CDP 的 result 对象本身(不带 id/result 信封)
 #[cfg(windows)]
-fn cdp_json(app: &AppHandle) -> Result<String, String> {
+fn cdp_call_json(app: &AppHandle, method_name: &str, params_json: &str) -> Result<String, String> {
     let page = ui::active_page_webview(app).ok_or("page webview not ready")?;
     let (tx, rx) = mpsc::channel::<Result<String, String>>();
     let tx2 = tx.clone();
+    let method_str = method_name.to_string();
+    let params_str = params_json.to_string();
     page.with_webview(move |platform_webview| {
         let controller = platform_webview.controller();
         unsafe {
@@ -51,8 +66,8 @@ fn cdp_json(app: &AppHandle) -> Result<String, String> {
             match webview_result {
                 Err(e) => { let _ = tx.send(Err(e)); }
                 Ok(webview) => {
-                    let method = windows::core::HSTRING::from("Accessibility.getFullAXTree");
-                    let params = windows::core::HSTRING::from(r#"{}"#);
+                    let method = windows::core::HSTRING::from(method_str.as_str());
+                    let params = windows::core::HSTRING::from(params_str.as_str());
                     let result = CallDevToolsProtocolMethodCompletedHandler::wait_for_async_operation(
                         Box::new(move |handler| {
                             webview
@@ -79,13 +94,59 @@ fn cdp_json(app: &AppHandle) -> Result<String, String> {
         .map_err(|_| "accessibility timeout".to_string())?
 }
 
+/// 按 selector 取元素子树(Windows)
+/// 链路:DOM.getDocument → DOM.querySelector 拿 nodeId → Accessibility.getPartialAXTree
+/// fetchRelatives=false 只取该节点自身+子树,与 Linux 子树语义一致
+#[cfg(windows)]
+fn cdp_subtree(app: &AppHandle, selector: &str) -> Result<serde_json::Value, String> {
+    // 1. 取文档根节点(depth:0 只需 root)
+    let doc_raw = cdp_call_json(app, "DOM.getDocument", r#"{"depth":0}"#)?;
+    let doc: serde_json::Value =
+        serde_json::from_str(&doc_raw).map_err(|e| format!("parse DOM.getDocument: {e}"))?;
+    let root_id = doc
+        .get("root")
+        .and_then(|r| r.get("nodeId"))
+        .and_then(|v| v.as_i64())
+        .ok_or("DOM.getDocument: no root nodeId")?;
+    // 2. 查询选择器命中的节点(nodeId=0 表示未命中)
+    let q_params = json!({ "nodeId": root_id, "selector": selector }).to_string();
+    let q_raw = cdp_call_json(app, "DOM.querySelector", &q_params)?;
+    let q: serde_json::Value =
+        serde_json::from_str(&q_raw).map_err(|e| format!("parse DOM.querySelector: {e}"))?;
+    let node_id = q.get("nodeId").and_then(|v| v.as_i64()).unwrap_or(0);
+    if node_id == 0 {
+        return Err(format!("element not found: {selector}"));
+    }
+    // 3. 该节点自身+子树的部分 AX 树(fetchRelatives=false 排除祖先/兄弟)
+    let p_params = json!({ "nodeId": node_id, "fetchRelatives": false }).to_string();
+    let p_raw = cdp_call_json(app, "Accessibility.getPartialAXTree", &p_params)?;
+    let p: serde_json::Value =
+        serde_json::from_str(&p_raw).map_err(|e| format!("parse getPartialAXTree: {e}"))?;
+    let nodes = p.get("nodes").and_then(|n| n.as_array()).cloned().unwrap_or_default();
+    build_tree(&nodes)
+}
+
 /// 页面 DOM → 近似可访问性树(Linux/WebKitGTK)
-/// 用页面 JS 重建同结构树;解析失败/页面无内容时返回与 Windows 一致的错误
+/// 用页面 JS 重建同结构树;selector 为 None/空从整页根构建,指定时从该元素起构建
+/// 解析失败/页面无内容时返回与 Windows 一致的错误
 #[cfg(target_os = "linux")]
-fn dom_accessibility_tree(app: &AppHandle) -> Result<serde_json::Value, String> {
-    let raw = ui::eval_page(app, DOM_AX_JS)?;
+fn dom_accessibility_tree(
+    app: &AppHandle,
+    selector: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    // selector 以 JSON 字面量注入 JS(避免手工转义),未指定时为 null
+    let sel_lit = match selector {
+        Some(s) if !s.is_empty() => serde_json::to_string(s).unwrap_or_else(|_| "null".to_string()),
+        _ => "null".to_string(),
+    };
+    let js = DOM_AX_JS.replace("__BT_AX_SELECTOR__", &sel_lit);
+    let raw = ui::eval_page(app, &js)?;
     let v: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| format!("parse dom ax result: {e}"))?;
+    // 选择器未命中:JS 返回 {error},直接透传为业务错误
+    if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
+        return Err(err.to_string());
+    }
     // JS 失败/无节点时返回 null;根节点必须带 role
     let has_role = v
         .as_object()
@@ -101,6 +162,7 @@ fn dom_accessibility_tree(app: &AppHandle) -> Result<serde_json::Value, String> 
 
 /// 页面 DOM → 近似可访问性树(内嵌 JS,与 Windows CDP 产物同结构)
 /// 结构:{role,name,value,children};过滤策略与 build_tree 一致(role 空 / generic 无 name 时提升子树)
+/// 占位符 `__BT_AX_SELECTOR__` 由 Rust 侧替换为 JSON 字符串或 null(限定子树根)
 #[cfg(target_os = "linux")]
 const DOM_AX_JS: &str = r##"
 (function(){
@@ -242,7 +304,14 @@ const DOM_AX_JS: &str = r##"
       if(children.length)node.children=children;
       return [node];
     }
-    var root=document.body||document.documentElement;
+    var sel=__BT_AX_SELECTOR__;
+    var root;
+    if(sel){
+      root=document.querySelector(sel);
+      if(!root)return {error:"element not found"};
+    }else{
+      root=document.body||document.documentElement;
+    }
     if(!root)return null;
     var nodes=walk(root,0);
     if(!nodes.length)return null;

@@ -79,8 +79,23 @@ pub fn fill(app: &AppHandle, selector: &str, value: &str) -> ControlResult<()> {
 }
 
 /// 获取可见文本
-pub fn visible_text(app: &AppHandle) -> ControlResult<String> {
-    let v = eval(app, "document.body ? document.body.innerText : ''")?;
+/// selector 为 None/空:取 document.body 全文;指定时取该元素 innerText(找不到返回明确错误)
+pub fn visible_text(app: &AppHandle, selector: Option<&str>) -> ControlResult<String> {
+    let js = match selector {
+        Some(s) if !s.is_empty() => format!(
+            r#"(function(){{
+              const el = document.querySelector({s:?});
+              if (!el) return {{error: "element not found"}};
+              return el.innerText;
+            }})()"#,
+            s = s
+        ),
+        _ => "document.body ? document.body.innerText : ''".to_string(),
+    };
+    let v = eval(app, &js)?;
+    if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
+        return Err(err.to_string());
+    }
     Ok(v.as_str().unwrap_or("").to_string())
 }
 
@@ -104,12 +119,13 @@ pub fn element_state(app: &AppHandle, selector: &str) -> ControlResult<Value> {
     )
 }
 
-/// 滚动页面
+/// 滚动页面(dx/dy 为视口 CSS 像素偏移)
+/// JS 必须返回可 JSON 化值:eval 会对返回值做 JSON 解析,window.scrollBy 返回 undefined 会报 EOF
 pub fn scroll(app: &AppHandle, dx: i32, dy: i32) -> ControlResult<()> {
-    eval(
-        app,
-        &format!("window.scrollBy({{left:{dx},top:{dy}}})"),
-    )?;
+    let js = format!(
+        r#"(function(){{ window.scrollBy({{left:{dx},top:{dy}}}); return {{ok:true}}; }})()"#
+    );
+    eval(app, &js)?;
     Ok(())
 }
 

@@ -7,6 +7,91 @@ use tauri::Manager;
 use crate::control;
 use crate::ui;
 
+/// 滚动缺省方向(与 bt_cli `scroll` 用法一致)
+const DEFAULT_SCROLL_DIRECTION: &str = "down";
+/// 滚动缺省像素
+const DEFAULT_SCROLL_AMOUNT: i64 = 300;
+/// visible-html 默认截断长度(字符)
+const DEFAULT_HTML_MAX_LENGTH: u64 = 20000;
+/// visible-html 默认移除 <script>
+const DEFAULT_REMOVE_SCRIPTS: bool = true;
+/// visible-html 默认保留 HTML 注释
+const DEFAULT_REMOVE_COMMENTS: bool = false;
+/// console-logs 默认返回条数(取最后 N 条)
+const DEFAULT_CONSOLE_LOG_LIMIT: u64 = 50;
+
+/// visible-html 提取 JS(占位符由 Rust 侧替换;返回 {html,truncated} 或 {error})
+/// 先 clone 再删除,不改动页面实际 DOM
+const VISIBLE_HTML_JS: &str = r##"
+(function(){
+  try{
+    var sel=__BT_SELECTOR__;
+    var removeScripts=__BT_REMOVE_SCRIPTS__;
+    var removeComments=__BT_REMOVE_COMMENTS__;
+    var maxLength=__BT_MAX_LENGTH__;
+    var root=sel?document.querySelector(sel):document.documentElement;
+    if(!root)return {error:"element not found"};
+    var clone=root.cloneNode(true);
+    if(removeScripts&&clone.querySelectorAll){
+      var scripts=clone.querySelectorAll("script");
+      for(var i=0;i<scripts.length;i++)scripts[i].parentNode.removeChild(scripts[i]);
+    }
+    if(removeComments&&document.createTreeWalker){
+      var walker=document.createTreeWalker(clone,NodeFilter.SHOW_COMMENT,null);
+      var comments=[];
+      while(walker.nextNode())comments.push(walker.currentNode);
+      for(var j=0;j<comments.length;j++)comments[j].parentNode.removeChild(comments[j]);
+    }
+    var html=clone.innerHTML;
+    var truncated=false;
+    if(html.length>maxLength){html=html.slice(0,maxLength);truncated=true;}
+    return {html:html,truncated:truncated};
+  }catch(e){return {error:String(e)};}
+})()
+"##;
+
+/// console-logs 过滤 JS(占位符由 Rust 侧替换;返回 {logs:[...]} 已格式化为 "[level] msg")
+/// 页面缓冲为 window.__btLogs = [{level,msg}],level ∈ log/info/warn/error/debug
+const CONSOLE_LOGS_JS: &str = r##"
+(function(){
+  var all=window.__btLogs||[];
+  var type=__BT_TYPE__;
+  var search=__BT_SEARCH__;
+  var limit=__BT_LIMIT__;
+  var clear=__BT_CLEAR__;
+  var out=[];
+  for(var i=0;i<all.length;i++){
+    var e=all[i]||{};
+    if(type!=="all"&&String(e.level||"")!==type)continue;
+    if(search&&String(e.msg||"").indexOf(search)<0)continue;
+    out.push(e);
+  }
+  if(limit<out.length)out=out.slice(out.length-limit);
+  if(clear)window.__btLogs=[];
+  var lines=[];
+  for(var j=0;j<out.length;j++)lines.push("["+(out[j].level||"log")+"] "+(out[j].msg||""));
+  return {logs:lines};
+})()
+"##;
+
+/// 读取整型参数:兼容 JSON 数字与命令行字符串(bt_cli 的 flag 默认 string 类型)
+fn num_i64(body: &Value, key: &str) -> Option<i64> {
+    body.get(key).and_then(|v| match v {
+        Value::Number(n) => n.as_i64(),
+        Value::String(s) => s.trim().parse::<i64>().ok(),
+        _ => None,
+    })
+}
+
+/// 读取无符号整型参数:兼容 JSON 数字与命令行字符串
+fn num_u64(body: &Value, key: &str) -> Option<u64> {
+    body.get(key).and_then(|v| match v {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.trim().parse::<u64>().ok(),
+        _ => None,
+    })
+}
+
 /// 应用状态(Arc 共享)
 pub struct App {
     /// Tauri 应用句柄(驱动页面/覆盖层/面板 Webview)
@@ -37,8 +122,8 @@ impl App {
             "/api/upload-file" => self.upload_file(&body).await,
             "/api/screenshot" => self.screenshot(&body).await,
             "/api/evaluate" => self.evaluate(&body).await,
-            "/api/visible-text" => self.visible_text().await,
-            "/api/visible-html" => self.visible_html().await,
+            "/api/visible-text" => self.visible_text(&body).await,
+            "/api/visible-html" => self.visible_html(&body).await,
             "/api/element-state" => self.element_state(&body).await,
             "/api/dropdown-options" => self.dropdown_options(&body).await,
             "/api/wait-for-selector" => self.wait_for_selector(&body).await,
@@ -56,7 +141,7 @@ impl App {
             "/api/user-agent" => self.set_user_agent(&body).await,
             "/api/panel-config" => Ok(json!({ "ok": true })),
             "/api/close-session" => Ok(json!({ "closed": true })),
-            "/api/accessibility" => self.accessibility().await,
+            "/api/accessibility" => self.accessibility(&body).await,
             "/api/iframe-click" => self.iframe_click(&body).await,
             "/api/iframe-fill" => self.iframe_fill(&body).await,
             "/api/tabs/new" => self.tabs_new(&body).await,
@@ -296,12 +381,29 @@ impl App {
         Ok(json!({ "uploaded": true }))
     }
 
+    /// 截图:有 selector 时截该元素区域(视口 CSS 像素),否则整视口(行为不变)
     async fn screenshot(&self, body: &Value) -> Result<Value, String> {
+        let selector = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let handle = self.handle.clone();
-        let base64 = tokio::task::block_in_place(|| {
-            crate::control::screenshot::screenshot(&handle)
+        let base64 = tokio::task::block_in_place(|| -> Result<String, String> {
+            if selector.is_empty() {
+                return crate::control::screenshot::screenshot(&handle);
+            }
+            // 元素矩形(视口 CSS 像素)由 element_state 提供
+            let st = crate::control::element_state(&handle, &selector)?;
+            if !st.get("exists").and_then(|v| v.as_bool()).unwrap_or(false) {
+                return Err(format!("element not found: {selector}"));
+            }
+            let rect = st.get("rect").ok_or("element rect missing")?;
+            let x = rect.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0).round() as i32;
+            let y = rect.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0).round() as i32;
+            let w = rect.get("w").and_then(|v| v.as_f64()).unwrap_or(0.0).round() as i32;
+            let h = rect.get("h").and_then(|v| v.as_f64()).unwrap_or(0.0).round() as i32;
+            if w <= 0 || h <= 0 {
+                return Err(format!("element has zero size: {selector}"));
+            }
+            crate::control::screenshot::screenshot_clip(&handle, x, y, w, h)
         })?;
-        let _ = body;
         Ok(json!({ "base64": base64, "mime": "image/png" }))
     }
 
@@ -312,17 +414,47 @@ impl App {
         Ok(r)
     }
 
-    async fn visible_text(&self) -> Result<Value, String> {
+    /// 可见文本:有 selector 取该元素 innerText,否则取 body 全文
+    async fn visible_text(&self, body: &Value) -> Result<Value, String> {
+        let selector = body.get("selector").and_then(|v| v.as_str()).map(|s| s.to_string());
         let handle = self.handle.clone();
-        let t = tokio::task::block_in_place(|| control::visible_text(&handle))?;
+        let t = tokio::task::block_in_place(|| control::visible_text(&handle, selector.as_deref()))?;
         Ok(json!({ "text": t }))
     }
 
-    async fn visible_html(&self) -> Result<Value, String> {
+    /// 可见 HTML:支持 selector / removeScripts / removeComments / maxLength
+    /// 默认 documentElement、移除 script、保留注释、截断 20000 字符
+    async fn visible_html(&self, body: &Value) -> Result<Value, String> {
+        let selector = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let remove_scripts = body
+            .get("removeScripts")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(DEFAULT_REMOVE_SCRIPTS);
+        let remove_comments = body
+            .get("removeComments")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(DEFAULT_REMOVE_COMMENTS);
+        let max_length = num_u64(body, "maxLength").unwrap_or(DEFAULT_HTML_MAX_LENGTH);
+        // 占位符替换为 JS 字面量(selector 走 JSON 转义)
+        let sel_lit = if selector.is_empty() {
+            "null".to_string()
+        } else {
+            serde_json::to_string(&selector).unwrap_or_else(|_| "null".to_string())
+        };
+        let js = VISIBLE_HTML_JS
+            .replace("__BT_SELECTOR__", &sel_lit)
+            .replace("__BT_REMOVE_SCRIPTS__", if remove_scripts { "true" } else { "false" })
+            .replace("__BT_REMOVE_COMMENTS__", if remove_comments { "true" } else { "false" })
+            .replace("__BT_MAX_LENGTH__", &max_length.to_string());
         let handle = self.handle.clone();
-        let js = r#"(function(){ return document.body ? document.body.innerHTML : ""; })()"#;
-        let r = tokio::task::block_in_place(|| control::eval(&handle, js))?;
-        Ok(json!({ "html": r.as_str().unwrap_or("") }))
+        let r = tokio::task::block_in_place(|| control::eval(&handle, &js))?;
+        if let Some(err) = r.get("error").and_then(|e| e.as_str()) {
+            return Err(err.to_string());
+        }
+        Ok(json!({
+            "html": r.get("html").and_then(|v| v.as_str()).unwrap_or(""),
+            "truncated": r.get("truncated").and_then(|v| v.as_bool()).unwrap_or(false),
+        }))
     }
 
     async fn element_state(&self, body: &Value) -> Result<Value, String> {
@@ -355,9 +487,29 @@ impl App {
         Ok(json!({ "found": found }))
     }
 
+    /// 滚动页面:同时兼容 {dx,dy} 精确偏移与 {direction,amount} 语义滚动
+    /// 两者都缺省时按 amount=300 向下滚动(与 bt_cli `scroll` 文档一致)
     async fn scroll(&self, body: &Value) -> Result<Value, String> {
-        let dx = body.get("dx").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-        let dy = body.get("dy").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+        let (dx, dy) = if body.get("dx").is_some() || body.get("dy").is_some() {
+            // 显式偏移:直接使用
+            (
+                num_i64(body, "dx").unwrap_or(0) as i32,
+                num_i64(body, "dy").unwrap_or(0) as i32,
+            )
+        } else {
+            let direction = body.get("direction").and_then(|v| v.as_str()).unwrap_or("");
+            let direction = if direction.is_empty() { DEFAULT_SCROLL_DIRECTION } else { direction };
+            let amount = num_i64(body, "amount").unwrap_or(DEFAULT_SCROLL_AMOUNT) as i32;
+            match direction {
+                "down" => (0, amount),
+                "up" => (0, -amount),
+                "right" => (amount, 0),
+                "left" => (-amount, 0),
+                other => {
+                    return Err(format!("unknown direction: {other} (up/down/left/right)"));
+                }
+            }
+        };
         let handle = self.handle.clone();
         tokio::task::block_in_place(|| control::scroll(&handle, dx, dy))?;
         Ok(json!({ "scrolled": true }))
@@ -428,17 +580,38 @@ impl App {
         Ok(json!({ "resized": true }))
     }
 
-    /// 读取页面控制台日志(由页面桥 __btLogs 捕获,读取后清空)
-    async fn console_logs(&self, _body: &Value) -> Result<Value, String> {
+    /// 读取页面控制台日志(由页面桥 __btLogs 捕获,元素形如 {level,msg})
+    /// 支持 type(按 level 过滤:all/error/warning/log/info/debug,默认 all)、
+    /// search(文本子串)、limit(取最后 N 条,默认 50)、clear(返回后清空缓冲)
+    async fn console_logs(&self, body: &Value) -> Result<Value, String> {
+        let type_raw = body
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("all")
+            .to_ascii_lowercase();
+        // 页面存储的 level 为 warn(非 warning),此处统一归一
+        let log_type = match type_raw.as_str() {
+            "" | "all" => "all",
+            "error" => "error",
+            "warning" | "warn" => "warn",
+            "log" => "log",
+            "info" => "info",
+            "debug" => "debug",
+            other => {
+                return Err(format!("unknown type: {other} (all/error/warning/log/info/debug)"));
+            }
+        };
+        let search = body.get("search").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let limit = num_u64(body, "limit").unwrap_or(DEFAULT_CONSOLE_LOG_LIMIT);
+        let clear = body.get("clear").and_then(|v| v.as_bool()).unwrap_or(false);
+        let js = CONSOLE_LOGS_JS
+            .replace("__BT_TYPE__", &serde_json::to_string(log_type).unwrap_or_else(|_| "\"all\"".into()))
+            .replace("__BT_SEARCH__", &serde_json::to_string(&search).unwrap_or_else(|_| "\"\"".into()))
+            .replace("__BT_LIMIT__", &limit.to_string())
+            .replace("__BT_CLEAR__", if clear { "true" } else { "false" });
         let handle = self.handle.clone();
-        let logs = tokio::task::block_in_place(|| {
-            let v = control::eval(
-                &handle,
-                "(function(){var l=window.__btLogs||[];window.__btLogs=[];return l;})()",
-            )?;
-            Ok::<_, String>(v)
-        })?;
-        Ok(json!({ "logs": logs }))
+        let r = tokio::task::block_in_place(|| control::eval(&handle, &js))?;
+        Ok(r)
     }
 
     /// 记录期望:清空响应历史并登记(声明"从此开始捕获")
@@ -485,10 +658,13 @@ impl App {
         Ok(json!({ "set": true, "ua": ua }))
     }
 
-    async fn accessibility(&self) -> Result<Value, String> {
+    /// 可访问性树:有 selector 返回该元素子树,否则整页(行为不变)
+    async fn accessibility(&self, body: &Value) -> Result<Value, String> {
+        let selector = body.get("selector").and_then(|v| v.as_str()).map(|s| s.to_string());
         let handle = self.handle.clone();
-        let tree =
-            tokio::task::block_in_place(|| crate::control::accessibility::accessibility_tree(&handle))?;
+        let tree = tokio::task::block_in_place(|| {
+            crate::control::accessibility::accessibility_tree(&handle, selector.as_deref())
+        })?;
         Ok(tree)
     }
 
