@@ -1,6 +1,6 @@
 //! 设备预设:内置常用设备模式(窗口尺寸 + User-Agent)
 //! 应用时:窗口 set_size 触发 Resized → ui::apply_layout 自动重排
-//! UA 运行时修改仅 Windows 支持(ICoreWebView2Settings2.SetUserAgent),其他平台返回错误
+//! UA 运行时修改:Windows 用 ICoreWebView2Settings2.SetUserAgent,Linux 用 WebKitSettings.set_user_agent,其他平台返回错误
 use tauri::{AppHandle, LogicalSize};
 
 use crate::ui;
@@ -92,8 +92,36 @@ pub fn set_user_agent(app: &AppHandle, ua: &str) -> Result<(), String> {
         .map_err(|_| "set user agent timeout".to_string())?
 }
 
-/// 非 Windows 平台暂不支持运行时修改 UA
-#[cfg(not(windows))]
+/// 运行时修改页面 Webview 的 User-Agent
+/// Linux:通过当前激活页面 webview 的 WebKitSettings::set_user_agent(仅影响该 webview,与 Windows 语义一致)
+#[cfg(target_os = "linux")]
+pub fn set_user_agent(app: &AppHandle, ua: &str) -> Result<(), String> {
+    use std::sync::mpsc;
+    use webkit2gtk::{SettingsExt, WebViewExt};
+    let page = ui::active_page_webview(app).ok_or("page webview not ready")?;
+    // 结果通道:闭包内执行(闭包须 'static,不能捕获局部变量)
+    let (tx, rx) = mpsc::channel::<Result<(), String>>();
+    let ua_owned = ua.to_string();
+    page.with_webview(move |platform_webview| {
+        let widget = platform_webview.inner();
+        match widget.settings() {
+            Some(settings) => {
+                // set_user_agent 接受 Option<&str>,None 表示回退默认 UA
+                settings.set_user_agent(Some(&ua_owned));
+                let _ = tx.send(Ok(()));
+            }
+            None => {
+                let _ = tx.send(Err("get webkit settings failed".into()));
+            }
+        }
+    })
+    .map_err(|e| format!("with_webview failed: {e}"))?;
+    rx.recv_timeout(std::time::Duration::from_secs(5))
+        .map_err(|_| "set user agent timeout".to_string())?
+}
+
+/// 其余平台暂不支持运行时修改 UA
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn set_user_agent(_app: &AppHandle, _ua: &str) -> Result<(), String> {
     Err("runtime user-agent change not supported on this platform yet".into())
 }

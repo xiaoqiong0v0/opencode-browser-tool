@@ -3,8 +3,8 @@
 //! 注意:eval_with_callback 会把 JS 表达式返回值 JSON 序列化后传回,
 //! 因此 JS 表达式直接返回对象/原始值,不要再包 JSON.stringify
 pub mod accessibility;
-/// 媒体权限放行(Windows:摄像头/麦克风统一 Allow,配合页面模拟脚本)
-#[cfg(windows)]
+/// 媒体权限放行(Windows/Linux:摄像头/麦克风统一放行,配合页面模拟脚本)
+#[cfg(any(windows, target_os = "linux"))]
 pub mod media;
 pub mod responses;
 pub mod screenshot;

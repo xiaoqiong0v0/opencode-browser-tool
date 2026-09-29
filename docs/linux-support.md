@@ -13,9 +13,10 @@
 | 覆盖层透明 / 面板遮罩 / 批注 | ✅ | 依赖窗口 `transparent`，见 §3.1 |
 | 页面截图 | ✅ | WebKitGTK `WebView::snapshot`（见 §4） |
 | 开发者工具 | ✅ | 开关状态用 wry 的真实 `is_devtools_open()`（Windows 上 wry 该值为恒 false，需另用本地标记） |
-| 网络响应捕获 / 可访问性树 / 新窗口拦截 | ❌ | 依赖 WebView2 原生事件，Linux 未实现（对应模块整体 `#[cfg(windows)]`） |
-| 运行时改 User-Agent | ❌ | 同上（依赖 `ICoreWebView2Settings2`） |
-| 媒体权限放行 | ❌ | 依赖 WebView2 `PermissionRequested` 事件 |
+| 网络响应捕获 / 新窗口拦截 | ✅ | 见 §6 |
+| 可访问性树 | ⚠️ 近似 | 见 §6（ATK 需 a11y bus，精简环境不可用） |
+| 运行时改 User-Agent | ✅ | `WebKitSettings::set_user_agent`（仅当前页面 Webview） |
+| 媒体权限放行 | ✅ | `permission-request` 信号 → `UserMediaPermissionRequest.allow()` |
 | macOS | ❌ | 未实现（截图等仍为 stub） |
 
 ## 2. 布局垫片 `ui/linux_layout.rs`（核心）
@@ -64,3 +65,17 @@ WebKitGTK：`WebViewExt::snapshot(SnapshotRegion::Visible, SnapshotOptions::NONE
 - 字体：精简发行版（Kali）默认无 emoji/CJK 字体；即便按 §3.3 改用 SVG 图标，**中文文本仍依赖系统 CJK 字体**（桌面发行版通常自带）。
 - WSLg 注意事项：应用走 Wayland 原生，**X11 抓屏工具（scrot/import/xwd）抓不到内容**（全黑），`xwininfo` 也看不到窗口；`xdotool` 无法验证 WM 动作（合成事件走 XWayland 内部，WM 动作在 Wayland 侧）；反复创建/销毁窗口后 WSLg/Weston 状态可能变脏（窗口已注册但 Windows 侧不显示）→ `wsl --shutdown` 复位。
 - 调试建议：任意可编程验证尽量走本项目自身的 HTTP API（`/api/status`、`/api/evaluate`、`/api/screenshot`），比截图/看界面可靠。
+
+## 6. 平台能力的 Linux 实现（替代 WebView2 原生事件）
+
+| 能力 | Windows（原实现） | Linux（WebKitGTK） |
+|---|---|---|
+| 新窗口拦截 | `NewWindowRequested` 事件 | `WebView::connect_create` → 恒返回 `None` 拒绝原生开窗，改调本项目 `open_new_tab`（复用 Windows 同一入口与 `should_skip()` 过滤：about:blank + 800ms 去重） |
+| 媒体权限放行 | `PermissionRequested`（仅 CAMERA/MICROPHONE） | `connect_permission_request` → `dynamic_cast_ref::<UserMediaPermissionRequest>()` 成功后 `allow()` 并返回已处理；其余保持默认 |
+| 运行时改 UA | `ICoreWebView2Settings2.SetUserAgent` | `widget.settings()` → `SettingsExt::set_user_agent(Some(ua))`（`settings()` 返回 `Option<Settings>`，None 视为失败；沿用 mpsc + 5s 超时回传结构） |
+| 响应捕获 | `WebResourceResponseReceived` 事件 | `connect_resource_load_started` → 对 `WebKitWebResource` 监听 `notify::response` → `URIResponseExt::uri()/status_code()` 写入同一 `RESPONSE_LOG`（上限 500、最新在末尾；`load_started` 时响应通常未就绪，故必须先监听 notify） |
+| 可访问性树 | CDP `Accessibility.getFullAXTree` | **近似实现**：`ui::eval_page` 执行内嵌 JS（`DOM_AX_JS`）从 DOM 重建同结构树（显式/隐式 role、accessible name 优先级、表单 value、跳过不可见与非内容元素、沿用 Windows 侧"generic 且无 name 则提升子树"的过滤） |
+
+**为什么可访问性树用近似而非 ATK**：`webkit_web_view_get_accessible()` 依赖 ATK + a11y bus（`at-spi2`），在 WSLg/精简发行版上通常不可用，无法验证与运行；DOM 近似在任何环境都可用，且对"元素定位/标注"这类用途足够。
+
+**已知限制**：近似树不是浏览器真实 AX 树（不含 layout/table 语义细节，name 计算也与浏览器实现有差异）；`data:`/`blob:` 等非 HTTP 资源的响应 status 可能记为 0。

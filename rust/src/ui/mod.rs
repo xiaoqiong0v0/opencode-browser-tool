@@ -3,8 +3,8 @@
 //! 工具栏 Webview 顶部横条(标签 + 地址栏 + 面板开关)
 //! 覆盖层 Webview 透明叠加,面板 Webview 覆盖式浮层(不占页面)
 pub mod annotate;
-/// 新窗口拦截(Windows:target=_blank → 新标签页)
-#[cfg(windows)]
+/// 新窗口拦截(Windows/Linux:target=_blank → 新标签页)
+#[cfg(any(windows, target_os = "linux"))]
 pub mod new_window;
 /// Linux 子 webview 绝对定位垫片(tauri/wry 在 Linux 用 GtkBox 导致 set_bounds 失效)
 #[cfg(target_os = "linux")]
@@ -616,13 +616,13 @@ pub fn create_ui(app: &AppHandle) -> tauri::Result<()> {
         // 全部先隐藏,避免布局定位前在左上角闪现 100x100 黑框
         let _ = w.hide();
         // 注册新窗口拦截(target=_blank → 新标签页)
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         new_window::setup(app, &w);
         // 注册响应捕获(expect/assert-response 查询历史)
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         crate::control::responses::setup(app, &w);
-        // 注册媒体权限放行(摄像头/麦克风统一 Allow)
-        #[cfg(windows)]
+        // 注册媒体权限放行(摄像头/麦克风统一放行)
+        #[cfg(any(windows, target_os = "linux"))]
         crate::control::media::setup(app, &w);
     }
     // 初始标签绑定 webview label
@@ -895,13 +895,13 @@ pub fn create_tab_webview(app: &AppHandle, id: u32) -> Result<tauri::webview::We
     // 初始隐藏,切换到该标签时才显示
     let _ = w.hide();
     // 注册新窗口拦截(target=_blank → 新标签页)
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     new_window::setup(app, &w);
     // 注册响应捕获(expect/assert-response 查询历史)
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     crate::control::responses::setup(app, &w);
-    // 注册媒体权限放行(摄像头/麦克风统一 Allow)
-    #[cfg(windows)]
+    // 注册媒体权限放行(摄像头/麦克风统一放行)
+    #[cfg(any(windows, target_os = "linux"))]
     crate::control::media::setup(app, &w);
     // Linux: 新页面 webview 迁入 gtk::Fixed 绝对定位,并重新置顶浮层(避免新页面盖住 overlay/panel)
     #[cfg(target_os = "linux")]

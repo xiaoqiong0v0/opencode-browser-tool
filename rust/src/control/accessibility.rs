@@ -1,20 +1,36 @@
-//! 可访问性树:通过 CDP Accessibility.getFullAXTree 获取页面可访问性树
-//! 复用截图同款通道(ICoreWebView2 + CallDevToolsProtocolMethod)
+//! 可访问性树:返回 {role,name,value,children} 嵌套结构
+//! Windows:CDP Accessibility.getFullAXTree(复用截图同款 ICoreWebView2 + CallDevToolsProtocolMethod 通道)
+//! Linux(WebKitGTK):ATK/AT-SPI 需要可用的 a11y bus(WSLg/Kali 不可用),改用页面 DOM 近似重建(同结构)
+#[cfg(windows)]
 use std::sync::mpsc;
 
-use serde_json::json;
 use tauri::AppHandle;
 
+#[cfg(any(windows, target_os = "linux"))]
 use crate::ui;
+#[cfg(windows)]
+use serde_json::json;
 
 /// 获取可访问性树,返回 {role,name,value,children} 嵌套结构
 pub fn accessibility_tree(app: &AppHandle) -> Result<serde_json::Value, String> {
-    let raw = cdp_json(app)?;
-    // CDP 返回 { "nodes": [...] }
-    let v: serde_json::Value =
-        serde_json::from_str(&raw).map_err(|e| format!("parse cdp result: {e}"))?;
-    let nodes = v.get("nodes").and_then(|n| n.as_array()).cloned().unwrap_or_default();
-    build_tree(&nodes)
+    #[cfg(windows)]
+    {
+        let raw = cdp_json(app)?;
+        // CDP 返回 { "nodes": [...] }
+        let v: serde_json::Value =
+            serde_json::from_str(&raw).map_err(|e| format!("parse cdp result: {e}"))?;
+        let nodes = v.get("nodes").and_then(|n| n.as_array()).cloned().unwrap_or_default();
+        build_tree(&nodes)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        dom_accessibility_tree(app)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = app;
+        Err("accessibility not implemented on this platform yet".into())
+    }
 }
 
 #[cfg(windows)]
@@ -63,12 +79,184 @@ fn cdp_json(app: &AppHandle) -> Result<String, String> {
         .map_err(|_| "accessibility timeout".to_string())?
 }
 
-#[cfg(not(windows))]
-fn cdp_json(_app: &AppHandle) -> Result<String, String> {
-    Err("accessibility not implemented on this platform yet".into())
+/// 页面 DOM → 近似可访问性树(Linux/WebKitGTK)
+/// 用页面 JS 重建同结构树;解析失败/页面无内容时返回与 Windows 一致的错误
+#[cfg(target_os = "linux")]
+fn dom_accessibility_tree(app: &AppHandle) -> Result<serde_json::Value, String> {
+    let raw = ui::eval_page(app, DOM_AX_JS)?;
+    let v: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("parse dom ax result: {e}"))?;
+    // JS 失败/无节点时返回 null;根节点必须带 role
+    let has_role = v
+        .as_object()
+        .and_then(|o| o.get("role"))
+        .and_then(|r| r.as_str())
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    if !has_role {
+        return Err("no accessibility nodes".into());
+    }
+    Ok(v)
 }
 
+/// 页面 DOM → 近似可访问性树(内嵌 JS,与 Windows CDP 产物同结构)
+/// 结构:{role,name,value,children};过滤策略与 build_tree 一致(role 空 / generic 无 name 时提升子树)
+#[cfg(target_os = "linux")]
+const DOM_AX_JS: &str = r##"
+(function(){
+  try{
+    // 递归深度上限:防御异常深的 DOM
+    var MAX_DEPTH=100;
+    // 非内容元素:不参与可访问性树
+    var SKIP_TAGS={SCRIPT:1,STYLE:1,NOSCRIPT:1,TEMPLATE:1,HEAD:1,META:1,LINK:1,TITLE:1,BASE:1};
+    // 元素可见性:不可见元素及其子树跳过
+    function isVisible(el){
+      var tag=el.tagName?el.tagName.toUpperCase():"";
+      // body/html 的 offsetParent 恒为 null,不能据此判为隐藏
+      if(tag==="BODY"||tag==="HTML")return true;
+      if(el.getClientRects&&el.getClientRects().length===0)return false;
+      if(el.offsetParent===null){
+        var pos="";
+        try{pos=getComputedStyle(el).position;}catch(e){}
+        // position:fixed 的 offsetParent 恒为 null,不能据此判为隐藏
+        if(pos!=="fixed")return false;
+      }
+      return true;
+    }
+    // aria-labelledby:解析被引用元素的文本,拼接为可访问名
+    function labelledBy(el){
+      var ids=(el.getAttribute("aria-labelledby")||"").trim();
+      if(!ids)return "";
+      var parts=[],list=ids.split(/\s+/);
+      for(var i=0;i<list.length;i++){
+        var ref=document.getElementById(list[i]);
+        if(!ref)continue;
+        var t=(ref.innerText||ref.textContent||"").replace(/\s+/g," ").trim();
+        if(t)parts.push(t);
+      }
+      return parts.join(" ").trim();
+    }
+    // 可访问名:aria-label → aria-labelledby → img alt → title → placeholder → 自身可见文本(≤120 字符)
+    function nameOf(el){
+      var tag=el.tagName?el.tagName.toUpperCase():"";
+      var v=el.getAttribute("aria-label");
+      if(v&&v.trim())return v.trim();
+      v=labelledBy(el);
+      if(v)return v;
+      if(tag==="IMG"){
+        var alt=el.getAttribute("alt");
+        if(alt&&alt.trim())return alt.trim();
+      }
+      v=el.getAttribute("title");
+      if(v&&v.trim())return v.trim();
+      v=el.getAttribute("placeholder");
+      if(v&&v.trim())return v.trim();
+      // 结构性容器不用自身文本,避免整页文本成为根名
+      if(tag==="BODY"||tag==="HTML")return "";
+      var t=(el.innerText||"").replace(/\s+/g," ").trim();
+      if(t.length>120)t=t.slice(0,120);
+      return t;
+    }
+    // 显式 role 属性(非空才有效)
+    function explicitRole(el){
+      var r=el.getAttribute("role");
+      return r&&r.trim()?r.trim().toLowerCase():"";
+    }
+    // 隐式 role 映射(按标签/type)
+    function implicitRole(el){
+      var tag=el.tagName?el.tagName.toLowerCase():"";
+      var type=(el.getAttribute("type")||"").toLowerCase();
+      switch(tag){
+        case "a":
+        case "area":
+          return el.hasAttribute("href")?"link":"";
+        case "button":return "button";
+        case "input":
+          if(type==="checkbox")return "checkbox";
+          if(type==="radio")return "radio";
+          if(type==="range")return "slider";
+          if(type==="number")return "spinbutton";
+          if(type==="search")return "searchbox";
+          if(type==="button"||type==="submit"||type==="reset"||type==="image")return "button";
+          if(type==="hidden")return "";
+          return "textbox";
+        case "select":return "combobox";
+        case "textarea":return "textbox";
+        case "h1":case "h2":case "h3":case "h4":case "h5":case "h6":return "heading";
+        case "img":return "img";
+        case "ul":case "ol":return "list";
+        case "li":return "listitem";
+        case "table":return "table";
+        case "nav":return "navigation";
+        case "form":return "form";
+        case "main":return "main";
+        case "header":return "banner";
+        case "footer":return "contentinfo";
+        case "dialog":return "dialog";
+        case "progress":return "progressbar";
+        default:return "";
+      }
+    }
+    // 值:复选状态 / 表单值 / aria-* 状态(统一转字符串)
+    function valueOf(el,role){
+      if(role==="checkbox"||role==="radio"){
+        var ac=el.getAttribute("aria-checked");
+        if(ac!==null&&ac!=="")return ac;
+        if(typeof el.checked==="boolean")return el.checked?"true":"false";
+      }
+      var tag=el.tagName?el.tagName.toUpperCase():"";
+      if(tag==="INPUT"||tag==="TEXTAREA"||tag==="SELECT"){
+        var v=el.value;
+        if(v!==undefined&&v!==null&&String(v)!=="")return String(v);
+      }
+      var attrs=["aria-valuenow","aria-checked","aria-pressed","aria-expanded","aria-selected"];
+      for(var i=0;i<attrs.length;i++){
+        var a=el.getAttribute(attrs[i]);
+        if(a!==null&&a!=="")return a;
+      }
+      return "";
+    }
+    // 递归构建:返回输出节点数组(被过滤节点自身不输出,子树提升到父级)
+    function walk(el,depth){
+      var out=[];
+      if(depth>MAX_DEPTH)return out;
+      var tag=el.tagName?el.tagName.toUpperCase():"";
+      if(SKIP_TAGS[tag])return out;
+      if(!isVisible(el))return out;
+      // 子节点(保持 DOM 顺序)
+      var children=[],kids=el.children||[];
+      for(var i=0;i<kids.length;i++){
+        var sub=walk(kids[i],depth+1);
+        for(var j=0;j<sub.length;j++)children.push(sub[j]);
+      }
+      var role=explicitRole(el)||implicitRole(el);
+      var name=nameOf(el);
+      // 无 role 但有文本的容器归为 generic
+      if(!role&&name)role="generic";
+      // 与 Windows build_tree 一致:role 为空或 generic 无 name 时自身不输出,子树提升
+      if(!role||(role==="generic"&&!name))return children;
+      var node={role:role};
+      if(name)node.name=name;
+      var val=valueOf(el,role);
+      if(val!=="")node.value=val;
+      if(children.length)node.children=children;
+      return [node];
+    }
+    var root=document.body||document.documentElement;
+    if(!root)return null;
+    var nodes=walk(root,0);
+    if(!nodes.length)return null;
+    if(nodes.length===1)return nodes[0];
+    // 顶层被提升为多个节点时合成虚拟根
+    return {role:"generic",children:nodes};
+  }catch(e){
+    return null;
+  }
+})()
+"##;
+
 /// CDP AX nodes → {role,name,value,children} 树(过滤 ignored/backdrop/none role)
+#[cfg(windows)]
 fn build_tree(nodes: &[serde_json::Value]) -> Result<serde_json::Value, String> {
     // 构建 children 映射:parentId → [nodeId]
     use std::collections::HashMap;
