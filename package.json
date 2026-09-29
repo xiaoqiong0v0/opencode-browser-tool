@@ -21,7 +21,7 @@
     "dist"
   ],
   "dependencies": {
-    "@xiaoqiong0v0/opencode-plugin-logger": "^1.0.2",
+    "@xiaoqiong0v0/opencode-plugin-logger": "^1.0.5",
     "string-argv": "^0.3.2"
   },
   "peerDependencies": {
