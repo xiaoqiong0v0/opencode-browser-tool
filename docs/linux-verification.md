@@ -3,6 +3,7 @@
 > 目的：在**真实 Linux 桌面**（GNOME/KDE，Wayland 或 X11）上复验 Linux 侧的可信输入与降级策略。
 > 依据与 WSLg 取证见 `.tmp/scratch/linux-gdk-evidence.md`；平台能力与降级规则见 `linux-support.md` §7。
 > 所有命令可直接照抄，只有 `<PORT>`、路径与发行版名需按环境替换。
+> 一键复验：`bash tests/manual/verify-linux.sh`（自动构建+起实例+跑 15 项+打印 PASS/FAIL 报告；`--keep` 保留实例，`--no-build` 跳过构建）
 
 ## 1. 前置依赖
 
