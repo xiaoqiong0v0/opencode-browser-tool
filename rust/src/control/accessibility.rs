@@ -1,5 +1,6 @@
 //! 可访问性树:返回 {role,name,value,children} 嵌套结构
-//! Windows:CDP Accessibility.getFullAXTree(复用截图同款 ICoreWebView2 + CallDevToolsProtocolMethod 通道)
+//! Windows:CDP(复用截图同款 ICoreWebView2 + CallDevToolsProtocolMethod 通道)
+//!   整页与 selector 子树均基于 Accessibility.getFullAXTree(selector 子树另经 DOM 定位命中节点)
 //! Linux(WebKitGTK):ATK/AT-SPI 需要可用的 a11y bus(WSLg/Kali 不可用),改用页面 DOM 近似重建(同结构)
 #[cfg(windows)]
 use std::sync::mpsc;
@@ -95,8 +96,15 @@ fn cdp_call_json(app: &AppHandle, method_name: &str, params_json: &str) -> Resul
 }
 
 /// 按 selector 取元素子树(Windows)
-/// 链路:DOM.getDocument → DOM.querySelector 拿 nodeId → Accessibility.getPartialAXTree
-/// fetchRelatives=false 只取该节点自身+子树,与 Linux 子树语义一致
+/// 链路:DOM.getDocument → DOM.querySelector → DOM.describeNode 取 backendNodeId
+///      → Accessibility.getFullAXTree → 以命中节点为根重建该元素子树
+///
+/// 为什么不用 Accessibility.getPartialAXTree:实测 fetchRelatives=false 只返回命中节点
+/// 自身(不含任何后代),且返回节点仍带 parentId(祖先不在结果里),build_tree 找不到根 →
+/// "no accessibility nodes";即便 fetchRelatives=true 也只多一层直接子节点与祖先,拿不到完整子树。
+/// getFullAXTree 是含 ignored 节点的完整快照,配合显式根即可精确取到该元素的子树。
+/// Chromium 会把 html/body、无 accessible name 的 generic 容器标为 ignored;
+/// ignored 节点交由 build_tree 过滤并提升其子树,与整页语义一致。
 #[cfg(windows)]
 fn cdp_subtree(app: &AppHandle, selector: &str) -> Result<serde_json::Value, String> {
     // 1. 取文档根节点(depth:0 只需 root)
@@ -108,7 +116,7 @@ fn cdp_subtree(app: &AppHandle, selector: &str) -> Result<serde_json::Value, Str
         .and_then(|r| r.get("nodeId"))
         .and_then(|v| v.as_i64())
         .ok_or("DOM.getDocument: no root nodeId")?;
-    // 2. 查询选择器命中的节点(nodeId=0 表示未命中)
+    // 2. 查询选择器命中的 DOM 节点(nodeId=0 表示未命中)
     let q_params = json!({ "nodeId": root_id, "selector": selector }).to_string();
     let q_raw = cdp_call_json(app, "DOM.querySelector", &q_params)?;
     let q: serde_json::Value =
@@ -117,13 +125,55 @@ fn cdp_subtree(app: &AppHandle, selector: &str) -> Result<serde_json::Value, Str
     if node_id == 0 {
         return Err(format!("element not found: {selector}"));
     }
-    // 3. 该节点自身+子树的部分 AX 树(fetchRelatives=false 排除祖先/兄弟)
-    let p_params = json!({ "nodeId": node_id, "fetchRelatives": false }).to_string();
-    let p_raw = cdp_call_json(app, "Accessibility.getPartialAXTree", &p_params)?;
-    let p: serde_json::Value =
-        serde_json::from_str(&p_raw).map_err(|e| format!("parse getPartialAXTree: {e}"))?;
-    let nodes = p.get("nodes").and_then(|n| n.as_array()).cloned().unwrap_or_default();
-    build_tree(&nodes)
+    // 3. 该节点的 backendNodeId(AX 节点用它定位命中的 DOM 节点)
+    let d_params = json!({ "nodeId": node_id }).to_string();
+    let d_raw = cdp_call_json(app, "DOM.describeNode", &d_params)?;
+    let d: serde_json::Value =
+        serde_json::from_str(&d_raw).map_err(|e| format!("parse DOM.describeNode: {e}"))?;
+    let backend_id = d
+        .get("node")
+        .and_then(|n| n.get("backendNodeId"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    // 4. 全量 AX 树快照(含 ignored 节点,父子关系完整)
+    //    不用 getPartialAXTree:实测它只返回命中节点 + 直接子节点 + 祖先,
+    //    拿不到完整后代子树(且 fetchRelatives=false 时连后代都没有)
+    let full_raw = cdp_call_json(app, "Accessibility.getFullAXTree", "{}")?;
+    let full: serde_json::Value =
+        serde_json::from_str(&full_raw).map_err(|e| format!("parse getFullAXTree: {e}"))?;
+    let nodes = full.get("nodes").and_then(|n| n.as_array()).cloned().unwrap_or_default();
+    if nodes.is_empty() {
+        return Err("no accessibility nodes".into());
+    }
+    // 5. 在整棵树里定位命中 DOM 节点对应的 AX 节点,显式作为根,只保留其子树
+    let target = pick_target_ax_node(&nodes, backend_id)
+        .ok_or_else(|| "no accessibility nodes".to_string())?;
+    build_tree_from(&nodes, Some(&target))
+}
+
+/// 在 AX 节点集合里选出"命中 DOM 节点"对应的 AX 节点 id
+/// 按 backendNodeId 匹配;若同一 DOM 节点有多个 AX 节点,优先非 ignored 的那个
+#[cfg(windows)]
+fn pick_target_ax_node(nodes: &[serde_json::Value], backend_id: i64) -> Option<String> {
+    if backend_id == 0 {
+        return None;
+    }
+    let mut ignored_match: Option<String> = None;
+    for n in nodes {
+        let Some(id) = n.get("nodeId").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if n.get("backendDOMNodeId").and_then(|v| v.as_i64()) == Some(backend_id) {
+            let ignored = n.get("ignored").and_then(|v| v.as_bool()).unwrap_or(false);
+            if !ignored {
+                return Some(id.to_string());
+            }
+            if ignored_match.is_none() {
+                ignored_match = Some(id.to_string());
+            }
+        }
+    }
+    ignored_match
 }
 
 /// 页面 DOM → 近似可访问性树(Linux/WebKitGTK)
@@ -325,8 +375,20 @@ const DOM_AX_JS: &str = r##"
 "##;
 
 /// CDP AX nodes → {role,name,value,children} 树(过滤 ignored/backdrop/none role)
+/// 根为 parentId 为空的节点(整页树入口)
 #[cfg(windows)]
 fn build_tree(nodes: &[serde_json::Value]) -> Result<serde_json::Value, String> {
+    build_tree_from(nodes, None)
+}
+
+/// CDP AX nodes → {role,name,value,children} 树,可显式指定根 AX 节点
+/// root_id=None:根为 parentId 为空的节点(整页);Some:以该节点为根(selector 子树,
+/// 其 parentId 指向未包含的祖先,必须显式指定,否则找不到根)
+#[cfg(windows)]
+fn build_tree_from(
+    nodes: &[serde_json::Value],
+    root_id: Option<&str>,
+) -> Result<serde_json::Value, String> {
     // 构建 children 映射:parentId → [nodeId]
     use std::collections::HashMap;
     let mut children_map: HashMap<String, Vec<String>> = HashMap::new();
@@ -394,19 +456,34 @@ fn build_tree(nodes: &[serde_json::Value]) -> Result<serde_json::Value, String> 
         vec![obj]
     }
 
-    // 根:parentId 为空的节点(可能存在多个,取第一个有输出的)
-    let mut roots = Vec::new();
-    for n in nodes {
-        let id = n.get("nodeId").and_then(|v| v.as_str()).unwrap_or("");
-        let has_parent = n.get("parentId").map(|p| p.is_string() && !p.as_str().unwrap_or("").is_empty()).unwrap_or(false);
-        if !has_parent {
-            roots.push(id);
+    // 选根:显式指定则以其为根;否则取 parentId 为空的节点
+    let mut roots: Vec<String> = Vec::new();
+    match root_id {
+        Some(r) => {
+            if id_node.contains_key(r) {
+                roots.push(r.to_string());
+            }
+        }
+        None => {
+            for n in nodes {
+                let id = n.get("nodeId").and_then(|v| v.as_str()).unwrap_or("");
+                let has_parent = n
+                    .get("parentId")
+                    .map(|p| p.is_string() && !p.as_str().unwrap_or("").is_empty())
+                    .unwrap_or(false);
+                if !has_parent {
+                    roots.push(id.to_string());
+                }
+            }
         }
     }
     for r in roots {
-        let out = convert(r, &id_node, &children_map);
-        if let Some(v) = out.into_iter().next() {
-            return Ok(v);
+        let out = convert(&r, &id_node, &children_map);
+        match out.len() {
+            0 => continue,
+            // 根被过滤且有多个被提升的孩子时,合成虚拟根(与 Linux 端一致)
+            1 => return Ok(out.into_iter().next().unwrap()),
+            _ => return Ok(json!({ "role": "generic", "children": out })),
         }
     }
     Err("no accessibility nodes".into())
