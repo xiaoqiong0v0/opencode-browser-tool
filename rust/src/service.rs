@@ -161,6 +161,8 @@ impl App {
             "/api/annotate/records" => self.annotate_records().await,
             "/api/annotate/send" => self.annotate_send().await,
             "/api/annotate/consume-sent" => self.annotate_consume_sent().await,
+            // 推送式投递:插件注册通知地址(附着模式 / 晚注册)
+            "/api/notify-url" => self.set_notify_url(&body).await,
             // 设备预设与开发者工具
             "/api/device" => self.device(&body).await,
             "/api/device/list" => self.device_list().await,
@@ -1055,6 +1057,19 @@ impl App {
             );
         }
         Ok(json!({ "records": items }))
+    }
+
+    /// 注册插件通知地址(推送式投递;附着模式或需要晚注册时使用)
+    async fn set_notify_url(&self, body: &Value) -> Result<Value, String> {
+        let url = body.get("url").and_then(|u| u.as_str()).unwrap_or("").trim().to_string();
+        let state = self.handle.state::<crate::ui::UiState>();
+        *state.notify_url.lock().unwrap() = if url.is_empty() { None } else { Some(url.clone()) };
+        if url.is_empty() {
+            eprintln!("[notify] notify-url cleared");
+        } else {
+            eprintln!("[notify] notify-url set: {url}");
+        }
+        Ok(json!({ "ok": true, "url": url }))
     }
 }
 

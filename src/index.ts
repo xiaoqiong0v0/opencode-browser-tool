@@ -9,7 +9,8 @@ import {
 import { registerLocale, t } from "./i18n/index.js";
 import en from "./i18n/en.js";
 import zh from "./i18n/zh.js";
-import { configureService, setUserDataDir, setAppDirectory, ensureService, openWindow, isRunning, stopService, service, probeStatus } from "./client.js";
+import { configureService, setUserDataDir, setAppDirectory, setServiceReadyHandler, ensureService, openWindow, isRunning, stopService, service, probeStatus } from "./client.js";
+import { startNotifyServer } from "./notify-server.js";
 import { startDownload, getBinaryStatus, describeBinaryStatus } from "./binary.js";
 import { tool, type Plugin } from "@opencode-ai/plugin";
 import { log } from "./logger.js";
@@ -256,8 +257,8 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree, directory,
     // 启动即后台下载 bt-shell(fire-and-forget:不阻塞启动,失败不抛出;状态见 getBinaryStatus)
     startDownload();
 
-    // 轮询批注发送队列(面板"发送全部" → 推送到对话)
-    void startAnnotatePoller(client);
+    // 事件驱动投递:插件本地监听 shell 通知(推送式,替代轮询)
+    setupAnnotateDelivery(client);
 
     return {
       event: async ({ event }) => {
@@ -390,8 +391,9 @@ function filterDisabled(tools: Record<string, any>, disabled?: string[]): Record
  * 注意:插件函数会随会话/切目录多次执行,轮询器必须进程级单例,
  * 否则同一进程会累积多个 interval 空转(server 与 TUI 进程各一份,互不共享)
  */
-let annotateTimer: any = null;
 let annotateClient: any = null;
+/** drain 进行中,避免并发重复投递 */
+let draining = false;
 /** 最近一次见到的会话 id 缓存(来自 event/chat.message/tool.execute.before 钩子) */
 const sessionCache = createSessionIDCache();
 /** 已记录过的 sid(避免重复刷屏) */
@@ -413,38 +415,46 @@ function saveShotImage(log: any, index: number, b64: string): string | null {
   }
 }
 
-function startAnnotatePoller(client: any): void {
-  // 更新 client 引用(插件重载后使用最新 client),但只启动一个轮询器
+/** 事件驱动投递:插件本地监听 shell 通知(收到即 drain),不再 setInterval 轮询 */
+function setupAnnotateDelivery(client: any): void {
+  // 更新 client 引用(插件重载后使用最新 client)
   annotateClient = client;
-  if (annotateTimer) return;
-  const POLL_MS = 2000;
-  let warnedNotRunning = false;
-  const timer = setInterval(async () => {
-    // 观测钩子缓存:首次学到 sid 时记一次(证明 sid 来源可用,与窗口是否打开无关)
+  // 服务就绪时做一次 drain(覆盖"通知机制建立前 shell 已发送过"的窗口,幂等;含 shell 重启)
+  setServiceReadyHandler(() => {
+    void drainAnnotate();
+  });
+  // 启动监听并把地址交给 shell(spawn 时 --notify-url,就绪后 /api/notify-url 注册)
+  startNotifyServer(() => {
+    void drainAnnotate();
+  })
+    .then((p) => log.info(`[notify] listening 127.0.0.1:${p}/notify (event-driven; no polling)`))
+    .catch((e) => log.error("[notify] listen failed (only initial/service-ready drain available)", e as Error));
+  // 插件启动时也 drain 一次(此时服务可能未起,isRunning() 会短路)
+  void drainAnnotate();
+}
+
+/** 拉取待发送记录并投递到当前会话(推送触发;空结果不记日志) */
+async function drainAnnotate(): Promise<void> {
+  if (draining) return;
+  const c = annotateClient;
+  if (!c) return;
+  // 服务未启动/已关闭:跳过(服务就绪或通知到达时会再次触发)
+  if (!isRunning()) return;
+  draining = true;
+  try {
+    // 观测钩子缓存:首次学到 sid 时记一次(证明 sid 来源可用)
     const learned = sessionCache.get();
     if (learned && learned !== lastLoggedSessionID) {
-      log.info(`[poller] hook-cache sid=${learned}`);
+      log.info(`[notify] hook-cache sid=${learned}`);
       lastLoggedSessionID = learned;
     }
-    // 服务未启动/已关闭:跳过本次轮询(窗口打开后再恢复推送);仅首次提示,避免刷屏
-    if (!isRunning()) {
-      if (!warnedNotRunning) {
-        log.info("[poller] shell not running; poll skipped (will resume after open_window/tool call)");
-        warnedNotRunning = true;
-      }
-      return;
-    }
-    warnedNotRunning = false;
-    const c = annotateClient;
-    if (!c) return;
-    try {
       const r = await service.annotateConsumeSent();
       const records = r?.records || [];
       if (records.length === 0) return; // 空结果不刷屏
       const imgInfo = records
         .filter((x: any) => x.type === "screenshot" && x.image)
         .map((x: any) => `#${x.index}:${x.image.length}B`);
-      log.info(`[poller] consume-sent -> ${records.length} record(s) ids=[${records.map((x: any) => x.index).join(",")}] images=[${imgInfo.join(",")}]`);
+      log.info(`[drain] consume-sent -> ${records.length} record(s) ids=[${records.map((x: any) => x.index).join(",")}] images=[${imgInfo.join(",")}]`);
       const lines = ["User annotated via panel:", ""];
       for (const item of records) {
         const label =
@@ -469,15 +479,15 @@ function startAnnotatePoller(client: any): void {
       if (!sid) {
         const sessions = await c.session.list();
         listLen = Array.isArray(sessions?.data) ? sessions.data.length : sessions?.error ? "error" : "none";
-        log.info(`[poller] session.list raw=${JSON.stringify(sessions).slice(0, 400)}`);
+        log.info(`[drain] session.list raw=${JSON.stringify(sessions).slice(0, 400)}`);
         sid = sessions?.data?.[0]?.id;
         source = "client.session.list()[0]";
       }
       // 关键诊断:sid 来源/缓存值/list 长度/插件目录(定位"静默失败"断点)
-      log.info(`[poller] sid source=${source} cached=${sessionCache.get() || "(EMPTY)"} listLen=${listLen} ctx=${pluginCtx.directory || "(none)"} srv=${pluginCtx.serverUrl || "(none)"} sid=${sid ?? "(EMPTY)"}`);
+      log.info(`[drain] sid source=${source} cached=${sessionCache.get() || "(EMPTY)"} listLen=${listLen} ctx=${pluginCtx.directory || "(none)"} srv=${pluginCtx.serverUrl || "(none)"} sid=${sid ?? "(EMPTY)"}`);
       if (!sid) {
         const msg = "no session id (hook cache empty and session.list returned none)";
-        log.error(`[poller] ${msg}`, new Error(msg));
+        log.error(`[drain] ${msg}`, new Error(msg));
         try {
           await service.notify({ message: `发送失败: ${msg}`, type: "err" });
         } catch {}
@@ -486,26 +496,23 @@ function startAnnotatePoller(client: any): void {
       const send = (parts: any[]) => c.session.prompt({ path: { id: sid }, body: { noReply: false, parts } });
 
       // 只发文本(参考实现同为纯文本;图片由工具附件/缓存路径交付,不在 prompt 里塞图片 part)
-      log.info(`[poller] prompt -> sid=${sid} parts=text-only textLen=${text.length}`);
+      log.info(`[drain] prompt -> sid=${sid} parts=text-only textLen=${text.length}`);
       const res = await send([{ type: "text", text }]);
       const err = res?.error;
       if (err) {
         // 不再静默:写日志 + 页面通知(SDK 返回 {error} 不抛,必须显式检查)
-        log.error(`[poller] prompt FAILED sid=${sid}: ${JSON.stringify(err).slice(0, 300)}`, new Error("prompt error"));
+        log.error(`[drain] prompt FAILED sid=${sid}: ${JSON.stringify(err).slice(0, 300)}`, new Error("prompt error"));
         try {
           await service.notify({ message: `发送记录失败: ${JSON.stringify(err).slice(0, 180)}`, type: "err" });
         } catch {}
       } else {
-        log.info(`[poller] prompt OK sid=${sid} delivered ${records.length} record(s)`);
+        log.info(`[drain] prompt OK sid=${sid} delivered ${records.length} record(s)`);
       }
     } catch (e) {
-      // 不终止轮询(此前 clearInterval 会导致后续发送永久"无反应")
-      log.error("annotate poller error", e as Error);
+      log.error("annotate drain error", e as Error);
+    } finally {
+      draining = false;
     }
-  }, POLL_MS);
-  // 不阻塞进程退出
-  if (typeof (timer as any).unref === "function") (timer as any).unref();
-  annotateTimer = timer;
 }
 
 // Export default for npm loader

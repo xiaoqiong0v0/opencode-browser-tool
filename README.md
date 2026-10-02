@@ -64,6 +64,7 @@ sha256 校验（**幂等**：sha 与当前 release 期望值一致即跳过；**
 - `BT_SHELL_NO_DOWNLOAD` — 设为 `1` 时不自动下载（状态 `disabled`；需自行放置二进制或配合 `BT_SHELL_PATH`）
 - `BT_SHELL_DOWNLOAD_BASE` — 覆盖下载根（默认 GitHub Release `https://github.com/xiaoqiong0v0/opencode-browser-tool/releases/download`），可指向镜像/自建
 - `BT_SHELL_VERSION` — 显式指定**二进制发布版本**（形如 `1.2.0`，即 `x.Y.0` 的 Release；**原样使用、不做归 0 推导**；不设时由插件版本自动推导）
+- `BT_SHELL_NOTIFY_URL` — 插件通知地址（**推送式投递**；一般由插件自动通过 `--notify-url` / `/api/notify-url` 设置，仅在手动启动 shell 时需自行指定）
 
 > **附着模式 vs 启动模式**：设置了 `BT_SHELL_URL`（优先）或 `BT_SHELL_PORT` 时进入附着模式——插件**不 spawn** 任何进程，直接连接该地址的外部 shell；两者都未设置时按启动模式 spawn 本地二进制（`BT_SHELL_PATH` 可覆盖查找路径）。附着模式下 `bt_close` 只关闭浏览器窗口并断开连接，**不会**结束外部 shell 进程（进程不归插件管理）。
 
@@ -188,7 +189,7 @@ opencode（Bun）
 - **批注模式** — 悬停高亮元素（覆盖层自绘），点击元素弹出输入框填写说明；引擎层拦截，弹框/下拉类元素不失焦
 - **截图模式** — 点击立即截全屏；也可进入截图模式后拖动框选区域（选区可拖拽手柄调整大小），保存时可按需裁剪（遮罩式选区，默认整图，双击还原）
 - **记录列表** — 面板「AI 功能」区：批注/截图记录卡片（截图带缩略图），显示所属标签 URL 与说明
-- **发送** — 面板底部「发送」按钮：所有记录（批注文字 + 截图图片）推送到 opencode 对话；发送后**面板列表清空**（与旧 Playwright 工具一致，仅列表为空），但**记录本身保留**并标记 `[sent]`（`bt_list_records` 仍可读取，截图也可通过 `bt_read_record_content` 取到）
+- **发送** — 面板底部「发送」按钮：所有记录（批注文字 + 截图图片）推送到 opencode 对话；发送后**面板列表清空**（与旧 Playwright 工具一致，仅列表为空），但**记录本身保留**并标记 `[sent]`（`bt_list_records` 仍可读取，截图也可通过 `bt_read_record_content` 取到）。投递为**推送式**：shell 发送后主动通知插件（`POST /notify`），插件收到即拉取并推送到对话（无轮询、无 2s 延迟）
 - 批注和截图**必须填写说明**才能保存/发送，否则弹出提示
 
 面板「配置」区：外观主题（跟随系统/浅色/深色）、设备预设下拉（等价 `bt_set_device`）、开发者工具按钮（等价 `bt_devtools`）。

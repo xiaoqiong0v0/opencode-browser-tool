@@ -96,8 +96,10 @@ pub struct UiState {
     pub annotate_mode: Mutex<bool>,
     /// 批注记录
     pub records: Mutex<Vec<AnnotationRecord>>,
-    /// 待发送记录队列(面板点击"发送全部"后,插件端轮询消费)
+    /// 待发送记录队列(面板点击"发送全部"后,插件侧消费)
     pub sent_records: Mutex<Vec<serde_json::Value>>,
+    /// 插件通知地址(推送式投递:send 后 POST 它触发插件立即 drain;来自 --notify-url / BT_SHELL_NOTIFY_URL / /api/notify-url)
+    pub notify_url: Mutex<Option<String>>,
     /// 开发者工具开关(wry 的 is_devtools_open 在 webview2 上恒 false,需自行维护)
     pub devtools_open: Mutex<bool>,
     /// HTTP 服务端口(面板 invoke 获取后 fetch /api/*)
@@ -130,6 +132,7 @@ impl UiState {
             annotate_mode: Mutex::new(false),
             records: Mutex::new(Vec::new()),
             sent_records: Mutex::new(Vec::new()),
+            notify_url: Mutex::new(None),
             devtools_open: Mutex::new(false),
             service_port: Mutex::new(0),
             panel_open: Mutex::new(false),
@@ -1047,7 +1050,41 @@ pub fn close_panel(app: &AppHandle) {
     emit_tabs_changed(app);
 }
 
-/// 发送未发送过的记录:快照入 sent_records 队列(插件端轮询 consume),并把记录标记为已发送
+/// 主动通知插件"有新记录待 drain"(推送式投递,替代插件轮询)。
+/// fire-and-forget:短超时(2s)、最多重试 2 次;仅传最小信息(count),大内容仍由插件走 drain 拉取。
+fn notify_plugin(app: &AppHandle, count: usize) {
+    let url = app.state::<UiState>().notify_url.lock().unwrap().clone();
+    let Some(url) = url else {
+        eprintln!("[notify] skipped: notify-url not configured");
+        return;
+    };
+    tauri::async_runtime::spawn(async move {
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[notify] client build failed: {e}");
+                return;
+            }
+        };
+        for attempt in 1..=2 {
+            match client.post(&url).json(&serde_json::json!({ "count": count })).send().await {
+                Ok(r) if r.status().is_success() => {
+                    eprintln!("[notify] posted count={count} -> {url} (attempt {attempt})");
+                    return;
+                }
+                Ok(r) => eprintln!("[notify] HTTP {} -> {url} (attempt {attempt})", r.status()),
+                Err(e) => eprintln!("[notify] post failed -> {url} (attempt {attempt}): {e}"),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        eprintln!("[notify] giving up after 2 attempts: {url}");
+    });
+}
+
+/// 发送未发送过的记录:快照入 sent_records 队列(插件侧 drain 消费),并把记录标记为已发送
 /// **不再清空 records** —— 发送后 list_records / read_record_content 仍可读到内容(含截图图片)
 /// 面板"发送"、批注/截图"发送"按钮共用;返回本次新发送的条数
 pub fn send_all_records(app: &AppHandle) -> usize {
@@ -1090,6 +1127,10 @@ pub fn send_all_records(app: &AppHandle) -> usize {
     }
     // 清空覆盖层批注/截图标记
     let _ = eval_overlay(app, "window.__btOverlay._marks = []; window.__btOverlay.redraw([], [])");
+    // 主动通知插件(推送式):仅传最小 count,插件收到后立即 drain 拉取内容
+    if count > 0 {
+        notify_plugin(app, count);
+    }
     count
 }
 

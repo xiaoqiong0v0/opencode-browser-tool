@@ -3,6 +3,7 @@ import { resolve, dirname } from "path";
 import { existsSync } from "fs";
 import { fileURLToPath } from "url";
 import { log } from "./logger.js";
+import { getNotifyUrl } from "./notify-server.js";
 
 import { cachedBinaryPath, describeBinaryStatus, ensureBinary } from "./binary.js";
 
@@ -94,6 +95,14 @@ export function setUserDataDir(dir: string): void {
   if (serviceConfig) serviceConfig.userDataDir = dir;
 }
 
+/** 服务就绪回调(插件注册:做一次初始 drain) */
+let serviceReadyHandler: (() => void) | null = null;
+
+/** 注册服务就绪回调(spawn/附着成功且注册 notify-url 之后调用一次) */
+export function setServiceReadyHandler(cb: () => void): void {
+  serviceReadyHandler = cb;
+}
+
 /** 懒启动服务:未启动则 spawn bt-shell(弹窗);已启动直接返回;并发时复用同一个 Promise */
 export async function ensureService(): Promise<void> {
   if (serviceReady) return;
@@ -105,16 +114,39 @@ export async function ensureService(): Promise<void> {
     starting = attachToService(attachUrl).finally(() => {
       starting = null;
     });
-    return starting;
+  } else {
+    // 启动模式:懒启动本地 shell
+    const cfg = serviceConfig;
+    if (!cfg) throw new Error("Service not configured");
+    starting = startService(cfg.nodePath, cfg.browsersPath, cfg.sessionIsolation, cfg.browserType, cfg.userDataDir).finally(() => {
+      starting = null;
+    });
   }
+  await starting;
+  // 服务就绪:把插件通知地址注册给 shell(推送式投递;附着模式同样走这里)
+  await registerNotifyUrl();
+  try {
+    serviceReadyHandler?.();
+  } catch (e) {
+    log.error("[notify] service-ready handler failed", e as Error);
+  }
+}
 
-  // 启动模式:懒启动本地 shell
-  const cfg = serviceConfig;
-  if (!cfg) throw new Error("Service not configured");
-  starting = startService(cfg.nodePath, cfg.browsersPath, cfg.sessionIsolation, cfg.browserType, cfg.userDataDir).finally(() => {
-    starting = null;
-  });
-  return starting;
+/** 把插件通知地址注册给 shell(/api/notify-url);直接 fetch,避免 callApi 触发 ensureService 递归 */
+async function registerNotifyUrl(): Promise<void> {
+  const url = getNotifyUrl();
+  if (!url || !serviceBaseUrl) return;
+  try {
+    const res = await fetch(`${serviceBaseUrl}/api/notify-url`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url }),
+    });
+    if (res.ok) log.info(`[notify] notify-url registered: ${url}`);
+    else log.error(`[notify] register failed: HTTP ${res.status}`);
+  } catch (e) {
+    log.error("[notify] register failed", e as Error);
+  }
 }
 
 async function callApi(path: string, body?: any, sessionId?: string): Promise<any> {
@@ -193,6 +225,9 @@ export async function startService(
   if (sessionIsolation) args.push("--session-isolation");
   // 多用户配置:userDataDir 指向独立 WebView2 用户数据目录
   if (userDataDir) args.push("--user-data-dir", userDataDir);
+  // 推送式投递:把插件本地通知地址传给 shell(亦可用 BT_SHELL_NOTIFY_URL;附着模式用 /api/notify-url 注册)
+  const notifyUrl = getNotifyUrl();
+  if (notifyUrl) args.push("--notify-url", notifyUrl);
   serviceProcess = spawn(shell, args, { stdio: ["ignore", "pipe", "pipe"] });
   // 把 shell 的 stdout/stderr 转发进共享日志:Rust 侧 println!/eprintln! 默认被管道吞掉(无人读取 → 日志永远看不到)
   const forwardShell = (tag: string) => (chunk: Buffer) => {

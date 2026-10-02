@@ -2,6 +2,8 @@
 //! 单窗口:页面 Webview + 覆盖层 Webview + 面板 Webview
 //! 启动参数兼容旧协议:--browsers-path, --browser, --session-isolation, --port
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// MSVC link.exe 会把"正在创建库 .lib/.exp"打到 stdout,cargo 以 linker_messages 警告呈现——非代码问题,屏蔽以保持 0 警告
+#![allow(linker_messages)]
 
 use std::sync::Arc;
 
@@ -11,11 +13,13 @@ use bt_shell::ui::{self, AnnotationRecord};
 use tauri::{Listener, Manager, State};
 
 /// 解析命令行参数(兼容旧 Node 服务协议)
-fn parse_args() -> (String, u16, Option<String>) {
+fn parse_args() -> (String, u16, Option<String>, Option<String>) {
     let args: Vec<String> = std::env::args().collect();
     let mut browsers_path = String::new();
     let mut port: u16 = 0;
     let mut user_data_dir: Option<String> = None;
+    // 通知地址:环境变量兜底(附着模式下插件通过 /api/notify-url 注册)
+    let mut notify_url: Option<String> = std::env::var("BT_SHELL_NOTIFY_URL").ok();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -37,11 +41,17 @@ fn parse_args() -> (String, u16, Option<String>) {
                     user_data_dir = Some(args[i].clone());
                 }
             }
+            "--notify-url" => {
+                i += 1;
+                if i < args.len() {
+                    notify_url = Some(args[i].clone());
+                }
+            }
             _ => {}
         }
         i += 1;
     }
-    (browsers_path, port, user_data_dir)
+    (browsers_path, port, user_data_dir, notify_url)
 }
 
 /// 面板拉取批注记录
@@ -344,7 +354,7 @@ fn main() {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
 
-    let (browsers_path, port, user_data_dir) = parse_args();
+    let (browsers_path, port, user_data_dir, notify_url) = parse_args();
 
     tauri::Builder::default()
         .manage(ui::UiState::new())
@@ -379,6 +389,10 @@ fn main() {
             {
                 let state = app.state::<ui::UiState>();
                 *state.service_port.lock().unwrap() = port;
+                // 推送式投递:记录插件通知地址(来自 --notify-url / BT_SHELL_NOTIFY_URL;可被 /api/notify-url 覆盖)
+                if notify_url.is_some() {
+                    *state.notify_url.lock().unwrap() = notify_url.clone();
+                }
             }
 
             // 启动 HTTP 服务(端口由 --port 指定,默认 0 随机)
