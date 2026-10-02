@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>浏览器输入 / 交互测试页（bt-shell 手动验证）</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20rx='3'%20fill='%231971c2'/%3E%3C/svg%3E">
+<style>
+  body { font-family: "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; margin: 16px; color: #222; }
+  h1 { font-size: 22px; margin: 0 0 8px; }
+  h2 { font-size: 15px; margin: 18px 0 6px; color: #444; }
+  #usage { font-size: 13px; background: #f1f3f5; border: 1px solid #dee2e6; padding: 8px 10px; border-radius: 6px; }
+  #status { font-size: 20px; font-weight: bold; padding: 12px 14px; margin: 10px 0; border-radius: 8px;
+            background: #e9ecef; border: 2px solid #868e96; font-family: Consolas, monospace; }
+  #status.idle { background: #e9ecef; color: #495057; }
+  #status.trusted { background: #d3f9d8; color: #2b8a3e; border-color: #2b8a3e; }
+  #status.untrusted { background: #ffe3e3; color: #c92a2a; border-color: #c92a2a; }
+  fieldset { border: 1px solid #adb5bd; border-radius: 6px; margin: 10px 0; padding: 10px; }
+  legend { font-size: 13px; font-weight: bold; color: #495057; }
+  label { font-size: 14px; }
+  input, select, button, textarea, a { font-size: 14px; margin: 4px 6px 4px 0; }
+  #text { width: 260px; padding: 4px; }
+  #vp { font-family: Consolas, monospace; font-size: 14px; background: #fff3bf; border: 1px solid #fab005;
+        padding: 4px 8px; border-radius: 4px; display: inline-block; }
+  #scroller { height: 220px; overflow-y: auto; border: 1px solid #868e96; border-radius: 6px;
+              padding: 8px 10px; background: #fafafa; }
+  #scroller p { margin: 6px 0; font-size: 13px; color: #555; }
+  #scroller .mark { font-weight: bold; color: #1971c2; }
+  #log { height: 200px; overflow-y: auto; background: #101113; color: #ced4da; font-family: Consolas, monospace;
+         font-size: 12px; padding: 8px; border-radius: 6px; }
+  #log .ln { white-space: pre-wrap; }
+  #log .ln.tr { color: #8ce99a; }
+  #log .ln.un { color: #ffd43b; }
+  #dump { width: 100%; box-sizing: border-box; font-family: Consolas, monospace; font-size: 12px; }
+  .hint { font-size: 12px; color: #868e96; }
+</style>
+</head>
+<body>
+<h1>浏览器输入 / 交互测试页</h1>
+<p id="usage">
+  用法：① 执行按键 / 输入命令后看下方大号状态条——显示<b>最后一个事件</b>的类型、key、code、isTrusted 与总条数；
+  <b>isTrusted=false</b> 表示合成事件（自动化工具派发，红底），true 表示真实用户操作（绿底）。
+  ② 状态条若停留在「尚未收到任何事件」、或只有 click 而没有 key 事件 → 按键没有到达页面。
+  ③ 「清空日志」按钮重置状态条、日志面板、window.__events 与 #dump。
+</p>
+
+<div id="status" class="idle">尚未收到任何事件</div>
+
+<h2>表单区</h2>
+<fieldset>
+  <legend>被拦截的表单 #f（submit 里 preventDefault，只记录事件、不跳转）</legend>
+  <form id="f">
+    <label for="text">#text 文本输入（在这里按 Enter，观察是否出现 submit 记录）：</label>
+    <input id="text" type="text">
+    <input type="submit" value="提交">
+  </form>
+</fieldset>
+<fieldset>
+  <legend>不被拦截的原生表单（验证真实提交：提交后页面刷新，URL 带 ?submitted=1，可用 evaluate 查 location.search）</legend>
+  <form action="?submitted=1" method="get">
+    <input type="submit" value="真实提交">
+  </form>
+</fieldset>
+
+<h2>其他控件</h2>
+<fieldset>
+  <legend>select / checkbox / radio / 按钮 / 链接</legend>
+  <select id="sel">
+    <option value="o1">选项一</option>
+    <option value="o2">选项二</option>
+    <option value="o3">选项三</option>
+  </select>
+  <label><input type="checkbox" id="cb"> 复选框 #cb</label><br>
+  <label><input type="radio" name="rg" value="r1"> 单选 A</label>
+  <label><input type="radio" name="rg" value="r2"> 单选 B</label><br>
+  <button id="counterBtn" type="button">按钮点击次数：0</button>
+  <a href="#link-ok" id="lk">锚点链接（点击只改 hash，不跳走）</a>
+</fieldset>
+
+<h2>滚动与视口</h2>
+<div id="vp">视口：初始化中…</div>
+<div id="scroller" tabindex="0"><!-- 长内容由 JS 生成，顶端/底部有标记 --></div>
+
+<h2>对照按钮</h2>
+<button id="synthBtn" type="button">派发合成事件（untrusted）</button>
+<button id="clearBtn" type="button">清空日志</button>
+<span class="hint">「派发合成事件」对 #text 直接 dispatchEvent 一个 keydown(key=a)，用于对照 isTrusted=false</span>
+
+<h2>事件日志（#log，自动滚到底；绿色=trusted，黄色=untrusted）</h2>
+<div id="log"></div>
+
+<h2>纯文本导出（#dump，供 evaluate 读取 .value）</h2>
+<textarea id="dump" rows="8" readonly spellcheck="false"></textarea>
+
+<script>
+'use strict';
+
+// ===== 全局状态 =====
+/** 事件记录数组，供 evaluate 直接统计，如 ({n:__events.length, trusted:...}) */
+window.__events = [];
+var seq = 0;
+
+var STATUS = document.getElementById('status');
+var LOG = document.getElementById('log');
+var DUMP = document.getElementById('dump');
+var EVENTS = window.__events;
+
+// ===== 公共函数 =====
+
+/**
+ * 记录一条事件：写入 __events、console.log([EVT] 前缀)、#log 面板、#dump 文本，并刷新状态条。
+ * @param {Event} e 浏览器事件对象
+ */
+function handleEvent(e) {
+  var el = e.target;
+  var isFormField = el && /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName);
+  var rec = {
+    t: Date.now(),
+    type: e.type,
+    key: (typeof e.key === 'string') ? e.key : null,
+    code: (typeof e.code === 'string') ? e.code : null,
+    isTrusted: !!e.isTrusted,
+    value: (isFormField && typeof el.value === 'string') ? el.value : null,
+    target: targetName(el)
+  };
+  EVENTS.push(rec);
+  console.log('[EVT] ' + JSON.stringify({
+    t: rec.t, type: rec.type, key: rec.key, code: rec.code,
+    isTrusted: rec.isTrusted, value: rec.value, target: rec.target
+  }));
+  seq += 1;
+
+  updateStatus(rec);
+  appendLog(rec);
+}
+
+/** 清空全部日志出口：#log、#dump、window.__events、状态条与序号 */
+function clearLogs() {
+  EVENTS.length = 0; // 保持 window.__events 引用不变，只清空内容
+  seq = 0;
+  LOG.innerHTML = '';
+  DUMP.value = '';
+  STATUS.textContent = '尚未收到任何事件';
+  STATUS.className = 'idle';
+}
+
+// ===== 私有函数 =====
+
+/** 元素的可读标识：优先 #id，其次 标签名(+name) */
+function targetName(el) {
+  if (!el || !el.tagName) { return String(el); }
+  if (el.id) { return '#' + el.id; }
+  var name = el.getAttribute && el.getAttribute('name');
+  return el.tagName.toLowerCase() + (name ? '[' + name + ']' : '');
+}
+
+/** 刷新顶部大号状态条：类型 / key / code / isTrusted / 总条数 */
+function updateStatus(rec) {
+  STATUS.textContent = rec.type +
+    ' │ key=' + (rec.key === null ? '-' : rec.key) +
+    ' │ code=' + (rec.code === null ? '-' : rec.code) +
+    ' │ isTrusted=' + rec.isTrusted +
+    ' │ 共 ' + EVENTS.length + ' 条';
+  STATUS.className = rec.isTrusted ? 'trusted' : 'untrusted';
+}
+
+/** 追加一行到 #log（带序号与时间戳）并同步 #dump，自动滚到底 */
+function appendLog(rec) {
+  var d = new Date(rec.t);
+  var pad = function (n, w) { return String(n).padStart(w, '0'); };
+  var text = '#' + pad(seq, 4) + ' ' +
+    pad(d.getHours(), 2) + ':' + pad(d.getMinutes(), 2) + ':' + pad(d.getSeconds(), 2) +
+    '.' + pad(d.getMilliseconds(), 3) + '  ' +
+    rec.type + ' key=' + (rec.key === null ? '-' : rec.key) +
+    ' code=' + (rec.code === null ? '-' : rec.code) +
+    ' trusted=' + rec.isTrusted +
+    ' target=' + rec.target +
+    (rec.value === null ? '' : ' value=' + JSON.stringify(rec.value));
+  var line = document.createElement('div');
+  line.className = 'ln ' + (rec.isTrusted ? 'tr' : 'un');
+  line.textContent = text;
+  LOG.appendChild(line);
+  LOG.scrollTop = LOG.scrollHeight;
+  DUMP.value += text + '\n';
+}
+
+// ===== 事件监听：document 捕获阶段统一收（focus/blur 不冒泡，必须捕获） =====
+['keydown', 'keyup', 'keypress', 'beforeinput', 'input', 'change',
+ 'submit', 'click', 'focus', 'blur'].forEach(function (tp) {
+  document.addEventListener(tp, handleEvent, true);
+});
+
+// 被拦截的表单 #f：阻止真实提交（记录由上面的全局捕获完成，避免重复日志）
+document.getElementById('f').addEventListener('submit', function (e) {
+  e.preventDefault();
+});
+
+// ===== 对照按钮 =====
+document.getElementById('synthBtn').addEventListener('click', function () {
+  var el = document.getElementById('text');
+  el.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', bubbles: true }));
+});
+document.getElementById('clearBtn').addEventListener('click', clearLogs);
+
+// ===== 按钮点击计数 =====
+var clickCount = 0;
+document.getElementById('counterBtn').addEventListener('click', function () {
+  clickCount += 1;
+  this.textContent = '按钮点击次数：' + clickCount;
+});
+
+// ===== 视口尺寸实时显示 =====
+function updateVp() {
+  document.getElementById('vp').textContent =
+    '视口：' + window.innerWidth + ' × ' + window.innerHeight + ' px';
+}
+window.addEventListener('resize', updateVp);
+updateVp();
+
+// ===== 可滚动长内容（高度固定 220px，内容由 JS 生成，顶端/底部有标记） =====
+(function buildScroller() {
+  var html = '<div class="mark" id="sc-top">▲ 滚动的顶端（scroll 到最底时这里应不可见）</div>';
+  for (var i = 1; i <= 40; i++) {
+    html += '<p>第 ' + i + ' 段：这是用于 scroll 测试的占位长内容，行内容 ' +
+      '填充填充填充填充填充填充填充填充填充填充。</p>';
+  }
+  html += '<div class="mark" id="sc-bottom">▼ 滚动的底部（能看见我说明已滚到底）</div>';
+  document.getElementById('scroller').innerHTML = html;
+})();
+</script>
+</body>
+</html>
