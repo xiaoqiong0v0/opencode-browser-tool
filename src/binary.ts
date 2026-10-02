@@ -36,6 +36,7 @@ import {
 import { dirname, resolve } from "path";
 import { fileURLToPath, pathToFileURL } from "url";
 import { getPluginDataDir } from "./config/index.js";
+import { log } from "./logger.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -346,7 +347,7 @@ function migrateLegacyDirs(info: PlatformInfo, finalPath: string, expected: stri
     .map((e) => resolve(dataDir, e.name));
   if (legacyDirs.length === 0) return;
 
-  console.log(`[bt-shell][migrate] dry-run 旧版本目录清单: ${legacyDirs.join(", ")}`);
+  log.info(`[bt-shell][migrate] dry-run 旧版本目录清单: ${legacyDirs.join(", ")}`);
 
   const newValid = existsSync(finalPath) && sha256File(finalPath) === expected;
   if (!newValid) {
@@ -356,7 +357,7 @@ function migrateLegacyDirs(info: PlatformInfo, finalPath: string, expected: stri
         if (existsSync(cand) && sha256File(cand) === expected) {
           mkdirSync(dirname(finalPath), { recursive: true });
           renameSync(cand, finalPath); // 同盘 rename
-          console.log(`[bt-shell][migrate] moved ${cand} -> ${finalPath}`);
+          log.info(`[bt-shell][migrate] moved ${cand} -> ${finalPath}`);
           break;
         }
       } catch {
@@ -364,15 +365,15 @@ function migrateLegacyDirs(info: PlatformInfo, finalPath: string, expected: stri
       }
     }
   } else {
-    console.log(`[bt-shell][migrate] 新路径已有合法文件,保留 ${finalPath}`);
+    log.info(`[bt-shell][migrate] 新路径已有合法文件,保留 ${finalPath}`);
   }
 
   for (const dir of legacyDirs) {
     try {
       rmSync(dir, { recursive: true, force: true });
-      console.log(`[bt-shell][migrate] removed ${dir}`);
+      log.info(`[bt-shell][migrate] removed ${dir}`);
     } catch (e) {
-      console.log(`[bt-shell][migrate] remove failed ${dir}: ${errMsg(e)}`);
+      log.error(`[bt-shell][migrate] remove failed ${dir}: ${errMsg(e)}`);
     }
   }
 
@@ -411,9 +412,9 @@ function ensureSidecar(
       sourceUrl,
     };
     writeFileSync(sidecarPath, JSON.stringify(version, null, 2), "utf-8");
-    console.log(`[bt-shell] 写入版本旁文件 ${sidecarPath}${extra ? ` (${extra})` : ""}`);
+    log.info(`[bt-shell] 写入版本旁文件 ${sidecarPath}${extra ? ` (${extra})` : ""}`);
   } catch (e) {
-    console.log(`[bt-shell] 写入版本旁文件失败: ${errMsg(e)}`);
+    log.error(`[bt-shell] 写入版本旁文件失败: ${errMsg(e)}`);
   }
 }
 
