@@ -30,6 +30,8 @@ sha256 校验（**幂等**：sha 与当前 release 期望值一致即跳过；**
 - 其它平台：暂不提供预编译，请用 `BT_SHELL_PATH` 指定自行构建的二进制
 
 > 代理：下载优先调用系统 `curl`（自动遵循 `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY`）；无 curl 时回退 Node `fetch`。
+>
+> **本地开发/调试**：插件优先使用本地 Rust 构建（按 opencode 传入的目录定位 `rust/target/release`，也支持 `CARGO_TARGET_DIR`、源码树的 `<install>/../rust/...` 与 `BT_SHELL_PATH`）；选中的路径与来源会写进日志 `Shell binary: <path> (source=local-dev|env|cargo-target-dir|download-cache)`；找不到时自动回落下载缓存（普通用户不受影响）。
 
 ## 版本与产物策略
 
@@ -186,7 +188,7 @@ opencode（Bun）
 - **批注模式** — 悬停高亮元素（覆盖层自绘），点击元素弹出输入框填写说明；引擎层拦截，弹框/下拉类元素不失焦
 - **截图模式** — 点击立即截全屏；也可进入截图模式后拖动框选区域（选区可拖拽手柄调整大小），保存时可按需裁剪（遮罩式选区，默认整图，双击还原）
 - **记录列表** — 面板「AI 功能」区：批注/截图记录卡片（截图带缩略图），显示所属标签 URL 与说明
-- **发送** — 面板底部「发送」按钮：所有记录（批注文字 + 截图图片）推送到 opencode 对话，发送后清空列表
+- **发送** — 面板底部「发送」按钮：所有记录（批注文字 + 截图图片）推送到 opencode 对话；发送后**面板列表清空**（与旧 Playwright 工具一致，仅列表为空），但**记录本身保留**并标记 `[sent]`（`bt_list_records` 仍可读取，截图也可通过 `bt_read_record_content` 取到）
 - 批注和截图**必须填写说明**才能保存/发送，否则弹出提示
 
 面板「配置」区：外观主题（跟随系统/浅色/深色）、设备预设下拉（等价 `bt_set_device`）、开发者工具按钮（等价 `bt_devtools`）。
@@ -224,6 +226,15 @@ npm install
 cd rust && cargo build
 npm run build
 ```
+
+## 日志
+
+插件侧统一使用公共包 `@xiaoqiong0v0/opencode-plugin-logger`，项目内由 `src/logger.ts` 导出共用实例。日志写入
+`~/.opencode/plugins-log/YYYYMMDD.log`，行格式 `[时间] [级别] browser-tool <内容>`；需在
+`~/.config/opencode/plugin-logger.jsonc` 设 `"enabled": true`（默认关闭）。
+
+> **插件侧禁止用 `console.*` 往 stdout/stderr 打日志**——那会污染 opencode TUI。`src/**` 内的 `console.*` 仅允许出现在独立 CLI 的 `isMain` 守卫内（`node dist/binary.js` 直接运行时）。
+> Rust 侧（`bt-shell`）的 `println!`/`eprintln!` 默认会被 spawn 管道吞掉、不可见；插件在启动 shell 时把其 stdout/stderr **转发进 logger**，因此 Rust 日志同样能在上述文件中看到。
 
 ## 文档
 

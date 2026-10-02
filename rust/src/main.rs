@@ -47,7 +47,8 @@ fn parse_args() -> (String, u16, Option<String>) {
 /// 面板拉取批注记录
 #[tauri::command]
 fn panel_records(state: State<ui::UiState>) -> Vec<AnnotationRecord> {
-    state.records.lock().unwrap().clone()
+    // 面板列表只显示"未发送"记录(与参考实现一致:发送后列表清空;记录本身保留供工具读取)
+    state.records.lock().unwrap().iter().filter(|r| !r.sent).cloned().collect()
 }
 
 /// 更新批注说明(面板输入框 → Rust)

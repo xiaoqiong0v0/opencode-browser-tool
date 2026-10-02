@@ -9,7 +9,7 @@ import {
 import { registerLocale, t } from "./i18n/index.js";
 import en from "./i18n/en.js";
 import zh from "./i18n/zh.js";
-import { configureService, setUserDataDir, ensureService, openWindow, isRunning, stopService, service, probeStatus } from "./client.js";
+import { configureService, setUserDataDir, setAppDirectory, ensureService, openWindow, isRunning, stopService, service, probeStatus } from "./client.js";
 import { startDownload, getBinaryStatus, describeBinaryStatus } from "./binary.js";
 import { tool, type Plugin } from "@opencode-ai/plugin";
 import { log } from "./logger.js";
@@ -234,6 +234,8 @@ function splitCsvLine(line: string): string[] {
 export const opencodeBrowserTool: Plugin = async ({ client, worktree, directory, serverUrl }) => {
   // 插件上下文(仅用于诊断:定位 session.list() 为空时是哪个实例/目录)
   pluginCtx = { directory: directory || "", worktree: worktree || "", serverUrl: serverUrl ? String(serverUrl) : "" };
+  // 供 resolveShellBinary 定位本地 Rust 构建(publish-local 到缓存目录后仍能找到仓库)
+  setAppDirectory(directory || "");
   registerLocale("en", en);
   registerLocale("zh", zh);
   loadConfig(worktree);
@@ -325,6 +327,7 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree, directory,
               }
               // 透传会话 ID(会话隔离用),并刷新钩子缓存(兜底:即使钩子未触发也能拿到 sid)
               sessionCache.updateFromHookInput(context);
+              setAppDirectory(context?.directory || "");
               params._sessionId = context?.sessionID || "";
               try {
                 return await def.run(params);
@@ -341,6 +344,7 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree, directory,
             },
             async execute(a: any, context: any) {
               sessionCache.updateFromHookInput(context);
+              setAppDirectory(context?.directory || "");
               const r = await service.mediaMode({ ...a, _sessionId: context?.sessionID || "" });
               return `Media mode: ${r.mode}`;
             },

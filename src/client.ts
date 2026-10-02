@@ -13,29 +13,55 @@ const READY_TIMEOUT_MS = 20000;
 /** 就绪轮询间隔(ms) */
 const READY_POLL_INTERVAL_MS = 300;
 
-// Rust 二进制查找:优先级 BT_SHELL_PATH → 本地开发构建 → 下载缓存(binary.ts)
-function resolveShellBinary(): string {
+/** 二进制来源(用于日志一眼判断用的是哪份) */
+type ShellSource = "env" | "local-dev" | "cargo-target-dir" | "download-cache";
+
+/** opencode 应用/项目目录(插件初始化与工具上下文提供);用于定位本地 Rust 开发构建 */
+let appDirectory = "";
+
+/** 记录 opencode 目录(插件初始化 / 工具调用时调用) */
+export function setAppDirectory(dir: string): void {
+  if (dir) appDirectory = dir;
+}
+
+// Rust 二进制查找:优先级 BT_SHELL_PATH → 本地开发构建(含 opencode 应用目录)→ 下载缓存(binary.ts)
+// 注意:用 `.tmp/publish-local.ps1` 覆盖到 ~/.cache/opencode/packages/... 后,插件 dist 的相对路径
+// (`<install>/../rust/...`)已指向缓存目录而非仓库 → 必须借助 opencode 传入的 directory 定位本地构建。
+// 导出仅供自验/单测直接调用。
+export function resolveShellBinary(): { path: string; source: ShellSource } {
   const platform = process.platform === "win32" ? "win-x64" : "linux-x64";
   const bin = process.platform === "win32" ? "bt-shell.exe" : "bt-shell";
   // 1) 显式指定:最优先(即使文件暂不存在也返回,由 startService 给出明确错误)
   const envPath = process.env.BT_SHELL_PATH;
-  if (envPath) return envPath;
-  // 2) 本地开发构建(保持开发者流程不变)
+  if (envPath) return { path: envPath, source: "env" };
   const cargoTargetDir = process.env.CARGO_TARGET_DIR;
-  const candidates = [
-    resolve(__dirname, "bin", `bt-shell-${platform}.exe`),
-    resolve(__dirname, "bin", `bt-shell-${platform}`),
-    resolve(__dirname, "..", "rust", "target", "release", bin),
-    resolve(__dirname, "..", "rust", "target", "debug", bin),
-    // 尊重自定义 target 目录(WSL 内用 CARGO_TARGET_DIR 构建时)
-    cargoTargetDir ? resolve(cargoTargetDir, "release", bin) : undefined,
-    cargoTargetDir ? resolve(cargoTargetDir, "debug", bin) : undefined,
-  ];
-  for (const c of candidates) {
-    if (c && existsSync(c)) return c;
+  // 2) 本地开发构建优先(开发者/源码树):含 opencode 应用目录的多种可能布局
+  const candidates: Array<[string | undefined, ShellSource]> = [];
+  if (appDirectory) {
+    candidates.push(
+      [resolve(appDirectory, "rust", "target", "release", bin), "local-dev"], // dir = 仓库根
+      [resolve(appDirectory, "target", "release", bin), "local-dev"], // dir = rust/
+      [resolve(appDirectory, "..", "rust", "target", "release", bin), "local-dev"], // dir = 仓库子目录
+      [resolve(appDirectory, "rust", "target", "debug", bin), "local-dev"],
+      [resolve(appDirectory, "target", "debug", bin), "local-dev"],
+      [resolve(appDirectory, "..", "rust", "target", "debug", bin), "local-dev"],
+    );
   }
-  // 3) 下载缓存(未下载时由 startService 先 ensureBinary)
-  return cachedBinaryPath();
+  candidates.push(
+    // 3) 源码树开发(插件直接从仓库 dist 加载时):<install>/../rust/...
+    [resolve(__dirname, "..", "rust", "target", "release", bin), "local-dev"],
+    [resolve(__dirname, "..", "rust", "target", "debug", bin), "local-dev"],
+    // 4) 自定义 CARGO_TARGET_DIR(WSL 内构建时)
+    [cargoTargetDir ? resolve(cargoTargetDir, "release", bin) : undefined, "cargo-target-dir"],
+    [cargoTargetDir ? resolve(cargoTargetDir, "debug", bin) : undefined, "cargo-target-dir"],
+    [resolve(__dirname, "bin", `bt-shell-${platform}.exe`), "local-dev"],
+    [resolve(__dirname, "bin", `bt-shell-${platform}`), "local-dev"],
+  );
+  for (const [p, source] of candidates) {
+    if (p && existsSync(p)) return { path: p, source };
+  }
+  // 5) 下载缓存(未下载时由 startService 先 ensureBinary)
+  return { path: cachedBinaryPath(), source: "download-cache" };
 }
 
 /** 解析附着模式目标地址:BT_SHELL_URL 优先,其次 BT_SHELL_PORT;均未设置返回 null */
@@ -145,7 +171,8 @@ export async function startService(
   userDataDir?: string,
 ): Promise<void> {
   attachMode = false;
-  let shell = resolveShellBinary();
+  const resolved = resolveShellBinary();
+  let shell = resolved.path;
   // 未就绪:先(有界)等待下载完成;失败/超时给出明确提示
   if (!existsSync(shell)) {
     if (process.env.BT_SHELL_PATH) {
@@ -157,6 +184,8 @@ export async function startService(
     }
     shell = st.path;
   }
+  // 记录最终选中的二进制与来源,便于一眼判断用的是哪份(local-dev / env / download-cache …)
+  log.info(`Shell binary: ${shell} (source=${resolved.source})`);
   // 显式指定端口(release 模式 GUI 程序无控制台,无法解析 stdout)
   const port = 18000 + Math.floor(Math.random() * 1000);
   const args = ["--browsers-path", browsersPath || "", "--port", String(port)];
