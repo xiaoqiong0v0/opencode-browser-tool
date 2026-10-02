@@ -8,8 +8,10 @@ pub mod accessibility;
 pub mod cdp;
 /// 拖拽(Windows:CDP 鼠标序列触发原生 HTML5 DnD)
 pub mod drag;
-/// 键盘注入(Windows:CDP 可信通道;其余平台未实现)
+/// 键盘注入(Windows:CDP 可信通道;非 Windows 明确报错)
 pub mod keyboard;
+/// 文本输入与下拉选择(Windows:CDP 可信通道;非 Windows 降级到 DOM/JS 并标注)
+pub mod input;
 /// 媒体权限放行(Windows/Linux:摄像头/麦克风统一放行,配合页面模拟脚本)
 #[cfg(any(windows, target_os = "linux"))]
 pub mod media;
@@ -28,6 +30,52 @@ use crate::ui;
 /// 页面操作错误
 pub type ControlResult<T> = Result<T, String>;
 
+/// 控制操作结果:附带"降级"说明
+/// - `degraded = None`:走可信/原生通道(Windows CDP)
+/// - `degraded = Some(reason)`:无可信通道,退回 untrusted DOM/JS 实现(须在返回里标注)
+#[derive(Debug, Clone)]
+pub struct Outcome<T> {
+    /// 操作本体(坐标 / 读回值等)
+    pub value: T,
+    /// 降级原因;None 表示可信/原生
+    pub degraded: Option<String>,
+}
+
+impl<T> Outcome<T> {
+    /// 可信/原生执行
+    pub fn trusted(value: T) -> Self {
+        Self { value, degraded: None }
+    }
+
+    /// 降级执行(untrusted DOM/JS 回退)
+    pub fn degraded(value: T) -> Self {
+        Self { value, degraded: Some(degrade_reason()) }
+    }
+
+    /// 降级执行并附自定义原因(如 Windows 上个别场景无适用可信路径)
+    pub fn degraded_with(value: T, reason: impl Into<String>) -> Self {
+        Self { value, degraded: Some(reason.into()) }
+    }
+}
+
+/// 统一降级原因文本(键 = degradedReason,插件据此追加 `(degraded: ...)`)
+pub fn degrade_reason() -> String {
+    format!("untrusted JS fallback on {}", std::env::consts::OS)
+}
+
+/// 调试开关:置 `BT_FORCE_DEGRADED=1` 时即使在 Windows 也强制走降级分支
+/// (用于在无 Linux 的环境下实测降级分支的代码路径与标注文本)
+pub fn force_degraded() -> bool {
+    std::env::var("BT_FORCE_DEGRADED")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// 是否可走可信通道:仅 Windows 且未被强制降级
+pub fn trusted_available() -> bool {
+    cfg!(windows) && !force_degraded()
+}
+
 /// 执行页面内 JS,返回解析后的值(对象/null/字符串等)
 pub fn eval(app: &AppHandle, js: &str) -> ControlResult<Value> {
     let raw = ui::eval_page(app, js)?;
@@ -45,29 +93,6 @@ pub fn navigate(app: &AppHandle, url: &str) -> ControlResult<()> {
 /// 执行任意 JS,返回结果(自动 JSON 序列化)
 pub fn evaluate(app: &AppHandle, script: &str) -> ControlResult<Value> {
     eval(app, &format!("(function(){{ return {script}; }})()"))
-}
-
-/// 填写输入框
-pub fn fill(app: &AppHandle, selector: &str, value: &str) -> ControlResult<()> {
-    let js = format!(
-        r#"(function(){{
-          const el = document.querySelector({sel:?});
-          if (!el) return {{error: "element not found"}};
-          const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-          const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
-          setter.call(el, {val:?});
-          el.dispatchEvent(new Event("input", {{bubbles:true}}));
-          el.dispatchEvent(new Event("change", {{bubbles:true}}));
-          return {{ok:true}};
-        }})()"#,
-        sel = selector,
-        val = value
-    );
-    let v = eval(app, &js)?;
-    if v.get("error").is_some() {
-        return Err(v["error"].as_str().unwrap_or("fill failed").to_string());
-    }
-    Ok(())
 }
 
 /// 获取可见文本

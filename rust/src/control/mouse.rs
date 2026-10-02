@@ -2,15 +2,17 @@
 //!
 //! Windows:CDP `Input.dispatchMouseEvent`(与真实鼠标一致,产生 isTrusted 事件、真实命中测试、
 //!   触发 CSS `:hover` 与元素默认行为)。公用发送函数 `mouse_event` 由点击/悬停/拖拽共用。
-//! Linux/其他:未实现,返回明确错误(旧 `el.click()` / 合成 MouseEvent 为 untrusted,不在本平台回退)
+//! 非 Windows(或 `BT_FORCE_DEGRADED=1`):降级到旧 `el.click()` / 合成 MouseEvent,返回标注 degraded。
 //!
-//! 命中校验:注入前用 `document.elementFromPoint` 在目标中心做命中测试;
+//! 命中校验(仅可信路径):注入前用 `document.elementFromPoint` 在目标中心做命中测试;
 //!   中心不在视口内、或被其它元素遮挡时返回明确错误,避免"点到了别处却报成功"。
 
 use tauri::AppHandle;
 
-use super::ControlResult;
+use super::{ControlResult, Outcome};
 
+#[cfg(windows)]
+use super::trusted_available;
 #[cfg(windows)]
 use serde_json::Value;
 
@@ -50,59 +52,132 @@ pub fn mouse_event(
     Ok(())
 }
 
-/// 可信点击元素中心(Windows):mouseMoved → mousePressed → mouseReleased
+/// 点击元素中心:Windows 可信路径;否则降级到 `el.click()`(untrusted,返回标注)
 ///
-/// 返回实际注入的视口坐标;中心出视口 / 被遮挡 / 元素不存在时返回 Err
-pub fn click(app: &AppHandle, selector: &str) -> ControlResult<Point> {
+/// 返回实际(或估算)的视口坐标;可信路径下中心出视口 / 被遮挡 / 元素不存在返回 Err
+pub fn click(app: &AppHandle, selector: &str) -> ControlResult<Outcome<Point>> {
     #[cfg(windows)]
-    {
-        click_at(app, None, selector)
+    if trusted_available() {
+        return Ok(Outcome::trusted(click_at(app, None, selector)?));
     }
-    #[cfg(not(windows))]
-    {
-        let _ = (app, selector);
-        Err("click: trusted mouse injection is not implemented on this platform yet \
-             (Windows via CDP Input.dispatchMouseEvent; Linux/WebKitGTK unverified)"
-            .into())
-    }
+    Ok(Outcome::degraded(click_fallback(app, selector)?))
 }
 
-/// 可信悬停元素中心(Windows):仅 mouseMoved(真实移动即触发 CSS `:hover`)
-pub fn hover(app: &AppHandle, selector: &str) -> ControlResult<Point> {
+/// 悬停元素中心:Windows 可信 mouseMoved(触发 CSS `:hover`);否则降级到合成 mouseover/mouseenter
+pub fn hover(app: &AppHandle, selector: &str) -> ControlResult<Outcome<Point>> {
     #[cfg(windows)]
-    {
+    if trusted_available() {
         let p = resolve_point(app, None, selector)?;
         ensure_reachable(&p, selector)?;
         mouse_event(app, "mouseMoved", p.x, p.y, "none", 0, 0)?;
-        Ok(Point { x: p.x, y: p.y })
+        return Ok(Outcome::trusted(Point { x: p.x, y: p.y }));
     }
-    #[cfg(not(windows))]
-    {
-        let _ = (app, selector);
-        Err("hover: trusted mouse injection is not implemented on this platform yet \
-             (Windows via CDP Input.dispatchMouseEvent; Linux/WebKitGTK unverified)"
-            .into())
-    }
+    Ok(Outcome::degraded(hover_fallback(app, selector)?))
 }
 
-/// 可信点击 iframe 内元素中心(Windows):iframe 内容坐标换算到顶层视口后点击
-///
-/// 跨域 iframe(`contentDocument` 为 null)返回明确错误,不静默点到别处
+/// 点击 iframe 内元素:Windows 把内容坐标换算到顶层视口后走可信鼠标序列;否则降级到 `el.click()`
 pub fn click_in_iframe(
     app: &AppHandle,
     iframe_selector: &str,
     selector: &str,
-) -> ControlResult<Point> {
+) -> ControlResult<Outcome<Point>> {
     #[cfg(windows)]
-    {
-        click_at(app, Some(iframe_selector), selector)
+    if trusted_available() {
+        return Ok(Outcome::trusted(click_at(
+            app,
+            Some(iframe_selector),
+            selector,
+        )?));
     }
-    #[cfg(not(windows))]
-    {
-        let _ = (app, iframe_selector, selector);
-        Err("iframe_click: trusted mouse injection is not implemented on this platform yet \
-             (Windows via CDP Input.dispatchMouseEvent; Linux/WebKitGTK unverified)"
-            .into())
+    Ok(Outcome::degraded(click_in_iframe_fallback(
+        app,
+        iframe_selector,
+        selector,
+    )?))
+}
+
+// ---- 降级实现(所有平台编译,Windows 强制降级时可实测) ----
+
+/// 降级点击:旧 `el.click()`(untrusted),并返回元素中心坐标
+fn click_fallback(app: &AppHandle, selector: &str) -> ControlResult<Point> {
+    let js = format!(
+        r#"(function(){{
+          var el = document.querySelector({sel:?});
+          if (!el) return {{error: "element not found"}};
+          if (el.scrollIntoView) el.scrollIntoView({{block: "center"}});
+          el.click();
+          var r = el.getBoundingClientRect();
+          return {{ok:true, x: r.left + r.width / 2, y: r.top + r.height / 2}};
+        }})()"#,
+        sel = selector
+    );
+    let v = super::eval(app, &js)?;
+    error_to_err(&v)?;
+    Ok(point_from(&v))
+}
+
+/// 降级悬停:合成 mouseover/mouseenter(untrusted)
+fn hover_fallback(app: &AppHandle, selector: &str) -> ControlResult<Point> {
+    let js = format!(
+        r#"(function(){{
+          var el = document.querySelector({sel:?});
+          if (!el) return {{error: "element not found"}};
+          el.dispatchEvent(new MouseEvent("mouseover", {{bubbles:true}}));
+          el.dispatchEvent(new MouseEvent("mouseenter", {{bubbles:true}}));
+          var r = el.getBoundingClientRect();
+          return {{ok:true, x: r.left + r.width / 2, y: r.top + r.height / 2}};
+        }})()"#,
+        sel = selector
+    );
+    let v = super::eval(app, &js)?;
+    error_to_err(&v)?;
+    Ok(point_from(&v))
+}
+
+/// 降级 iframe 点击:同源 iframe 内 `el.click()`(untrusted),坐标含 iframe 偏移
+fn click_in_iframe_fallback(
+    app: &AppHandle,
+    iframe_selector: &str,
+    selector: &str,
+) -> ControlResult<Point> {
+    let js = format!(
+        r#"(function(){{
+          var f = document.querySelector({iframe:?});
+          if (!f) return {{error: "iframe not found"}};
+          var d = f.contentDocument;
+          if (!d) return {{error: "cross-origin iframe not accessible"}};
+          var el = d.querySelector({sel:?});
+          if (!el) return {{error: "element not found"}};
+          if (el.scrollIntoView) el.scrollIntoView({{block: "center"}});
+          el.click();
+          var cs = getComputedStyle(f);
+          var fr = f.getBoundingClientRect();
+          var r = el.getBoundingClientRect();
+          var offX = fr.left + (parseFloat(cs.borderLeftWidth) || 0) + (parseFloat(cs.paddingLeft) || 0);
+          var offY = fr.top + (parseFloat(cs.borderTopWidth) || 0) + (parseFloat(cs.paddingTop) || 0);
+          return {{ok:true, x: offX + r.left + r.width / 2, y: offY + r.top + r.height / 2}};
+        }})()"#,
+        iframe = iframe_selector,
+        sel = selector
+    );
+    let v = super::eval(app, &js)?;
+    error_to_err(&v)?;
+    Ok(point_from(&v))
+}
+
+/// JS 返回值带 error 字段则转 Err
+fn error_to_err(v: &serde_json::Value) -> ControlResult<()> {
+    if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
+        return Err(err.to_string());
+    }
+    Ok(())
+}
+
+/// 从 JS 返回值解析坐标(缺失按 0 处理)
+fn point_from(v: &serde_json::Value) -> Point {
+    Point {
+        x: v.get("x").and_then(|x| x.as_f64()).unwrap_or(0.0),
+        y: v.get("y").and_then(|y| y.as_f64()).unwrap_or(0.0),
     }
 }
 

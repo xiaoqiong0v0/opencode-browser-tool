@@ -79,3 +79,34 @@ WebKitGTK：`WebViewExt::snapshot(SnapshotRegion::Visible, SnapshotOptions::NONE
 **为什么可访问性树用近似而非 ATK**：`webkit_web_view_get_accessible()` 依赖 ATK + a11y bus（`at-spi2`），在 WSLg/精简发行版上通常不可用，无法验证与运行；DOM 近似在任何环境都可用，且对"元素定位/标注"这类用途足够。
 
 **已知限制**：近似树不是浏览器真实 AX 树（不含 layout/table 语义细节，name 计算也与浏览器实现有差异）；`data:`/`blob:` 等非 HTTP 资源的响应 status 可能记为 0。
+
+## 7. 平台能力与降级策略（交互命令）
+
+### 7.1 统一规则
+
+1. **有可信通道就用可信通道**：Windows/WebView2 走 CDP（`Input.*` / `DOM.setFileInputFiles` 等），产生 `isTrusted=true` 事件、真实命中测试与默认行为。
+2. **没有可信通道（Linux/WebKitGTK、macOS）时，退回原本"确实可用"的 DOM/JS 实现，但必须标注降级**：service 返回 `{degraded:true, degradedReason:"untrusted JS fallback on <os>"}`，插件 `src/index.ts` 统一格式化为 ` (degraded: ...)` 追加到结果文本；**绝不静默假成功**。
+3. **原本就不可用/假成功的实现不做兜底**：保持明确报错（宁可报错也不假成功）。
+4. **"原本是否确实可用"以旧实现行为与实测为准**；不确定处标注存疑。
+
+调试开关：环境变量 **`BT_FORCE_DEGRADED=1`** 会让 Windows 也强制走降级分支，用于在无 Linux 环境实测降级路径与标注文本。判定入口在 `rust/src/control/mod.rs`（`trusted_available()` / `Outcome`）。
+
+### 7.2 命令级现状
+
+| 命令 | Windows（可信） | Linux / 其他（降级或报错） | 现状与限制 |
+|---|---|---|---|
+| `click` | CDP `Input.dispatchMouseEvent`（moved→pressed→released） | **降级**：`el.click()`（untrusted），标注 | Windows 派发前做命中测试/视口/disabled 校验；被遮挡 / 出视口 / disabled → 明确报错 |
+| `hover` | CDP `mouseMoved` | **降级**：合成 `mouseover`/`mouseenter`，标注 | 降级路径**不触发 CSS `:hover`**（实测强制降级下 `matches(':hover')=false`） |
+| `click_and_switch_tab` | 同 `click` | **降级**：`el.click()`，标注 | Rust 侧只负责点击 + 200ms 后读 URL；"切标签"逻辑不在 Rust 侧 |
+| `iframe_click` | iframe 内容坐标换算到顶层视口后 CDP 点击 | **降级**：`contentDocument` 内 `el.click()`，标注 | 仅支持顶层选择器定位的**单层 iframe**；跨域 iframe（`contentDocument==null`）两个平台都明确报错 |
+| `fill` | focus → 全选 → CDP `Input.insertText` → 读回校验 | **降级**：原生原型 setter + 派发 `input`/`change`，标注 | Windows 产生可信 `beforeinput`/`input`（受控组件可用）；读回不一致即报错 |
+| `clear` | focus → 全选 → CDP `Delete` → 读回校验 | **降级**：同 `fill` 空值，标注 | |
+| `select` | focus → 方向键移动选中项 → 读回校验 | **降级**：原生 setter + `input`/`change`，标注 | Windows 仅单值 select 走可信键盘；`multiple`/`size>1` **降级并标注**（实测）；目标 value 不存在 → 报错 |
+| `iframe_fill` | iframe 内容文档内 focus → `insertText` → 读回 | **降级**：`contentDocument` 内原型 setter + 事件，标注 | |
+| `press_key` | CDP `Input.dispatchKeyEvent` | **明确报错**（不做降级） | 旧 JS 只派发 untrusted keydown/keyup，页面 handler 能收到但**不产生输入字符/默认行为**（提交等）→ 属假成功 |
+| `upload_file` | CDP `DOM.setFileInputFiles` + 读回 `el.files` | **明确报错** | 旧 `fetch("file:///…")` 在非 file:// 源被拦且异步未等待 → 确定性假成功 |
+| `drag` | CDP `Input.dispatchMouseEvent` 鼠标序列（触发原生 DnD） | **明确报错** | 旧合成 `DragEvent` 不触发原生 DnD 且 `dataTransfer` 无数据 → 基本不可用 |
+
+> - 未列出的交互/只读命令（`scroll`、`scroll_to_element`、`get_*`、`evaluate` 等）在各平台均为可用实现，不涉及降级/报错。
+> - `drag` 未采用 `Input.dispatchDragEvent` + `setInterceptDrags`：实测普通鼠标序列已能触发可信原生 DnD，且本项目的 CDP 通道是请求/响应式、收不到 `Input.dragIntercepted` 事件。
+> - 非 Windows 的有可信通道候选（WebKitGTK 合成 GdkEvent / WebDriver）均**未确证**，故一律走"降级 + 标注"或"明确报错"，不用未验证实现冒充可信。

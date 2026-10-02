@@ -16,6 +16,11 @@ import createLogger from "@xiaoqiong0v0/opencode-plugin-logger";
 const log = createLogger("browser-tool");
 const _t = (k: string) => t(k);
 
+/** 降级说明:服务端在无可信通道、退回 untrusted DOM/JS 时返回 degraded,统一在此追加标注 */
+function degradedNote(r: any): string {
+  return r && r.degraded ? ` (degraded: ${r.degradedReason || "untrusted fallback"})` : "";
+}
+
 /** CLI 命令参数定义:flag=参数名,type=类型(string/boolean) */
 type CmdArg = { flag: string; type?: "string" | "boolean" };
 /** CLI 命令定义:usage=参数用法,descKey=命令描述 i18n 键(cli.cmd.*),args=可解析的 flag 表,run=执行 */
@@ -33,11 +38,11 @@ const COMMANDS: Record<string, CmdDef> = {
     if (r.installError) return `Installation failed: ${r.error}. Retry.`;
     return r.installing ? `Installing ${r.installing} (${r.progress}). Try again.` : `Navigated to: ${r.url}`;
   } },
-  click: { usage: "--selector", descKey: "cli.cmd.click", args: [{ flag: "selector" }], run: async (a) => { await service.click(a); return "Clicked"; } },
-  fill: { usage: "--selector --value", descKey: "cli.cmd.fill", args: [{ flag: "selector" }, { flag: "value" }], run: async (a) => { await service.fill(a); return "Filled"; } },
-  clear: { usage: "--selector", descKey: "cli.cmd.clear", args: [{ flag: "selector" }], run: async (a) => { await service.clear(a); return "Cleared"; } },
-  select: { usage: "--selector --value", descKey: "cli.cmd.select", args: [{ flag: "selector" }, { flag: "value" }], run: async (a) => { await service.select(a); return "Selected"; } },
-  hover: { usage: "--selector", descKey: "cli.cmd.hover", args: [{ flag: "selector" }], run: async (a) => { await service.hover(a); return "Hovered"; } },
+  click: { usage: "--selector", descKey: "cli.cmd.click", args: [{ flag: "selector" }], run: async (a) => { const r = await service.click(a); return "Clicked" + degradedNote(r); } },
+  fill: { usage: "--selector --value", descKey: "cli.cmd.fill", args: [{ flag: "selector" }, { flag: "value" }], run: async (a) => { const r = await service.fill(a); return "Filled" + degradedNote(r); } },
+  clear: { usage: "--selector", descKey: "cli.cmd.clear", args: [{ flag: "selector" }], run: async (a) => { const r = await service.clear(a); return "Cleared" + degradedNote(r); } },
+  select: { usage: "--selector --value", descKey: "cli.cmd.select", args: [{ flag: "selector" }, { flag: "value" }], run: async (a) => { const r = await service.select(a); return "Selected" + degradedNote(r); } },
+  hover: { usage: "--selector", descKey: "cli.cmd.hover", args: [{ flag: "selector" }], run: async (a) => { const r = await service.hover(a); return "Hovered" + degradedNote(r); } },
   drag: { usage: "--sourceSelector --targetSelector", descKey: "cli.cmd.drag", args: [{ flag: "sourceSelector" }, { flag: "targetSelector" }], run: async (a) => { await service.drag(a); return "Dragged"; } },
   press_key: { usage: "--key [--selector]", descKey: "cli.cmd.press_key", args: [{ flag: "key" }, { flag: "selector" }], run: async (a) => { await service.pressKey(a); return `Pressed: ${a.key}`; } },
   upload_file: { usage: "--selector --filePath", descKey: "cli.cmd.upload_file", args: [{ flag: "selector" }, { flag: "filePath" }], run: async (a) => { await service.uploadFile(a); return "Uploaded"; } },
@@ -74,9 +79,9 @@ const COMMANDS: Record<string, CmdDef> = {
   show_notification: { usage: "--message [--type]", descKey: "cli.cmd.show_notification", args: [{ flag: "message" }, { flag: "type" }], run: async (a) => { await service.notify(a); return "Notification shown"; } },
   scroll: { usage: "[--direction --amount]", descKey: "cli.cmd.scroll", args: [{ flag: "direction" }, { flag: "amount" }], run: async (a) => { await service.scroll(a); return `Scrolled ${a.direction || "down"} by ${a.amount || 300}px`; } },
   wait_for_selector: { usage: "--selector [--timeout]", descKey: "cli.cmd.wait_for_selector", args: [{ flag: "selector" }, { flag: "timeout" }], run: async (a) => { await service.waitForSelector(a); return "Element appeared"; } },
-  click_and_switch_tab: { usage: "--selector", descKey: "cli.cmd.click_and_switch_tab", args: [{ flag: "selector" }], run: async (a) => { const r = await service.clickSwitchTab(a); return `Clicked ${a.selector}, current URL: ${r.url || ""}`; } },
-  iframe_click: { usage: "--iframeSelector --selector", descKey: "cli.cmd.iframe_click", args: [{ flag: "iframeSelector" }, { flag: "selector" }], run: async (a) => { await service.iframeClick(a); return "Clicked in iframe"; } },
-  iframe_fill: { usage: "--iframeSelector --selector --value", descKey: "cli.cmd.iframe_fill", args: [{ flag: "iframeSelector" }, { flag: "selector" }, { flag: "value" }], run: async (a) => { await service.iframeFill(a); return "Filled in iframe"; } },
+  click_and_switch_tab: { usage: "--selector", descKey: "cli.cmd.click_and_switch_tab", args: [{ flag: "selector" }], run: async (a) => { const r = await service.clickSwitchTab(a); return `Clicked ${a.selector}, current URL: ${r.url || ""}` + degradedNote(r); } },
+  iframe_click: { usage: "--iframeSelector --selector", descKey: "cli.cmd.iframe_click", args: [{ flag: "iframeSelector" }, { flag: "selector" }], run: async (a) => { const r = await service.iframeClick(a); return "Clicked in iframe" + degradedNote(r); } },
+  iframe_fill: { usage: "--iframeSelector --selector --value", descKey: "cli.cmd.iframe_fill", args: [{ flag: "iframeSelector" }, { flag: "selector" }, { flag: "value" }], run: async (a) => { const r = await service.iframeFill(a); return "Filled in iframe" + degradedNote(r); } },
   get_browser_status: { usage: "", descKey: "cli.cmd.get_browser_status", run: async () => {
     const s = await service.status();
     if (s.installing && Object.keys(s.installing).length > 0) return `Installing ${Object.entries(s.installing).map(([b, p]) => `${b} (${p})`).join(", ")}.`;

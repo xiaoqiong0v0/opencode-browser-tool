@@ -1,8 +1,9 @@
 //! 键盘注入:平台可信通道(产生 isTrusted=true 的事件并触发浏览器默认行为)
 //!
 //! Windows:CDP `Input.dispatchKeyEvent`(复用 `control::cdp`),先聚焦目标元素再注入
-//! Linux(WebKitGTK):可信路径尚未确证(见仓库报告),暂不提供,返回明确错误而非假成功
-//! macOS 及其他平台:未实现,维持原有 JS 合成事件实现(不在本次改动范围)
+//! 非 Windows(WebKitGTK/macOS):无可信通道;旧 JS 只派发 untrusted keydown/keyup,
+//!   页面 JS handler 能收到但**不会真的输入字符/提交表单**,属确定性假成功 →
+//!   按"宁可报错也不假成功"保持明确报错,不做降级兜底(详见 docs/linux-support.md)
 //!
 //! 契约:`--key <键名>` + 可选 `--selector <选择器>`。`key` 支持可打印单字符、
 //! Enter/Tab/Escape/Backspace/Delete/方向键/Home/End/PageUp/PageDown/F1-F12/Space;
@@ -58,53 +59,19 @@ pub fn press_key(app: &AppHandle, key: &str, selector: &str) -> ControlResult<()
     Ok(())
 }
 
-/// 非 Windows 平台:可信键盘注入未实现,返回明确错误(避免旧的 JS 合成事件假成功)
-#[cfg(target_os = "linux")]
+/// 非 Windows 平台:无可信键盘通道,旧 JS 合成事件无法产生输入/默认行为 → 明确报错
+#[cfg(not(windows))]
 pub fn press_key(_app: &AppHandle, _key: &str, _selector: &str) -> ControlResult<()> {
-    Err("press_key: trusted keyboard injection is not implemented on this platform yet \
-         (Windows via CDP; Linux WebKitGTK path unverified)"
+    Err("press_key: no trusted keyboard channel on this platform \
+         (Windows via CDP; WebKitGTK/macOS unverified) — refusing untrusted JS fallback"
         .into())
 }
 
-/// macOS 及其他平台:未实现,维持原有 JS 合成事件实现(本次改动范围外,不改行为)
-///
-/// 注意:该路径派发的是 unTrusted 的合成事件,不触发默认行为;仅为保持 macOS 现状。
-#[cfg(not(any(windows, target_os = "linux")))]
-pub fn press_key(app: &AppHandle, key: &str, _selector: &str) -> ControlResult<()> {
-    let key_map: &[(&str, &str)] = &[
-        ("Enter", "Enter"),
-        ("Escape", "Escape"),
-        ("Tab", "Tab"),
-        ("Backspace", "Backspace"),
-        ("ArrowUp", "ArrowUp"),
-        ("ArrowDown", "ArrowDown"),
-        ("ArrowLeft", "ArrowLeft"),
-        ("ArrowRight", "ArrowRight"),
-    ];
-    let code = key_map
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(key))
-        .map(|(_, c)| c.to_string())
-        .unwrap_or_else(|| key.to_string());
-    let js = format!(
-        r#"(function(){{
-          const el = document.activeElement || document.body;
-          el.dispatchEvent(new KeyboardEvent("keydown", {{key:{k:?},code:{k:?},bubbles:true}}));
-          el.dispatchEvent(new KeyboardEvent("keypress", {{key:{k:?},code:{k:?},bubbles:true}}));
-          el.dispatchEvent(new KeyboardEvent("keyup", {{key:{k:?},code:{k:?},bubbles:true}}));
-          return {{ok:true}};
-        }})()"#,
-        k = code
-    );
-    super::eval(app, &js)?;
-    Ok(())
-}
-
-/// 聚焦目标元素,确保后续 CDP 注入落到该元素而非 body
+/// 聚焦目标元素,确保后续 CDP 注入落到该元素而非 body(供键盘/文本输入复用)
 ///
 /// 元素不存在或 `focus()` 未生效(不可聚焦)时返回错误,避免静默落到错误目标
 #[cfg(windows)]
-fn focus_element(app: &AppHandle, selector: &str) -> ControlResult<()> {
+pub fn focus_element(app: &AppHandle, selector: &str) -> ControlResult<()> {
     let js = format!(
         r#"(function(){{
           var el = document.querySelector({sel:?});

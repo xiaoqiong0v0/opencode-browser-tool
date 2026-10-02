@@ -92,6 +92,15 @@ fn num_u64(body: &Value, key: &str) -> Option<u64> {
     })
 }
 
+/// 把降级标记写入结果 JSON(可信路径不写字段);`degraded`/`degradedReason` 与插件约定一致
+fn mark_degraded(mut v: Value, degraded: &Option<String>) -> Value {
+    if let Some(reason) = degraded {
+        v["degraded"] = json!(true);
+        v["degradedReason"] = json!(reason);
+    }
+    v
+}
+
 /// 应用状态(Arc 共享)
 pub struct App {
     /// Tauri 应用句柄(驱动页面/覆盖层/面板 Webview)
@@ -228,46 +237,49 @@ impl App {
             return Err("selector is required".into());
         }
         let handle = self.handle.clone();
-        // 可信点击:Windows 走 CDP 鼠标序列(命中测试 + 真实默认行为),非 Windows 明确报错
-        let p = tokio::task::block_in_place(|| control::mouse::click(&handle, &s))?;
-        Ok(json!({ "clicked": true, "x": p.x, "y": p.y }))
+        // Windows:CDP 鼠标序列(命中测试 + 真实默认行为);非 Windows:降级 el.click() 并标注
+        let o = tokio::task::block_in_place(|| control::mouse::click(&handle, &s))?;
+        Ok(mark_degraded(
+            json!({ "clicked": true, "x": o.value.x, "y": o.value.y }),
+            &o.degraded,
+        ))
     }
 
     async fn fill(&self, body: &Value) -> Result<Value, String> {
         let s = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if s.is_empty() {
+            return Err("selector is required".into());
+        }
         let v = body.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string();
         let handle = self.handle.clone();
-        tokio::task::block_in_place(|| control::fill(&handle, &s, &v))?;
-        Ok(json!({ "filled": true }))
+        // Windows:focus + 全选 + Input.insertText;非 Windows:降级 DOM setter + input/change 并标注
+        let o = tokio::task::block_in_place(|| control::input::fill(&handle, &s, &v))?;
+        Ok(mark_degraded(json!({ "filled": true }), &o.degraded))
     }
 
     async fn clear(&self, body: &Value) -> Result<Value, String> {
         let s = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if s.is_empty() {
+            return Err("selector is required".into());
+        }
         let handle = self.handle.clone();
-        tokio::task::block_in_place(|| control::fill(&handle, &s, ""))?;
-        Ok(json!({ "cleared": true }))
+        let o = tokio::task::block_in_place(|| control::input::clear(&handle, &s))?;
+        Ok(mark_degraded(json!({ "cleared": true }), &o.degraded))
     }
 
     async fn select(&self, body: &Value) -> Result<Value, String> {
         let s = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if s.is_empty() {
+            return Err("selector is required".into());
+        }
         let v = body.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string();
         let handle = self.handle.clone();
-        let js = format!(
-            r#"(function(){{
-              const el = document.querySelector({s:?});
-              if (!el) return {{error:"not found"}};
-              el.value = {v:?};
-              el.dispatchEvent(new Event("change", {{bubbles:true}}));
-              return {{ok:true}};
-            }})()"#,
-            s = s,
-            v = v
-        );
-        let r = tokio::task::block_in_place(|| control::eval(&handle, &js))?;
-        if r.get("error").is_some() {
-            return Err(r["error"].as_str().unwrap_or("select failed").to_string());
-        }
-        Ok(json!({ "selected": true }))
+        // Windows:focus + 方向键可信选择(单值 select);multiple/size>1 或其他平台降级并标注
+        let o = tokio::task::block_in_place(|| control::input::select(&handle, &s, &v))?;
+        Ok(mark_degraded(
+            json!({ "selected": true, "value": o.value }),
+            &o.degraded,
+        ))
     }
 
     async fn hover(&self, body: &Value) -> Result<Value, String> {
@@ -276,9 +288,12 @@ impl App {
             return Err("selector is required".into());
         }
         let handle = self.handle.clone();
-        // 可信悬停:Windows 走 CDP mouseMoved(真实移动触发 CSS :hover),非 Windows 明确报错
-        let p = tokio::task::block_in_place(|| control::mouse::hover(&handle, &s))?;
-        Ok(json!({ "hovered": true, "x": p.x, "y": p.y }))
+        // Windows:CDP mouseMoved(真实 CSS :hover);非 Windows:降级合成 mouseover/mouseenter 并标注
+        let o = tokio::task::block_in_place(|| control::mouse::hover(&handle, &s))?;
+        Ok(mark_degraded(
+            json!({ "hovered": true, "x": o.value.x, "y": o.value.y }),
+            &o.degraded,
+        ))
     }
 
     async fn press_key(&self, body: &Value) -> Result<Value, String> {
@@ -671,43 +686,33 @@ impl App {
             return Err("selector is required".into());
         }
         let handle = self.handle.clone();
-        // 可信 iframe 点击:iframe 内容坐标换算到顶层视口后走 CDP 鼠标序列
-        let p = tokio::task::block_in_place(|| {
+        // Windows:iframe 内容坐标换算后走可信鼠标序列;非 Windows:降级同源 iframe el.click() 并标注
+        let o = tokio::task::block_in_place(|| {
             control::mouse::click_in_iframe(&handle, &iframe, &sel)
         })?;
-        Ok(json!({ "clicked": true, "x": p.x, "y": p.y }))
+        Ok(mark_degraded(
+            json!({ "clicked": true, "x": o.value.x, "y": o.value.y }),
+            &o.degraded,
+        ))
     }
 
     /// 在 iframe 中填写输入框
     async fn iframe_fill(&self, body: &Value) -> Result<Value, String> {
         let iframe = body.get("iframeSelector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if iframe.is_empty() {
+            return Err("iframeSelector is required".into());
+        }
         let sel = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if sel.is_empty() {
+            return Err("selector is required".into());
+        }
         let val = body.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let handle = self.handle.clone();
-        let js = format!(
-            r#"(function(){{
-              const f = document.querySelector({iframe:?});
-              if (!f) return {{error:"iframe not found"}};
-              const d = f.contentDocument;
-              if (!d) return {{error:"cross-origin iframe not accessible"}};
-              const el = d.querySelector({sel:?});
-              if (!el) return {{error:"element not found"}};
-              const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-              const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
-              setter.call(el, {val:?});
-              el.dispatchEvent(new Event("input", {{bubbles:true}}));
-              el.dispatchEvent(new Event("change", {{bubbles:true}}));
-              return {{ok:true}};
-            }})()"#,
-            iframe = iframe,
-            sel = sel,
-            val = val
-        );
-        let r = tokio::task::block_in_place(|| control::eval(&handle, &js))?;
-        if r.get("error").is_some() {
-            return Err(r["error"].as_str().unwrap_or("iframe fill failed").to_string());
-        }
-        Ok(json!({ "filled": true }))
+        // Windows:iframe 内 focus + insertText;非 Windows:降级 DOM setter + input/change 并标注
+        let o = tokio::task::block_in_place(|| {
+            control::input::fill_in_iframe(&handle, &iframe, &sel, &val)
+        })?;
+        Ok(mark_degraded(json!({ "filled": true }), &o.degraded))
     }
 
     async fn click_switch_tab(&self, body: &Value) -> Result<Value, String> {
@@ -716,15 +721,18 @@ impl App {
             return Err("selector is required".into());
         }
         let handle = self.handle.clone();
-        // 可信点击(与 click 同通道),点击可能触发导航 → 读取当前 URL
-        let p = tokio::task::block_in_place(|| control::mouse::click(&handle, &s))?;
+        // 与 click 同通道(可信/降级一致),点击可能触发导航 → 读取当前 URL
+        let o = tokio::task::block_in_place(|| control::mouse::click(&handle, &s))?;
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let handle2 = self.handle.clone();
         let url = tokio::task::block_in_place(|| {
             let v = control::page_state(&handle2).unwrap_or_default();
             v["url"].as_str().unwrap_or("").to_string()
         });
-        Ok(json!({ "clicked": true, "url": url, "x": p.x, "y": p.y }))
+        Ok(mark_degraded(
+            json!({ "clicked": true, "url": url, "x": o.value.x, "y": o.value.y }),
+            &o.degraded,
+        ))
     }
 
     // ---- 批注状态机端点 ----

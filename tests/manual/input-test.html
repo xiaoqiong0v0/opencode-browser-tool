@@ -65,6 +65,10 @@
   `click --selector #covered-btn` 应报「被遮挡」错误且 #covered-info 计数不变（对照 `#synth-covered` 走 el.click() 会 +1）。
   ⑦ 悬停：`hover --selector #hover-target` 后 #hover-info 的 <b>matches:hover=true</b> 且 bg 变绿；
   iframe 内用 `iframe_click --iframeSelector #ifr --selector #ifr-btn`，看 #ifr-info 计数。
+  ⑧ 表单填写：`fill --selector #text --value hello` 后 #text 值应为 hello；`fill --selector #controlled --value abc`
+  应更新 #controlled-info 的 state 且 trusted+1（untrusted 输入会被回滚）；`select --selector #sel --value o3`
+  应选中 o3 并出现可信 change；`iframe_fill --iframeSelector #ifr --selector #ifr-text --value abc` 应填入 iframe 输入框。
+  非 Windows 下上述命令会带 <b>(degraded: ...)</b> 标注。
 </p>
 
 <div id="status" class="idle">尚未收到任何事件</div>
@@ -138,6 +142,14 @@
   <legend>#hover-target 默认灰底，:hover 变绿；同时记录 mouseover/mouseenter/mouseleave</legend>
   <div id="hover-target">悬停我 #hover-target</div>
   <div id="hover-info">bg=（—） matches:hover=false</div>
+</fieldset>
+
+<h2>受控组件模拟</h2>
+<fieldset>
+  <legend>#controlled 只接受可信 input（untrusted input 会把值还原）——用于验证 fill 是否产生可信 beforeinput/input</legend>
+  <input id="controlled" type="text" placeholder="受控输入">
+  <div id="controlled-info">state="" trusted=0 untrusted=0</div>
+  <button id="synth-controlled" type="button">对照：对 #controlled 派发 untrusted input</button>
 </fieldset>
 
 <h2>iframe 内点击</h2>
@@ -377,6 +389,33 @@ document.getElementById('hover-target').addEventListener('mouseenter', function 
 document.getElementById('hover-target').addEventListener('mouseleave', function () { hoverState.leave += 1; updateHoverInfo(); });
 updateHoverInfo();
 
+// ===== 受控组件模拟:只接受可信 input,untrusted input 回滚 =====
+var controlledState = '';
+window.__controlled = { state: '', trustedInputs: 0, untrustedInputs: 0 };
+function updateControlledInfo() {
+  document.getElementById('controlled-info').textContent =
+    'state=' + JSON.stringify(window.__controlled.state) +
+    ' trusted=' + window.__controlled.trustedInputs +
+    ' untrusted=' + window.__controlled.untrustedInputs;
+}
+document.getElementById('controlled').addEventListener('input', function (e) {
+  if (e.isTrusted) {
+    window.__controlled.state = e.target.value;      // 受控组件接受可信输入
+    window.__controlled.trustedInputs += 1;
+  } else {
+    window.__controlled.untrustedInputs += 1;
+    e.target.value = window.__controlled.state;       // 不可信输入 → 还原（模拟 React 受控回滚）
+  }
+  updateControlledInfo();
+});
+document.getElementById('synth-controlled').addEventListener('click', function () {
+  var el = document.getElementById('controlled');
+  var setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+  setter.call(el, el.value + 'X');
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+});
+updateControlledInfo();
+
 // ===== iframe 内容与点击计数（同源 about:blank） =====
 window.__iframeClicks = 0;
 (function initIframe() {
@@ -386,6 +425,7 @@ window.__iframeClicks = 0;
   idoc.open();
   idoc.write('<!DOCTYPE html><html><body style="margin:0">' +
     '<button id="ifr-btn" style="margin:16px;padding:8px 12px">iframe 按钮 #ifr-btn</button>' +
+    '<input id="ifr-text" style="margin:0 16px;padding:4px" placeholder="iframe 输入">' +
     '</body></html>');
   idoc.close();
   idoc.getElementById('ifr-btn').addEventListener('click', function () {
