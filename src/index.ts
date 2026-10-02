@@ -9,12 +9,12 @@ import {
 import { registerLocale, t } from "./i18n/index.js";
 import en from "./i18n/en.js";
 import zh from "./i18n/zh.js";
-import { configureService, setUserDataDir, ensureService, openWindow, isRunning, stopService, service } from "./client.js";
-import { startDownload } from "./binary.js";
+import { configureService, setUserDataDir, ensureService, openWindow, isRunning, stopService, service, probeStatus } from "./client.js";
+import { startDownload, getBinaryStatus, describeBinaryStatus } from "./binary.js";
 import { tool, type Plugin } from "@opencode-ai/plugin";
-import createLogger from "@xiaoqiong0v0/opencode-plugin-logger";
+import { log } from "./logger.js";
+import { createSessionIDCache, extractSessionIDFromEvent } from "./session-id.js";
 
-const log = createLogger("browser-tool");
 const _t = (k: string) => t(k);
 
 /** 降级说明:服务端在无可信通道、退回 untrusted DOM/JS 时返回 degraded,统一在此追加标注 */
@@ -69,7 +69,7 @@ const COMMANDS: Record<string, CmdDef> = {
   upload_file: { usage: "--selector --filePath", descKey: "cli.cmd.upload_file", args: [{ flag: "selector" }, { flag: "filePath" }], run: async (a) => { await service.uploadFile(a); return "Uploaded"; } },
   screenshot: { usage: "[--selector]", descKey: "cli.cmd.screenshot", args: [{ flag: "selector" }], run: async (a) => {
     const r = await service.screenshot(a);
-    return { output: `Screenshot taken${a.selector ? ` (element: ${a.selector})` : " (full page)"}`, attachments: [{ type: "file", mime: r.mime || "image/png", data: r.base64, url: "" }] };
+    return { output: `Screenshot taken${a.selector ? ` (element: ${a.selector})` : " (full page)"}`, attachments: [{ type: "file", mime: r.mime || "image/png", url: `data:${r.mime || "image/png"};base64,${r.base64}` }] };
   } },
   evaluate: { usage: "--script", descKey: "cli.cmd.evaluate", args: [{ flag: "script" }], run: async (a) => JSON.stringify(await service.evaluate(a), null, 2) },
   get_visible_text: { usage: "[--selector]", descKey: "cli.cmd.get_visible_text", args: [{ flag: "selector" }], run: async (a) => (await service.visibleText(a))?.text || "(no visible text)" },
@@ -104,7 +104,12 @@ const COMMANDS: Record<string, CmdDef> = {
   iframe_click: { usage: "--iframeSelector --selector", descKey: "cli.cmd.iframe_click", args: [{ flag: "iframeSelector" }, { flag: "selector" }], run: async (a) => { const r = await service.iframeClick(a); return "Clicked in iframe" + degradedNote(r); } },
   iframe_fill: { usage: "--iframeSelector --selector --value", descKey: "cli.cmd.iframe_fill", args: [{ flag: "iframeSelector" }, { flag: "selector" }, { flag: "value" }], run: async (a) => { const r = await service.iframeFill(a); return "Filled in iframe" + degradedNote(r); } },
   get_browser_status: { usage: "", descKey: "cli.cmd.get_browser_status", run: async () => {
-    const s = await service.status();
+    // 纯查询:不 spawn、不懒启动(未运行只提示,不弹窗)
+    const s = await probeStatus();
+    if (!s) {
+      const b = getBinaryStatus();
+      return `Browser is not running.\nbt-shell: ${describeBinaryStatus(b)}\n(执行任意其它工具会自动启动；也可用 open_window 显式启动)`;
+    }
     if (s.installing && Object.keys(s.installing).length > 0) return `Installing ${Object.entries(s.installing).map(([b, p]) => `${b} (${p})`).join(", ")}.`;
     if (!s.open) return "Browser is not open. Use command=open_window or navigate.";
     return `Browser is open\nTitle: ${s.title}\nURL: ${s.url}\nTabs: ${s.tabs}`;
@@ -120,8 +125,8 @@ const COMMANDS: Record<string, CmdDef> = {
   expect_response: { usage: "--url", descKey: "cli.cmd.expect_response", args: [{ flag: "url" }], run: async (a) => { await service.expectResponse({ urlPattern: a.url }); return `Now expecting response matching: ${a.url}. Use command=assert_response to check.`; } },
   assert_response: { usage: "--id", descKey: "cli.cmd.assert_response", args: [{ flag: "id" }], run: async (a) => { const r = await service.assertResponse({ id: a.id }); return r.matched ? `Response matched: ${r.url} (${r.status})` : r.error || "No response yet"; } },
   get_accessibility_tree: { usage: "[--selector --maxDepth]", descKey: "cli.cmd.get_accessibility_tree", args: [{ flag: "selector" }, { flag: "maxDepth" }], run: async (a) => { const s = await service.accessibility(a); return s ? formatNode(s, 0, a.maxDepth ?? 8) : "(no accessibility info)"; } },
-  list_records: { usage: "", descKey: "cli.cmd.list_records", run: async () => { try { const records = await service.annotateRecords(); if (!records || !records.length) return "(no records)"; return records.map((r: any) => { const rect = r.rect ? ` rect=(${r.rect[0]},${r.rect[1]},${r.rect[2]},${r.rect[3]})` : ""; return `[${r.index}] ${r.selector}${rect}${r.note ? ` note="${r.note}"` : ""}`; }).join("\n"); } catch { return "(no records)"; } } },
-  read_record_content: { usage: "--id", descKey: "cli.cmd.read_record_content", args: [{ flag: "id" }], run: async (a) => { try { const records = await service.annotateRecords(); const rec = (records || []).find((r: any) => r.index === a.id); if (!rec) return `(record #${a.id} not found)`; return `#${rec.index} ${rec.selector}\nrect: ${JSON.stringify(rec.rect)}\nnote: ${rec.note || "(none)"}`; } catch { return "(no records)"; } } },
+  list_records: { usage: "", descKey: "cli.cmd.list_records", run: async () => { try { const records = await service.annotateRecords(); if (!records || !records.length) return "(no records)"; return records.map((r: any) => { const rect = r.rect ? ` rect=(${r.rect[0]},${r.rect[1]},${r.rect[2]},${r.rect[3]})` : ""; const img = r.image ? " +img" : ""; const sent = r.sent ? " [sent]" : ""; return `[${r.index}] ${r.selector}${rect}${img}${sent}${r.note ? ` note="${r.note}"` : ""}`; }).join("\n"); } catch { return "(no records)"; } } },
+  read_record_content: { usage: "--id", descKey: "cli.cmd.read_record_content", args: [{ flag: "id" }], run: async (a) => { try { const records = await service.annotateRecords(); const rec = (records || []).find((r: any) => r.index === a.id); if (!rec) return `(record #${a.id} not found)`; let img = ""; if (rec.image) { const p = saveShotImage(log, rec.index, rec.image); img = `\nimage: ${Math.round(rec.image.length / 1024)}KB base64` + (p ? ` (saved: ${p})` : ""); } return `#${rec.index} ${rec.selector}\nrect: ${JSON.stringify(rec.rect)}${img}\nnote: ${rec.note || "(none)"}`; } catch { return "(no records)"; } } },
   fake_audio: { usage: "--kind [--data --freq --durMs --notes --digits --loop]", descKey: "cli.cmd.fake_audio", args: [{ flag: "kind" }, { flag: "data" }, { flag: "freq" }, { flag: "durMs" }, { flag: "notes" }, { flag: "digits" }, { flag: "loop", type: "boolean" }], run: async (a) => { const r = await service.mediaAudio(a); return `Fake mic audio: ${r.injected}`; } },
   fake_video: { usage: "--kind [--data --url --loop]", descKey: "cli.cmd.fake_video", args: [{ flag: "kind" }, { flag: "data" }, { flag: "url" }, { flag: "loop", type: "boolean" }], run: async (a) => { const r = await service.mediaVideo(a); return `Fake camera video: ${r.injected}`; } },
   profile: { usage: "[--set <name> | --delete <name>]", descKey: "cli.cmd.profile", args: [{ flag: "set" }, { flag: "delete" }], run: async (a) => {
@@ -226,7 +231,9 @@ function splitCsvLine(line: string): string[] {
   return out;
 }
 
-export const opencodeBrowserTool: Plugin = async ({ client, worktree }) => {
+export const opencodeBrowserTool: Plugin = async ({ client, worktree, directory, serverUrl }) => {
+  // 插件上下文(仅用于诊断:定位 session.list() 为空时是哪个实例/目录)
+  pluginCtx = { directory: directory || "", worktree: worktree || "", serverUrl: serverUrl ? String(serverUrl) : "" };
   registerLocale("en", en);
   registerLocale("zh", zh);
   loadConfig(worktree);
@@ -248,14 +255,27 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree }) => {
     startDownload();
 
     // 轮询批注发送队列(面板"发送全部" → 推送到对话)
-    void startAnnotatePoller(client, log);
+    void startAnnotatePoller(client);
 
     return {
       event: async ({ event }) => {
-        if (event.type === "session.deleted") {
-          const sid = (event as any).data?.sessionID;
-          if (sid) { try { await service.closeSession({ _sessionId: sid }); } catch {} }
+        // 缓存最近会话 id:这是投递批注最可靠的 sessionID 来源
+        if (event.type !== "session.deleted") {
+          sessionCache.updateFromEvent(event);
+        } else {
+          const delId = extractSessionIDFromEvent(event);
+          if (delId) {
+            sessionCache.clearIf(delId);
+            try { await service.closeSession({ _sessionId: delId }); } catch {}
+          }
         }
+      },
+      // 用户发消息 / 调工具时刷新当前会话 id(参考项目用 ctx.sessionID,此处为等价钩子来源)
+      "chat.message": async (input: any) => {
+        sessionCache.updateFromHookInput(input);
+      },
+      "tool.execute.before": async (input: any) => {
+        sessionCache.updateFromHookInput(input);
       },
       tool: filterDisabled(
         {
@@ -303,7 +323,8 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree }) => {
                   }
                 }
               }
-              // 透传会话 ID(会话隔离用)
+              // 透传会话 ID(会话隔离用),并刷新钩子缓存(兜底:即使钩子未触发也能拿到 sid)
+              sessionCache.updateFromHookInput(context);
               params._sessionId = context?.sessionID || "";
               try {
                 return await def.run(params);
@@ -319,6 +340,7 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree }) => {
               mode: tool.schema.enum(["simulate", "real"]).optional().describe(_t("tool.set_media_mode.arg.mode")),
             },
             async execute(a: any, context: any) {
+              sessionCache.updateFromHookInput(context);
               const r = await service.mediaMode({ ...a, _sessionId: context?.sessionID || "" });
               return `Media mode: ${r.mode}`;
             },
@@ -366,49 +388,115 @@ function filterDisabled(tools: Record<string, any>, disabled?: string[]): Record
  */
 let annotateTimer: any = null;
 let annotateClient: any = null;
+/** 最近一次见到的会话 id 缓存(来自 event/chat.message/tool.execute.before 钩子) */
+const sessionCache = createSessionIDCache();
+/** 已记录过的 sid(避免重复刷屏) */
+let lastLoggedSessionID = "";
+/** 插件上下文(诊断用) */
+let pluginCtx: { directory: string; worktree: string; serverUrl: string } = { directory: "", worktree: "", serverUrl: "" };
 
-function startAnnotatePoller(client: any, log: any): void {
+/** 把截图 base64 落盘为临时 PNG,返回路径(失败返回 null);用于发送时保留图片与给出可读路径 */
+function saveShotImage(log: any, index: number, b64: string): string | null {
+  try {
+    const dir = resolve(getTmpDir());
+    mkdirSync(dir, { recursive: true });
+    const p = resolve(dir, `shot-${Date.now()}-${index}.png`);
+    writeFileSync(p, Buffer.from(b64, "base64"));
+    return p;
+  } catch (e) {
+    log.error("save screenshot image failed", e as Error);
+    return null;
+  }
+}
+
+function startAnnotatePoller(client: any): void {
   // 更新 client 引用(插件重载后使用最新 client),但只启动一个轮询器
   annotateClient = client;
   if (annotateTimer) return;
   const POLL_MS = 2000;
+  let warnedNotRunning = false;
   const timer = setInterval(async () => {
-    // 服务未启动/已关闭:跳过本次轮询(窗口打开后再恢复推送)
-    if (!isRunning()) return;
+    // 观测钩子缓存:首次学到 sid 时记一次(证明 sid 来源可用,与窗口是否打开无关)
+    const learned = sessionCache.get();
+    if (learned && learned !== lastLoggedSessionID) {
+      log.info(`[poller] hook-cache sid=${learned}`);
+      lastLoggedSessionID = learned;
+    }
+    // 服务未启动/已关闭:跳过本次轮询(窗口打开后再恢复推送);仅首次提示,避免刷屏
+    if (!isRunning()) {
+      if (!warnedNotRunning) {
+        log.info("[poller] shell not running; poll skipped (will resume after open_window/tool call)");
+        warnedNotRunning = true;
+      }
+      return;
+    }
+    warnedNotRunning = false;
     const c = annotateClient;
     if (!c) return;
     try {
       const r = await service.annotateConsumeSent();
       const records = r?.records || [];
-      if (records.length === 0) return;
+      if (records.length === 0) return; // 空结果不刷屏
+      const imgInfo = records
+        .filter((x: any) => x.type === "screenshot" && x.image)
+        .map((x: any) => `#${x.index}:${x.image.length}B`);
+      log.info(`[poller] consume-sent -> ${records.length} record(s) ids=[${records.map((x: any) => x.index).join(",")}] images=[${imgInfo.join(",")}]`);
       const lines = ["User annotated via panel:", ""];
-      const parts: any[] = [];
       for (const item of records) {
-        // 截图记录:附带图片 part(裸 base64),AI 可直接看图
-        if (item.type === "screenshot" && item.image) {
-          parts.push({ type: "file", mime: "image/png", data: item.image, url: "" });
-        }
         const label =
           item.type === "screenshot"
             ? `[#${item.index}] 截图${item.url ? ` @ ${item.url}` : ""}`
             : `[#${item.index}] ${item.selector || "(no selector)"}${item.url ? ` @ ${item.url}` : ""}`;
         lines.push(`- ${label}${item.note ? `: ${item.note}` : ""}`);
+        // 截图:落盘保留并写入文本路径。与参考实现(opencode-playwright-tool)一致 ——
+        // 图片**不经 session.prompt**(服务端对 image/* part 返回 400),而是走
+        // 「工具结果附件」(bt_screenshot)或「读记录返回缓存路径」(read_record_content)。
+        if (item.type === "screenshot" && item.image) {
+          const savedPath = saveShotImage(log, item.index, item.image);
+          if (savedPath) lines.push(`  (image saved: ${savedPath})`);
+        }
         lines.push("");
       }
       const text = lines.join("\n");
-      const bodyParts: any[] = [{ type: "text", text }];
-      for (const p of parts) bodyParts.push(p);
-      const sessions = await c.session.list();
-      if (sessions?.data?.length) {
-        await c.session.prompt({
-          path: { id: sessions.data[0].id },
-          body: { noReply: false, parts: bodyParts },
-        });
+      // 取当前会话 id:优先用钩子缓存(参考项目 ctx.sessionID 的等价物),session.list() 仅兜底
+      let sid = sessionCache.get();
+      let source = "hook-cache";
+      let listLen: any = "-";
+      if (!sid) {
+        const sessions = await c.session.list();
+        listLen = Array.isArray(sessions?.data) ? sessions.data.length : sessions?.error ? "error" : "none";
+        log.info(`[poller] session.list raw=${JSON.stringify(sessions).slice(0, 400)}`);
+        sid = sessions?.data?.[0]?.id;
+        source = "client.session.list()[0]";
       }
-    } catch {
-      // 服务未就绪/已退出,停止轮询
-      clearInterval(timer);
-      annotateTimer = null;
+      // 关键诊断:sid 来源/缓存值/list 长度/插件目录(定位"静默失败"断点)
+      log.info(`[poller] sid source=${source} cached=${sessionCache.get() || "(EMPTY)"} listLen=${listLen} ctx=${pluginCtx.directory || "(none)"} srv=${pluginCtx.serverUrl || "(none)"} sid=${sid ?? "(EMPTY)"}`);
+      if (!sid) {
+        const msg = "no session id (hook cache empty and session.list returned none)";
+        log.error(`[poller] ${msg}`, new Error(msg));
+        try {
+          await service.notify({ message: `发送失败: ${msg}`, type: "err" });
+        } catch {}
+        return;
+      }
+      const send = (parts: any[]) => c.session.prompt({ path: { id: sid }, body: { noReply: false, parts } });
+
+      // 只发文本(参考实现同为纯文本;图片由工具附件/缓存路径交付,不在 prompt 里塞图片 part)
+      log.info(`[poller] prompt -> sid=${sid} parts=text-only textLen=${text.length}`);
+      const res = await send([{ type: "text", text }]);
+      const err = res?.error;
+      if (err) {
+        // 不再静默:写日志 + 页面通知(SDK 返回 {error} 不抛,必须显式检查)
+        log.error(`[poller] prompt FAILED sid=${sid}: ${JSON.stringify(err).slice(0, 300)}`, new Error("prompt error"));
+        try {
+          await service.notify({ message: `发送记录失败: ${JSON.stringify(err).slice(0, 180)}`, type: "err" });
+        } catch {}
+      } else {
+        log.info(`[poller] prompt OK sid=${sid} delivered ${records.length} record(s)`);
+      }
+    } catch (e) {
+      // 不终止轮询(此前 clearInterval 会导致后续发送永久"无反应")
+      log.error("annotate poller error", e as Error);
     }
   }, POLL_MS);
   // 不阻塞进程退出

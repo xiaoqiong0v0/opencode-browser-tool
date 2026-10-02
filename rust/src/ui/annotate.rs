@@ -373,6 +373,7 @@ impl Annotator {
             rect,
             note: note.to_string(),
             image,
+            sent: false,
         });
         let list = records.clone();
         drop(records);

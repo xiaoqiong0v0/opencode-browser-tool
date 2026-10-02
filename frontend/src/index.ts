@@ -47,7 +47,13 @@ class Panel {
 
     // 底部发送按钮:发送所有记录(批注+截图),结果用统一 toast 通知
     this.doms.btnSend.addEventListener("click", () => {
+      // 诊断日志:面板控制台可见(注意 /api/console-logs 读的是"页面"控制台,面板不在此内)
+      const imgs = this.records.filter((r) => r.type === "screenshot" && r.image);
+      console.log(
+        `[send] panel send-all: records=${this.records.length} ids=[${this.records.map((r) => r.index).join(",")}] images=${imgs.length} imageBytes=[${imgs.map((r) => (r.image || "").length).join(",")}]`,
+      );
       void invoke<boolean>("panel_cmd", { cmd: "send-all" }).then((sent) => {
+        console.log(`[send] panel send-all result: sent=${sent}`);
         if (sent) {
           this.notify("已发送所有记录", "ok");
         } else {

@@ -85,6 +85,9 @@ pub struct AnnotationRecord {
     /// 截图记录:Png base64(仅 screenshot 类型有值)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+    /// 是否已发送过:发送后记录仍保留(便于 list_records/read_record_content 继续读取图片),仅标记
+    #[serde(default)]
+    pub sent: bool,
 }
 
 /// UI 状态(跨线程共享)
@@ -1044,15 +1047,17 @@ pub fn close_panel(app: &AppHandle) {
     emit_tabs_changed(app);
 }
 
-/// 发送所有记录:快照入 sent_records 队列(插件端轮询 consume)并清空已发送记录,返回记录数量
-/// 面板"发送"、批注/截图"发送"按钮共用
+/// 发送未发送过的记录:快照入 sent_records 队列(插件端轮询 consume),并把记录标记为已发送
+/// **不再清空 records** —— 发送后 list_records / read_record_content 仍可读到内容(含截图图片)
+/// 面板"发送"、批注/截图"发送"按钮共用;返回本次新发送的条数
 pub fn send_all_records(app: &AppHandle) -> usize {
     let state = app.state::<UiState>();
-    let records = state.records.lock().unwrap();
-    let count = records.len();
+    let mut records = state.records.lock().unwrap();
     let items: Vec<serde_json::Value> = records
-        .iter()
+        .iter_mut()
+        .filter(|r| !r.sent)
         .map(|r| {
+            r.sent = true;
             serde_json::json!({
                 "index": r.index,
                 "type": r.typ,
@@ -1064,11 +1069,21 @@ pub fn send_all_records(app: &AppHandle) -> usize {
             })
         })
         .collect();
+    let count = items.len();
+    // 诊断日志("面板发送 → agent 收到"链路第 2 断点;经插件转发写入日志文件)
+    eprintln!(
+        "[send] send_all_records: count={} ids={:?} images={:?}",
+        count,
+        items.iter().filter_map(|v| v.get("index").and_then(|x| x.as_u64())).collect::<Vec<_>>(),
+        items
+            .iter()
+            .filter(|v| v.get("image").map(|i| !i.is_null()).unwrap_or(false))
+            .map(|v| format!("#{}:{}B", v["index"], v["image"].as_str().map(str::len).unwrap_or(0)))
+            .collect::<Vec<_>>()
+    );
     drop(records);
-    // 清空已发送的记录(发送后不再保留)
-    state.records.lock().unwrap().clear();
     *state.sent_records.lock().unwrap() = items;
-    // 通知面板刷新(空列表)
+    // 面板刷新为空列表(记录仍在 Rust 侧保留,仅标记已发送)
     use tauri::Emitter;
     if let Some(panel) = panel_webview(app) {
         let _ = panel.emit("records-changed", Vec::<AnnotationRecord>::new());

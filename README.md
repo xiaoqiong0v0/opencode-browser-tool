@@ -145,7 +145,7 @@ opencode（Bun）
 | `bt_click_and_switch_tab` | `selector`(string) 必填 | 点击元素；若触发新标签则自动切换，返回当前 URL |
 | `bt_iframe_click` | `iframeSelector`, `selector`(string) 必填 | 在 iframe 中点击（仅同源可访问） |
 | `bt_iframe_fill` | `iframeSelector`, `selector`, `value`(string) 必填 | 在 iframe 中输入（仅同源可访问） |
-| `bt_get_browser_status` | 无 | 返回 open/url/title/tabs 数量 |
+| `bt_get_browser_status` | 无 | **纯查询、不启动浏览器**：运行中返回 open/url/title/tabs 数量；未运行时返回未运行提示 + bt-shell 二进制状态（下载中/就绪/失败/禁用） |
 | `bt_list_tabs` | 无 | 列出标签页（索引+URL） |
 | `bt_switch_tab` | `index`(number) 必填 | 按位置（0 起）切换标签 |
 | `bt_new_tab` | `url`(string) 必填 | 新建独立标签页（真多标签）并导航 |
@@ -163,8 +163,8 @@ opencode（Bun）
 | `bt_expect_response` | `url`(string) 必填 | 记录期望匹配的响应模式，清空响应历史后重新捕获 |
 | `bt_assert_response` | `id`(string) 必填 | 断言是否存在匹配的响应（返回 `url` + `status` 码） |
 | `bt_get_accessibility_tree` | `selector`, `maxDepth`(number) | 返回页面可访问性树（role/name/value 嵌套结构） |
-| `bt_list_records` | 无 | 列出批注/截图记录（索引/标签/说明） |
-| `bt_read_record_content` | `id`(number) 必填 | 读取单条记录详情 |
+| `bt_list_records` | 无 | 列出批注/截图记录（索引/标签/说明；截图带 `+img`，已发送带 `[sent]`） |
+| `bt_read_record_content` | `id`(number) 必填 | 读取单条记录详情（截图附带图片大小与落盘路径） |
 
 ## 设备预设
 

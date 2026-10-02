@@ -1045,6 +1045,12 @@ impl App {
         // 返回自上次消费后标记的记录
         let mut sent = state.sent_records.lock().unwrap();
         let items: Vec<serde_json::Value> = sent.drain(..).collect();
+        // 诊断日志("面板发送 → agent 收到"链路第 3 断点;经插件转发写入日志文件)
+        eprintln!(
+            "[send] consume-sent: {} record(s) ids={:?}",
+            items.len(),
+            items.iter().filter_map(|v| v.get("index").and_then(|x| x.as_u64())).collect::<Vec<_>>()
+        );
         Ok(json!({ "records": items }))
     }
 }

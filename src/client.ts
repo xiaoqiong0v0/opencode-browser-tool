@@ -2,7 +2,7 @@ import { spawn } from "child_process";
 import { resolve, dirname } from "path";
 import { existsSync } from "fs";
 import { fileURLToPath } from "url";
-import createLogger from "@xiaoqiong0v0/opencode-plugin-logger";
+import { log } from "./logger.js";
 
 import { cachedBinaryPath, describeBinaryStatus, ensureBinary } from "./binary.js";
 
@@ -126,7 +126,6 @@ async function waitForReady(baseUrl: string, timeoutMessage: string): Promise<vo
 
 /** 附着到外部已运行的 shell(不 spawn):等待就绪后记录 base URL */
 async function attachToService(baseUrl: string): Promise<void> {
-  const log = createLogger("opencode-browser-tool");
   attachMode = true;
   log.info(`Attaching to existing bt-shell at ${baseUrl} (no spawn)`);
   await waitForReady(
@@ -145,7 +144,6 @@ export async function startService(
   browserType?: string,
   userDataDir?: string,
 ): Promise<void> {
-  const log = createLogger("opencode-browser-tool");
   attachMode = false;
   let shell = resolveShellBinary();
   // 未就绪:先(有界)等待下载完成;失败/超时给出明确提示
@@ -167,6 +165,15 @@ export async function startService(
   // 多用户配置:userDataDir 指向独立 WebView2 用户数据目录
   if (userDataDir) args.push("--user-data-dir", userDataDir);
   serviceProcess = spawn(shell, args, { stdio: ["ignore", "pipe", "pipe"] });
+  // 把 shell 的 stdout/stderr 转发进共享日志:Rust 侧 println!/eprintln! 默认被管道吞掉(无人读取 → 日志永远看不到)
+  const forwardShell = (tag: string) => (chunk: Buffer) => {
+    for (const line of chunk.toString().split(/\r?\n/)) {
+      const s = line.trim();
+      if (s) log.info(`${tag} ${s}`);
+    }
+  };
+  serviceProcess.stdout?.on("data", forwardShell("[shell:out]"));
+  serviceProcess.stderr?.on("data", forwardShell("[shell:err]"));
 
   // 等待服务就绪(轮询端口)
   const baseUrl = `http://127.0.0.1:${port}`;
@@ -177,7 +184,6 @@ export async function startService(
 }
 
 export async function stopService(): Promise<void> {
-  const log = createLogger("opencode-browser-tool");
   if (attachMode) {
     // 附着模式:外部 shell 进程不归插件管,只清空本地状态
     log.info("Detached from external bt-shell (process left running)");
@@ -200,6 +206,32 @@ export async function openWindow(): Promise<void> {
 /** 服务当前是否运行 */
 export function isRunning(): boolean {
   return serviceReady;
+}
+
+/**
+ * 纯查询：探测 shell 是否在运行，**绝不 spawn**。
+ * 仅在本进程已启动/附着（`serviceBaseUrl` 已知）时做一次短超时 HTTP 探测；否则返回 null。
+ * 用于 `get_browser_status` 这类只读命令，避免查询也弹出浏览器窗口。
+ */
+export async function probeStatus(timeoutMs = 1500): Promise<any | null> {
+  if (!serviceReady || !serviceBaseUrl) return null;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+  try {
+    const res = await fetch(`${serviceBaseUrl}/api/status`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+      signal: ac.signal,
+    });
+    if (!res.ok) return null;
+    const json = await res.json();
+    return json?.success ? json.data : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function cmd(name: string) {
