@@ -33,6 +33,7 @@
 - Mutex 加锁注意提前 drop，避免同一线程重入死锁（emit_mode_state 曾卡死 HTTP 服务）
 - 前端 build 的 copyHtml 可能不更新 dist HTML（esbuild 缓存）→ 需手动 Copy-Item src/*.html dist/
 - 调试注意：非 DPI 感知进程读取 GetWindowRect 得到虚拟化坐标，截图会错位
+- **插件持有 exe 文件锁 → 部署新二进制必须先退出 opencode**：opencode 启动时 spawn `rust/target/release/bt-shell.exe`，运行期间该文件被锁，此时 `cargo build --release` 会在最后一步报 `failed to remove file ... (os error 5)`（编译已完成，只是拷贝被拒），**磁盘上的产物不可信任**。部署顺序：退出 opencode（确认 shell 也已退出）→ 在 `rust/` 执行 `cargo build --release` → 重新启动 opencode（插件用它拉起 shell）；构建失败后不要依赖旧产物，退出 opencode 后重跑构建。同理，插件 TS（`dist/`）的改动也需要重启 opencode 才会生效
 
 ## 待办
 
