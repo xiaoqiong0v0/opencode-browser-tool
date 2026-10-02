@@ -2,12 +2,11 @@
 //! Windows:CDP(复用截图同款 ICoreWebView2 + CallDevToolsProtocolMethod 通道)
 //!   整页与 selector 子树均基于 Accessibility.getFullAXTree(selector 子树另经 DOM 定位命中节点)
 //! Linux(WebKitGTK):ATK/AT-SPI 需要可用的 a11y bus(WSLg/Kali 不可用),改用页面 DOM 近似重建(同结构)
-#[cfg(windows)]
-use std::sync::mpsc;
-
 use tauri::AppHandle;
 
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(windows)]
+use crate::control::cdp;
+#[cfg(target_os = "linux")]
 use crate::ui;
 #[cfg(windows)]
 use serde_json::json;
@@ -25,7 +24,7 @@ pub fn accessibility_tree(
             Some(s) if !s.is_empty() => cdp_subtree(app, s),
             // 无 selector:整页(原行为)
             _ => {
-                let raw = cdp_call_json(app, "Accessibility.getFullAXTree", "{}")?;
+                let raw = cdp::call_json(app, "Accessibility.getFullAXTree", "{}")?;
                 // CDP 返回 { "nodes": [...] }
                 let v: serde_json::Value =
                     serde_json::from_str(&raw).map_err(|e| format!("parse cdp result: {e}"))?;
@@ -45,56 +44,6 @@ pub fn accessibility_tree(
     }
 }
 
-/// 调用任意 CDP 方法并返回其结果 JSON
-/// jsonResult 即 CDP 的 result 对象本身(不带 id/result 信封)
-#[cfg(windows)]
-fn cdp_call_json(app: &AppHandle, method_name: &str, params_json: &str) -> Result<String, String> {
-    let page = ui::active_page_webview(app).ok_or("page webview not ready")?;
-    let (tx, rx) = mpsc::channel::<Result<String, String>>();
-    let tx2 = tx.clone();
-    let method_str = method_name.to_string();
-    let params_str = params_json.to_string();
-    page.with_webview(move |platform_webview| {
-        let controller = platform_webview.controller();
-        unsafe {
-            use webview2_com::CallDevToolsProtocolMethodCompletedHandler;
-            use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2;
-            use windows::core::Interface;
-
-            let webview_result: Result<ICoreWebView2, String> = controller
-                .CoreWebView2()
-                .map_err(|e| format!("get webview failed: {e}"));
-            match webview_result {
-                Err(e) => { let _ = tx.send(Err(e)); }
-                Ok(webview) => {
-                    let method = windows::core::HSTRING::from(method_str.as_str());
-                    let params = windows::core::HSTRING::from(params_str.as_str());
-                    let result = CallDevToolsProtocolMethodCompletedHandler::wait_for_async_operation(
-                        Box::new(move |handler| {
-                            webview
-                                .CallDevToolsProtocolMethod(&method, &params, &handler)
-                                .map_err(webview2_com::Error::from)
-                        }),
-                        Box::new(
-                            move |_result: windows::core::Result<()>, json: String| -> windows::core::Result<()> {
-                                let _ = tx2.send(Ok(json));
-                                Ok(())
-                            },
-                        ),
-                    );
-                    if let Err(e) = result {
-                        let _ = tx.send(Err(e.to_string()));
-                    }
-                }
-            }
-        }
-    })
-    .map_err(|e| format!("with_webview failed: {e}"))?;
-
-    rx.recv_timeout(std::time::Duration::from_secs(10))
-        .map_err(|_| "accessibility timeout".to_string())?
-}
-
 /// 按 selector 取元素子树(Windows)
 /// 链路:DOM.getDocument → DOM.querySelector → DOM.describeNode 取 backendNodeId
 ///      → Accessibility.getFullAXTree → 以命中节点为根重建该元素子树
@@ -108,7 +57,7 @@ fn cdp_call_json(app: &AppHandle, method_name: &str, params_json: &str) -> Resul
 #[cfg(windows)]
 fn cdp_subtree(app: &AppHandle, selector: &str) -> Result<serde_json::Value, String> {
     // 1. 取文档根节点(depth:0 只需 root)
-    let doc_raw = cdp_call_json(app, "DOM.getDocument", r#"{"depth":0}"#)?;
+    let doc_raw = cdp::call_json(app, "DOM.getDocument", r#"{"depth":0}"#)?;
     let doc: serde_json::Value =
         serde_json::from_str(&doc_raw).map_err(|e| format!("parse DOM.getDocument: {e}"))?;
     let root_id = doc
@@ -118,7 +67,7 @@ fn cdp_subtree(app: &AppHandle, selector: &str) -> Result<serde_json::Value, Str
         .ok_or("DOM.getDocument: no root nodeId")?;
     // 2. 查询选择器命中的 DOM 节点(nodeId=0 表示未命中)
     let q_params = json!({ "nodeId": root_id, "selector": selector }).to_string();
-    let q_raw = cdp_call_json(app, "DOM.querySelector", &q_params)?;
+    let q_raw = cdp::call_json(app, "DOM.querySelector", &q_params)?;
     let q: serde_json::Value =
         serde_json::from_str(&q_raw).map_err(|e| format!("parse DOM.querySelector: {e}"))?;
     let node_id = q.get("nodeId").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -127,7 +76,7 @@ fn cdp_subtree(app: &AppHandle, selector: &str) -> Result<serde_json::Value, Str
     }
     // 3. 该节点的 backendNodeId(AX 节点用它定位命中的 DOM 节点)
     let d_params = json!({ "nodeId": node_id }).to_string();
-    let d_raw = cdp_call_json(app, "DOM.describeNode", &d_params)?;
+    let d_raw = cdp::call_json(app, "DOM.describeNode", &d_params)?;
     let d: serde_json::Value =
         serde_json::from_str(&d_raw).map_err(|e| format!("parse DOM.describeNode: {e}"))?;
     let backend_id = d
@@ -138,7 +87,7 @@ fn cdp_subtree(app: &AppHandle, selector: &str) -> Result<serde_json::Value, Str
     // 4. 全量 AX 树快照(含 ignored 节点,父子关系完整)
     //    不用 getPartialAXTree:实测它只返回命中节点 + 直接子节点 + 祖先,
     //    拿不到完整后代子树(且 fetchRelatives=false 时连后代都没有)
-    let full_raw = cdp_call_json(app, "Accessibility.getFullAXTree", "{}")?;
+    let full_raw = cdp::call_json(app, "Accessibility.getFullAXTree", "{}")?;
     let full: serde_json::Value =
         serde_json::from_str(&full_raw).map_err(|e| format!("parse getFullAXTree: {e}"))?;
     let nodes = full.get("nodes").and_then(|n| n.as_array()).cloned().unwrap_or_default();

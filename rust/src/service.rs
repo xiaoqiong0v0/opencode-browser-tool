@@ -298,34 +298,13 @@ impl App {
 
     async fn press_key(&self, body: &Value) -> Result<Value, String> {
         let key = body.get("key").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if key.is_empty() {
+            return Err("key is required".into());
+        }
+        let selector = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let handle = self.handle.clone();
-        // 通过 eval 派发键盘事件(Enter/Escape 等常用键)
-        let key_map: &[(&str, &str)] = &[
-            ("Enter", "Enter"),
-            ("Escape", "Escape"),
-            ("Tab", "Tab"),
-            ("Backspace", "Backspace"),
-            ("ArrowUp", "ArrowUp"),
-            ("ArrowDown", "ArrowDown"),
-            ("ArrowLeft", "ArrowLeft"),
-            ("ArrowRight", "ArrowRight"),
-        ];
-        let code = key_map
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(&key))
-            .map(|(_, c)| c.to_string())
-            .unwrap_or_else(|| key.clone());
-        let js = format!(
-            r#"(function(){{
-              const el = document.activeElement || document.body;
-              el.dispatchEvent(new KeyboardEvent("keydown", {{key:{k:?},code:{k:?},bubbles:true}}));
-              el.dispatchEvent(new KeyboardEvent("keypress", {{key:{k:?},code:{k:?},bubbles:true}}));
-              el.dispatchEvent(new KeyboardEvent("keyup", {{key:{k:?},code:{k:?},bubbles:true}}));
-              return {{ok:true}};
-            }})()"#,
-            k = code
-        );
-        tokio::task::block_in_place(|| control::eval(&handle, &js))?;
+        // 可信键盘注入:Windows 走 CDP(先聚焦 selector),非 Windows 未实现则明确报错
+        tokio::task::block_in_place(|| control::keyboard::press_key(&handle, &key, &selector))?;
         Ok(json!({ "pressed": key }))
     }
 
