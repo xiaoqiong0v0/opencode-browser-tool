@@ -1,9 +1,12 @@
 # Kali(Linux)可信输入复验清单
 
 > 目的：在**真实 Linux 桌面**（GNOME/KDE，Wayland 或 X11）上复验 Linux 侧的可信输入与降级策略。
-> 依据与 WSLg 取证见 `.tmp/scratch/linux-gdk-evidence.md`；平台能力与降级规则见 `linux-support.md` §7。
+> 平台能力与降级规则见 `linux-support.md` §7；GDK `gdk_event_put` 机制与 WSLg 实测结论见 `linux-support.md` §7.2。
 > 所有命令可直接照抄，只有 `<PORT>`、路径与发行版名需按环境替换。
 > 一键复验：`bash tests/manual/verify-linux.sh`（自动构建+起实例+跑 15 项+打印 PASS/FAIL 报告；`--keep` 保留实例，`--no-build` 跳过构建）
+>
+> **验证状态**：WSLg（Kali）下该脚本连跑 5 次均 **15/15 通过**；真实 Linux 桌面待用户复验。
+> §5 是**人工清单 17 项**；脚本自动覆盖其中 **15 项**（未自动化的两项：第 10 项 `select` multiple 的降级标注、第 12 项 `iframe_fill`）。
 
 ## 1. 前置依赖
 

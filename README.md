@@ -20,7 +20,7 @@ opencode 插件：Tauri 多 Webview 浏览器外壳 + 零注入视觉元素选�
 `%USERPROFILE%\.opencode\plugins-data\opencode-browser-tool\<triple>\bt-shell.exe`），并**就地覆盖**同一路径
 （不按插件版本建目录）；同目录另有 `bt-shell.version.json` 记录该可执行文件的来源
 （`tag` / `asset` / `sha256` / `size` / `downloadedAt` / `sourceUrl`）。下载用 Release 的 `SHA256SUMS` 做
-sha256 校验（**幂等**：sha 与当前 release 期望值一致即跳过；**原子**替换；跨进程 `.lock`）。下载后台进行、**不阻塞 opencode 启动**；未就绪时工具调用会给出
+sha256 校验（**幂等**：sha 与当前 release 期望值一致即跳过；**原子**替换；跨进程 `.lock`；Linux 下载后 `chmod 755`）。下载后台进行、**不阻塞 opencode 启动**；未就绪时工具调用会给出
 明确提示（下载进度 / 失败原因），不会假装成功。
 
 平台支持与系统依赖：
@@ -105,12 +105,13 @@ opencode（Bun）
 
 | 类别 | 工具 |
 |------|------|
-| **导航** | `bt_navigate`, `bt_go_back`, `bt_go_forward`, `bt_reload`, `bt_close` |
+| **导航** | `bt_navigate`, `bt_go_back`, `bt_go_forward`, `bt_reload`, `bt_open_window`, `bt_close` |
 | **交互** | `bt_click`, `bt_fill`, `bt_clear`, `bt_select`, `bt_hover`, `bt_drag`, `bt_press_key`, `bt_upload_file`, `bt_iframe_click`, `bt_iframe_fill` |
 | **标签页** | `bt_list_tabs`, `bt_switch_tab`, `bt_new_tab`, `bt_close_tab`, `bt_click_and_switch_tab` |
 | **信息** | `bt_screenshot`, `bt_evaluate`, `bt_get_visible_text`, `bt_get_visible_html`, `bt_console_logs`, `bt_get_browser_status`, `bt_get_element_state`, `bt_get_dropdown_options`, `bt_list_records`, `bt_expect_response`, `bt_assert_response`, `bt_get_accessibility_tree` |
 | **滚动/等待** | `bt_scroll`, `bt_scroll_to_element`, `bt_wait_for_selector`, `bt_resize`, `bt_set_device` |
 | **设备/工具** | `bt_custom_user_agent`, `bt_devtools`（开发者工具开关） |
+| **媒体/本地** | `bt_fake_audio`, `bt_fake_video`, `bt_profile`, `bt_exports`, `bt_lookup` |
 | **其他** | `bt_show_notification`, `bt_read_record_content` |
 
 ### 工具参数
@@ -126,7 +127,7 @@ opencode（Bun）
 | `bt_drag` | `sourceSelector`, `targetSelector`(string) 必填 | 从源元素拖到目标元素 |
 | `bt_press_key` | `key`(string) 必填, `selector`(string) 可选 | 按键（如 Enter/Escape）；可指定聚焦元素 |
 | `bt_upload_file` | `selector`, `filePath`(string) 必填 | 向文件输入框上传文件 |
-| `bt_screenshot` | `selector`(string) 可选（当前忽略） | 截取当前视口，返回图片附件（PNG） |
+| `bt_screenshot` | `selector`(string) 可选 | 截取视口；指定 `selector` 时截该元素区域（PNG 图片附件） |
 | `bt_evaluate` | `script`(string) 必填 | 在页面执行 JS 并返回 JSON 结果 |
 | `bt_get_visible_text` | `selector`(string) 可选 | 返回页面/元素可见文本 |
 | `bt_get_visible_html` | `selector`, `removeScripts`(boolean), `removeComments`(boolean), `maxLength`(number) | 返回页面/元素 HTML |
@@ -152,7 +153,13 @@ opencode（Bun）
 | `bt_get_element_state` | `selector`(string) 必填 | 返回元素可见性/文本/位置 |
 | `bt_scroll_to_element` | `selector`(string) 必填 | 滚动到元素 |
 | `bt_get_dropdown_options` | `selector`(string) 必填 | 列出下拉框选项 |
-| `bt_custom_user_agent` | `userAgent`(string) 必填 | 设置自定义 User-Agent（仅 Windows 支持） |
+| `bt_custom_user_agent` | `userAgent`(string) 必填 | 设置自定义 User-Agent（Windows/Linux 支持；macOS 未实现） |
+| `bt_open_window` | 无 | 打开浏览器窗口（未启动则启动；已启动幂等） |
+| `bt_fake_audio` | `kind`(string) 必填，`data`/`freq`/`durMs`/`notes`/`digits`(string)，`loop`(boolean) | 向页面注入模拟麦克风音频 |
+| `bt_fake_video` | `kind`(string) 必填，`data`/`url`(string)，`loop`(boolean) | 向页面注入模拟摄像头画面 |
+| `bt_profile` | `set` / `delete`(string) 可选 | user-data 配置管理：空参列出；`--set` 切换并重启服务；`--delete` 删除（默认/激活项除外） |
+| `bt_exports` | 无 | 显示导出目录与 Edge/Chrome 导出指引 |
+| `bt_lookup` | `csv`, `url`(string) 必填 | 从密码 CSV 按站点匹配并返回凭据（写入临时文件，不进上下文） |
 | `bt_expect_response` | `url`(string) 必填 | 记录期望匹配的响应模式，清空响应历史后重新捕获 |
 | `bt_assert_response` | `id`(string) 必填 | 断言是否存在匹配的响应（返回 `url` + `status` 码） |
 | `bt_get_accessibility_tree` | `selector`, `maxDepth`(number) | 返回页面可访问性树（role/name/value 嵌套结构） |
@@ -170,7 +177,7 @@ opencode（Bun）
 | iPhone | `iphone-15-pro`, `iphone-14`, `iphone-13`, `iphone-12`, `iphone-se` |
 | Android | `pixel-7`, `pixel-6`, `galaxy-s23` |
 
-切换时自动调整窗口尺寸并运行时修改 UA（UA 修改仅 Windows 支持）。
+切换时自动调整窗口尺寸并运行时修改 UA（UA 修改 Windows/Linux 支持；macOS 未实现）。
 
 ## 批注 / 截图
 
@@ -190,12 +197,25 @@ opencode（Bun）
 
 ## 发布
 
+版本规则见上文「版本与产物策略」：**动了 Rust / 发新 exe 才升中间位（minor）**，纯插件改动只升末位（patch）；**二进制资产只挂在 `x.Y.0` 的 Release 上**（插件 patch 版本由自身版本推导二进制 tag）。
+
 ```bash
-cd rust && cargo build --release
+# 1) 定版本（动 Rust 用 minor；纯插件用 patch）
+npm version <x.y.z> --no-git-tag-version
+# 2) 构建插件产物（清空 dist 再建，避免孤儿 .js）
+npm run build
+# 3) 提交 + 打 tag + 建 Release（tag = v<x.y.z>）
+#    只有动 Rust 时才需要为 x.Y.0 上传各平台二进制 + SHA256SUMS：
+gh release create v<x.y.z> --title v<x.y.z> --notes "..."
+gh release upload v<x.y.z> <各平台二进制> SHA256SUMS --clobber
+# 4) 发布 npm 包（只含 dist；不含二进制）
 npm publish
 ```
 
-只发布 `dist/`（`files: ["dist"]`）。
+- `SHA256SUMS` 每行 `<sha256>  <文件名>`（两空格），文件名不带路径。
+- npm 包只带 `dist/`（`files: ["dist"]`）；原生二进制由运行时从 Release 下载（见「二进制获取」）。
+- **先本地自测**：可用 `.tmp/publish-local.ps1` 覆盖到 opencode 插件缓存后重启验证（做法与脚本模板见技能 `xqv-plugin-release`）。
+- **部署顺序（exe 文件锁）**：若已有 opencode 实例在跑，`cargo build --release` 会在最后一步报 `failed to remove file ... (os error 5)`（产物不可信）→ 先**退出 opencode**（确认 shell 也退出）→ 构建 → 重新启动。TS 改动需 `npm run build` 重建 `dist/`。
 
 ## 开发
 
@@ -208,4 +228,7 @@ npm run build
 ## 文档
 
 - [docs/v5-tauri-architecture.md](./docs/v5-tauri-architecture.md) — V5 当前架构
-- [docs/implementation.md](./docs/implementation.md) — 实施状态
+- [docs/implementation.md](./docs/implementation.md) — 实施状态与关键经验
+- [docs/linux-support.md](./docs/linux-support.md) — Linux 适配、硬性约定，及 §7「平台能力与降级策略」（可信通道/降级矩阵）
+- [docs/linux-verification.md](./docs/linux-verification.md) — Kali/Linux 可信输入复验清单（含 `tests/manual/verify-linux.sh` 一键 15 项）
+- [docs/README.md](./docs/README.md) — docs 索引

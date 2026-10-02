@@ -15,6 +15,7 @@
 | 开发者工具 | ✅ | 开关状态用 wry 的真实 `is_devtools_open()`（Windows 上 wry 该值为恒 false，需另用本地标记） |
 | 网络响应捕获 / 新窗口拦截 | ✅ | 见 §6 |
 | 可访问性树 | ⚠️ 近似 | 见 §6（ATK 需 a11y bus，精简环境不可用） |
+| 可信输入（键盘/鼠标/文本/拖拽） | ✅（部分明确报错） | 无 CDP，改用 GDK `gdk_event_put` 注入原生事件（见 §7）；`upload_file` / `drag` 无可信通道 → **明确报错** |
 | 运行时改 User-Agent | ✅ | `WebKitSettings::set_user_agent`（仅当前页面 Webview） |
 | 媒体权限放行 | ✅ | `permission-request` 信号 → `UserMediaPermissionRequest.allow()` |
 | macOS | ❌ | 未实现（截图等仍为 stub） |
@@ -93,7 +94,7 @@ WebKitGTK：`WebViewExt::snapshot(SnapshotRegion::Visible, SnapshotOptions::NONE
 
 ### 7.2 Linux 可信输入实现（GDK）
 
-`rust/src/control/gdk.rs`：在 GTK 主线程（`webview.with_webview`）用 `gdk_event_put` 注入合成 `GdkEvent`（键盘 `GdkEventKey`、指针 `GdkEventMotion`/`GdkEventButton`），由 GTK 分发给 `WebKitWebView`（等于原生事件）。事件的 `window` 指向 webview 的 GdkWindow；若 webview 没有独立 GdkWindow（事件窗口是 toplevel），坐标会自动加上 webview 原点偏移。取证过程与实测输出见 `.tmp/scratch/linux-gdk-evidence.md`。
+`rust/src/control/gdk.rs`：在 GTK 主线程（`webview.with_webview`）用 `gdk_event_put` 注入合成 `GdkEvent`（键盘 `GdkEventKey`、指针 `GdkEventMotion`/`GdkEventButton`），由 GTK 分发给 `WebKitWebView`（等于原生事件）。事件的 `window` 指向 webview 的 GdkWindow；若 webview 没有独立 GdkWindow（事件窗口是 toplevel），坐标会自动加上 webview 原点偏移。WSLg 实测已通过；一键复验见 `linux-verification.md`。
 
 关键实测结论（WSLg，页面侧读取）：
 
@@ -108,7 +109,7 @@ WebKitGTK：`WebViewExt::snapshot(SnapshotRegion::Visible, SnapshotOptions::NONE
 | 命令 | Windows（可信，CDP） | Linux（WebKitGTK） | 现状与限制 |
 |---|---|---|---|
 | `click` | `Input.dispatchMouseEvent`（moved→pressed→released） | **可信**：GDK motion+press+release | 两平台派发前均做命中测试/视口/disabled 校验；被遮挡/出视口/disabled → 明确报错 |
-| `hover` | `mouseMoved` | **可信**：GDK motion | 实测触发 CSS `:hover`；强制降级分支不触发 |
+| `hover` | `mouseMoved` | **可信**：GDK motion | 注入前等滚动/布局稳定、注入后轮询 `matches(':hover')` 确认，未生效则重试，仍失败**明确报错**（不假成功）；强制降级分支不触发 `:hover` |
 | `click_and_switch_tab` | 同 `click` | **可信**：同 `click` | Rust 侧只负责点击 + 200ms 后读 URL；"切标签"逻辑不在 Rust 侧 |
 | `iframe_click` | 内容坐标换算到顶层视口后 CDP 点击 | **可信**：同 Windows（GDK） | 仅支持顶层选择器定位的**单层 iframe**；跨域 iframe 两平台都明确报错 |
 | `fill` | focus → 全选 → `Input.insertText` → 轮询读回 | **可信**：focus → 全选 → GDK 逐字符按键 → 轮询读回 | 产生可信 `beforeinput`/`input`（受控组件可用）；读回超时不一致即报错 |
@@ -125,12 +126,9 @@ WebKitGTK：`WebViewExt::snapshot(SnapshotRegion::Visible, SnapshotOptions::NONE
 
 ### 7.4 时序/就绪（平台无关）
 
-`navigate` / `go_back` / `go_forward` 不再固定 sleep，而是等待就绪信号：`document.readyState` 达到
-`interactive`/`complete`，或观察到导航进展（URL 变化 / 曾进入 `loading`）；`scroll` 等待窗口滚动位置连续多次
-采样不变，`scroll_to_element` 额外校验元素真的进入视口（主路径用**立即** `scrollIntoView`，避免平滑滚动
-在嵌套滚动容器上停在中途；必要时兜底逐级滚动可滚动祖先 + 窗口）。均有**有界超时**（默认 navigate 15s、history 5s、
-scroll 3s），超时**如实回传** `ready:false` / `stable:false` / `reached:false` + `timedOut:true` + `waitedMs`，
-`scroll_to_element` 不可达时另带 `reason`，插件在结果文本后追加说明，不假装成功。
+`navigate` / `go_back` / `go_forward` 不再固定 sleep：先**确认确实发生了导航**——**文档身份**（`performance.timeOrigin`）或 **URL** 发生变化（`timeOrigin` 覆盖新文档加载与**同 URL 重载**；URL 覆盖 SPA `pushState` 与 bfcache 前进/后退）——再等新文档 `readyState` 达到 `interactive`/`complete`；避免把**旧文档的 `complete`** 误判为就绪。`scroll` 等待窗口滚动位置连续多次采样不变；`scroll_to_element` 额外校验元素真的进入视口（主路径用**立即** `scrollIntoView`，避免平滑滚动在嵌套滚动容器上停在中途；必要时兜底逐级滚动可滚动祖先 + 窗口）。
+
+均有**有界超时**（默认 navigate 15s、history 5s、scroll 3s），超时**如实回传**：`navigate`/`go_back`/`go_forward` 带 `ready`/`navigated`/`readyState`/`timedOut`/`waitedMs`；`scroll` 带 `stable`/`x`/`y`/`timedOut`/`waitedMs`；`scroll_to_element` 带 `reached`/`inViewport`/`stable`/`timedOut`/`waitedMs`（不可达时另带 `reason`）。插件在结果文本后追加说明，不假装成功。
 
 调试覆盖（起实例时设置）：`BT_NAV_TIMEOUT_MS`、`BT_HISTORY_TIMEOUT_MS`、`BT_SCROLL_TIMEOUT_MS`。
-Kali 复验步骤见 `linux-verification.md`。
+Kali 复验步骤见 `linux-verification.md`（WSLg 下 `tests/manual/verify-linux.sh` 连跑 5 次均 15/15 通过；真实 Linux 桌面待复验）。

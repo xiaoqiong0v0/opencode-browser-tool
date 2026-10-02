@@ -15,9 +15,12 @@
 - [x] V5.8 批注/截图双模式：遮罩式选区裁剪、保存需说明、发送后清空、记录卡片化、面板 toast
 - [x] V5.9 真多标签接 HTTP + 新窗口拦截（target=_blank → 新标签）+ z-order 置顶
 - [x] V5.10 工具补齐：expect/assert 网络响应捕获、可访问性树、插件取字段修复
-- [x] 插件命令与 Rust 端点已全部对齐，无不可用项
+- [x] 插件命令与 Rust 端点已全部对齐；**跨平台可用性**：Windows 全量可信，Linux 除 `upload_file`/`drag` **明确报错**外均可用（无 CDP/GDK 可信通道时的降级与标注见 `linux-support.md` §7），macOS 未实现
 - [x] 依赖清理：移除 adm-zip/esbuild/tsx 旧 Playwright 残留与 test/ 目录；lucide 移 devDependencies
 - [x] 截图 Linux 分支：WebKitGTK `WebView::snapshot`（Visible 区域）+ cairo 裁剪 → PNG base64
+- [x] 可信输入全链路：Windows CDP（`Input.dispatchKeyEvent`/`dispatchMouseEvent`/`DOM.setFileInputFiles`/鼠标序列拖拽）、Linux GDK `gdk_event_put`；统一降级策略（可信优先，无通道则 DOM/JS 兜底并在返回标注 `degraded`，原本不可用者明确报错）
+- [x] 时序/就绪：`navigate`/`go_back`/`go_forward` 等"确实发生导航（URL 或 `performance.timeOrigin` 变化）且新文档就绪"，`scroll` 等位置稳定，均**有界超时并如实报告**；`scroll_to_element` 支持内层滚动容器
+- [x] 二进制分发：插件启动后台从 GitHub Release 下载到固定路径并校验/原子替换/并发锁；版本策略（二进制只挂 `x.Y.0`、插件自动推导 tag）
 
 ### 关键经验
 - `eval_with_callback` 自动 JSON 序列化 JS 返回值，表达式直接返回对象（勿双重 stringify）
@@ -38,6 +41,6 @@
 
 ## 待办
 
-- 截图平台分支（macOS WKWebView snapshot）
-- 新窗口拦截 / 响应捕获 / 可访问性树 的 Linux/macOS 分支
-- Linux/macOS 实机验证
+- macOS：截图（WKWebView snapshot）、可信输入（无 CDP/GDK 通道，现走降级或明确报错）等平台分支
+- Linux：`upload_file` / `drag` 的可信通道未确证（当前**明确报错**，不假成功）；可访问性树为 DOM 近似
+- 真实 Linux 桌面（GNOME/KDE）复验（WSLg 已通过 15 项，见 `linux-verification.md`）
