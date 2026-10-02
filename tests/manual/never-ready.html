@@ -1,0 +1,15 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>never ready（就绪超时验证）</title>
+</head>
+<body>
+<h1>never ready</h1>
+<p>解析被一个指向不可路由地址(RFC5737 TEST-NET-1 192.0.2.1)的外部脚本阻塞：
+<code>document.readyState</code> 停在 <code>loading</code>、DOMContentLoaded 不触发，而 JS 线程仍空闲
+（可响应 evaluate）。用于验证 <code>navigate</code> 的有界超时。</p>
+<script src="http://192.0.2.1/never.js"></script>
+<div id="never-ready-after">（这行在脚本阻塞期间不会出现）</div>
+</body>
+</html>

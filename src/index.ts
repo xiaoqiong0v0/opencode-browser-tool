@@ -21,6 +21,25 @@ function degradedNote(r: any): string {
   return r && r.degraded ? ` (degraded: ${r.degradedReason || "untrusted fallback"})` : "";
 }
 
+/** 就绪说明:导航/前进后退未在超时内就绪时如实标注(不假装成功) */
+function readyNote(r: any): string {
+  if (!r || r.ready !== false) return "";
+  const rs = r.readyState ? `, readyState=${r.readyState}` : "";
+  return ` (not ready after ${r.waitedMs ?? "?"}ms${rs})`;
+}
+
+/** 滚动稳定说明:未在超时内稳定时如实标注 */
+function stableNote(r: any): string {
+  if (!r || r.stable !== false) return "";
+  return ` (scroll position not stable after ${r.waitedMs ?? "?"}ms)`;
+}
+
+/** scroll_to_element 到达说明:未进入视口时如实标注 */
+function reachedNote(r: any): string {
+  if (!r || r.reached !== false) return "";
+  return ` (element reached=${r.inViewport ? "in viewport" : "not in viewport"} after ${r.waitedMs ?? "?"}ms)`;
+}
+
 /** CLI 命令参数定义:flag=参数名,type=类型(string/boolean) */
 type CmdArg = { flag: string; type?: "string" | "boolean" };
 /** CLI 命令定义:usage=参数用法,descKey=命令描述 i18n 键(cli.cmd.*),args=可解析的 flag 表,run=执行 */
@@ -36,7 +55,7 @@ const COMMANDS: Record<string, CmdDef> = {
   navigate: { usage: "--url", descKey: "cli.cmd.navigate", args: [{ flag: "url" }], run: async (a) => {
     const r = await service.navigate(a);
     if (r.installError) return `Installation failed: ${r.error}. Retry.`;
-    return r.installing ? `Installing ${r.installing} (${r.progress}). Try again.` : `Navigated to: ${r.url}`;
+    return r.installing ? `Installing ${r.installing} (${r.progress}). Try again.` : `Navigated to: ${r.url}` + readyNote(r);
   } },
   click: { usage: "--selector", descKey: "cli.cmd.click", args: [{ flag: "selector" }], run: async (a) => { const r = await service.click(a); return "Clicked" + degradedNote(r); } },
   fill: { usage: "--selector --value", descKey: "cli.cmd.fill", args: [{ flag: "selector" }, { flag: "value" }], run: async (a) => { const r = await service.fill(a); return "Filled" + degradedNote(r); } },
@@ -61,8 +80,8 @@ const COMMANDS: Record<string, CmdDef> = {
     return r?.truncated ? `${html}\n…(truncated at maxLength=${html.length})` : html;
   } },
   console_logs: { usage: "[--type --search --limit --clear]", descKey: "cli.cmd.console_logs", args: [{ flag: "type" }, { flag: "search" }, { flag: "limit" }, { flag: "clear", type: "boolean" }], run: async (a) => { const r = await service.consoleLogs(a); return (r.logs || []).join("\n") || "(no logs)"; } },
-  go_back: { usage: "", descKey: "cli.cmd.go_back", run: async () => { const r = await service.goBack(); return `Went back, current URL: ${r.url}`; } },
-  go_forward: { usage: "", descKey: "cli.cmd.go_forward", run: async () => { const r = await service.goForward(); return `Went forward, current URL: ${r.url}`; } },
+  go_back: { usage: "", descKey: "cli.cmd.go_back", run: async () => { const r = await service.goBack(); return `Went back, current URL: ${r.url}` + readyNote(r); } },
+  go_forward: { usage: "", descKey: "cli.cmd.go_forward", run: async () => { const r = await service.goForward(); return `Went forward, current URL: ${r.url}` + readyNote(r); } },
   resize: { usage: "--width --height", descKey: "cli.cmd.resize", args: [{ flag: "width" }, { flag: "height" }], run: async (a) => { await service.resize(a); return "Resized"; } },
   set_device: { usage: "[--name]", descKey: "cli.cmd.set_device", args: [{ flag: "name" }], run: async (a) => {
     if (!a.name) {
@@ -77,7 +96,7 @@ const COMMANDS: Record<string, CmdDef> = {
   open_window: { usage: "", descKey: "cli.cmd.open_window", run: async () => { await openWindow(); return "Browser window opened"; } },
   close: { usage: "", descKey: "cli.cmd.close", run: async () => { if (!isRunning()) return "Browser already closed"; await service.close(); await stopService(); return "Browser closed"; } },
   show_notification: { usage: "--message [--type]", descKey: "cli.cmd.show_notification", args: [{ flag: "message" }, { flag: "type" }], run: async (a) => { await service.notify(a); return "Notification shown"; } },
-  scroll: { usage: "[--direction --amount]", descKey: "cli.cmd.scroll", args: [{ flag: "direction" }, { flag: "amount" }], run: async (a) => { await service.scroll(a); return `Scrolled ${a.direction || "down"} by ${a.amount || 300}px`; } },
+  scroll: { usage: "[--direction --amount]", descKey: "cli.cmd.scroll", args: [{ flag: "direction" }, { flag: "amount" }], run: async (a) => { const r = await service.scroll(a); return `Scrolled ${a.direction || "down"} by ${a.amount || 300}px` + stableNote(r); } },
   wait_for_selector: { usage: "--selector [--timeout]", descKey: "cli.cmd.wait_for_selector", args: [{ flag: "selector" }, { flag: "timeout" }], run: async (a) => { await service.waitForSelector(a); return "Element appeared"; } },
   click_and_switch_tab: { usage: "--selector", descKey: "cli.cmd.click_and_switch_tab", args: [{ flag: "selector" }], run: async (a) => { const r = await service.clickSwitchTab(a); return `Clicked ${a.selector}, current URL: ${r.url || ""}` + degradedNote(r); } },
   iframe_click: { usage: "--iframeSelector --selector", descKey: "cli.cmd.iframe_click", args: [{ flag: "iframeSelector" }, { flag: "selector" }], run: async (a) => { const r = await service.iframeClick(a); return "Clicked in iframe" + degradedNote(r); } },
@@ -93,7 +112,7 @@ const COMMANDS: Record<string, CmdDef> = {
   new_tab: { usage: "--url", descKey: "cli.cmd.new_tab", args: [{ flag: "url" }], run: async (a) => { const r = await service.newTab(a); return `New tab opened: ${r.url}`; } },
   close_tab: { usage: "[--index]", descKey: "cli.cmd.close_tab", args: [{ flag: "index" }], run: async (a) => { await service.closeTab(a); return a.index !== undefined ? `Closed tab #${a.index}` : "Closed current tab"; } },
   get_element_state: { usage: "--selector", descKey: "cli.cmd.get_element_state", args: [{ flag: "selector" }], run: async (a) => { const r: any = await service.elementState(a); if (!r || !r.exists) return `Element not found: ${a.selector}`; return `Element <${r.tag}>: ${a.selector}\nVisible: ${r.visible}${r.text ? `\nText: ${r.text}` : ""}\nRect: ${r.rect.x},${r.rect.y} ${r.rect.w}x${r.rect.h}`; } },
-  scroll_to_element: { usage: "--selector", descKey: "cli.cmd.scroll_to_element", args: [{ flag: "selector" }], run: async (a) => { await service.scrollToElement(a); return "Scrolled to element"; } },
+  scroll_to_element: { usage: "--selector", descKey: "cli.cmd.scroll_to_element", args: [{ flag: "selector" }], run: async (a) => { const r = await service.scrollToElement(a); return "Scrolled to element" + reachedNote(r); } },
   get_dropdown_options: { usage: "--selector", descKey: "cli.cmd.get_dropdown_options", args: [{ flag: "selector" }], run: async (a) => { const r: any = await service.dropdownOptions(a); const opts: any[] = r?.options ?? []; if (!opts.length) return `Select not found or no options: ${a.selector}`; return opts.map((o: any) => `${o.selected ? "* " : "  "}${o.value}: ${o.text}`).join("\n"); } },
   custom_user_agent: { usage: "--userAgent", descKey: "cli.cmd.custom_user_agent", args: [{ flag: "userAgent" }], run: async (a) => { await service.userAgent(a); return "User-Agent set"; } },
   expect_response: { usage: "--url", descKey: "cli.cmd.expect_response", args: [{ flag: "url" }], run: async (a) => { await service.expectResponse({ urlPattern: a.url }); return `Now expecting response matching: ${a.url}. Use command=assert_response to check.`; } },

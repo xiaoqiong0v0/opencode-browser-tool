@@ -122,3 +122,14 @@ WebKitGTK：`WebViewExt::snapshot(SnapshotRegion::Visible, SnapshotOptions::NONE
 > - 未列出的交互/只读命令（`scroll`、`scroll_to_element`、`get_*`、`evaluate` 等）在各平台均为可用实现，不涉及降级/报错。
 > - `drag`（Windows）未采用 `Input.dispatchDragEvent` + `setInterceptDrags`：实测普通鼠标序列已能触发可信原生 DnD，且本项目 CDP 通道是请求/响应式、收不到 `Input.dragIntercepted` 事件。
 > - macOS：无 CDP / GDK 通道 → 鼠标/文本类命令走"降级 + 标注"，键盘/上传/拖拽明确报错（由 `trusted_available()` 与各命令平台分支决定）。
+
+### 7.4 时序/就绪（平台无关）
+
+`navigate` / `go_back` / `go_forward` 不再固定 sleep，而是等待就绪信号：`document.readyState` 达到
+`interactive`/`complete`，或观察到导航进展（URL 变化 / 曾进入 `loading`）；`scroll` 等待窗口滚动位置连续多次
+采样不变，`scroll_to_element` 额外校验元素真的进入视口。均有**有界超时**（默认 navigate 15s、history 5s、
+scroll 3s），超时**如实回传** `ready:false` / `stable:false` / `reached:false` + `timedOut:true` + `waitedMs`，
+插件在结果文本后追加说明，不假装成功。
+
+调试覆盖（起实例时设置）：`BT_NAV_TIMEOUT_MS`、`BT_HISTORY_TIMEOUT_MS`、`BT_SCROLL_TIMEOUT_MS`。
+Kali 复验步骤见 `linux-verification.md`。

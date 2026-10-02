@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>slow page（就绪等待验证）</title>
+</head>
+<body>
+<h1>slow page</h1>
+<p>验证 <code>navigate</code> 就绪等待：脚本同步阻塞若干毫秒，阻塞期间 <code>readyState</code> 停在
+<code>loading</code> 且 <code>#slow-ready</code> 尚不存在。</p>
+<p>参数：<code>?block=NNNN</code> 阻塞毫秒(默认 1000)；<code>?autoscroll=1</code> 用 <code>setInterval</code>
+持续 <code>scrollBy</code>(用于验证 <code>scroll</code> 的稳定等待/超时)。</p>
+<div id="slow-status">loading…</div>
+<div id="slow-filler"></div>
+<script>
+  var q = location.search || '';
+  function qnum(name, def) {
+    var m = q.match(new RegExp('[?&]' + name + '=(\\d+)'));
+    return m ? parseInt(m[1], 10) : def;
+  }
+  function qflag(name) { return new RegExp('[?&]' + name + '(=|&|$)').test(q); }
+
+  if (qflag('autoscroll')) {
+    document.getElementById('slow-filler').style.height = '6000px';
+    setInterval(function () { window.scrollBy(0, 9); }, 25);
+  }
+
+  // 同步阻塞解析约 block 毫秒:阻塞期间 readyState=loading、#slow-ready 不存在
+  var block = qnum('block', 1000);
+  var end = Date.now() + block;
+  while (Date.now() < end) { /* busy wait */ }
+  var d = document.createElement('div');
+  d.id = 'slow-ready';
+  d.textContent = 'ready after ' + block + 'ms';
+  document.body.appendChild(d);
+  document.getElementById('slow-status').textContent = 'done';
+</script>
+</body>
+</html>

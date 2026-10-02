@@ -197,10 +197,25 @@ impl App {
         // 裸域名自动补 http://
         let url = ui::normalize_url(&url);
         let handle = self.handle.clone();
+        // 记录导航前 URL:用于判断"已提交/SPA URL 变化"这一就绪进展
+        let prev = tokio::task::block_in_place(|| control::document_state(&handle).ok())
+            .and_then(|v| v.get("url").and_then(|u| u.as_str()).map(str::to_string))
+            .unwrap_or_default();
         tokio::task::block_in_place(|| control::navigate(&handle, &url))?;
         // 同步激活标签的 URL(工具栏显示一致)
         ui::sync_active_tab(&self.handle, &url, "");
-        Ok(json!({ "url": url }))
+        // 等待就绪(readyState>=interactive,或观察到导航进展);有界超时,超时如实返回 ready:false
+        let prev_ref = if prev == url { "" } else { prev.as_str() };
+        let st = tokio::task::block_in_place(|| {
+            control::wait_ready(&handle, prev_ref, control::nav_timeout_ms())
+        })?;
+        Ok(json!({
+            "url": url,
+            "ready": st["ready"],
+            "readyState": st["readyState"],
+            "timedOut": st["timedOut"],
+            "waitedMs": st["waitedMs"],
+        }))
     }
 
     /// 在页面显示通知气泡(通过覆盖层 Webview 的 __btOverlay.notify)
@@ -468,15 +483,34 @@ impl App {
             }
         };
         let handle = self.handle.clone();
-        tokio::task::block_in_place(|| control::scroll(&handle, dx, dy))?;
-        Ok(json!({ "scrolled": true }))
+        // 等待滚动稳定(平滑滚动异步);超时如实返回 stable:false
+        let r = tokio::task::block_in_place(|| control::scroll(&handle, dx, dy))?;
+        Ok(json!({
+            "scrolled": true,
+            "stable": r["stable"],
+            "timedOut": r["timedOut"],
+            "x": r["x"],
+            "y": r["y"],
+            "waitedMs": r["waitedMs"],
+        }))
     }
 
     async fn scroll_to_element(&self, body: &Value) -> Result<Value, String> {
         let s = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if s.is_empty() {
+            return Err("selector is required".into());
+        }
         let handle = self.handle.clone();
-        tokio::task::block_in_place(|| control::scroll_to_element(&handle, &s))?;
-        Ok(json!({ "scrolled": true }))
+        // 等待元素真正进入视口且滚动稳定;超时如实返回 reached:false
+        let r = tokio::task::block_in_place(|| control::scroll_to_element(&handle, &s))?;
+        Ok(json!({
+            "scrolled": true,
+            "reached": r["reached"],
+            "inViewport": r["inViewport"],
+            "stable": r["stable"],
+            "timedOut": r["timedOut"],
+            "waitedMs": r["waitedMs"],
+        }))
     }
 
     async fn reload(&self) -> Result<Value, String> {
@@ -492,34 +526,41 @@ impl App {
 
     async fn go_back(&self) -> Result<Value, String> {
         let handle = self.handle.clone();
-        tokio::task::block_in_place(|| {
-            let js = "history.back(); true";
-            control::eval(&handle, js)
+        let prev = tokio::task::block_in_place(|| control::document_state(&handle).ok())
+            .and_then(|v| v.get("url").and_then(|u| u.as_str()).map(str::to_string))
+            .unwrap_or_default();
+        tokio::task::block_in_place(|| control::eval(&handle, "history.back(); true"))?;
+        // 等待导航就绪(URL 变化 + readyState);有界超时,超时如实返回 ready:false
+        let st = tokio::task::block_in_place(|| {
+            control::wait_ready(&handle, &prev, control::history_timeout_ms())
         })?;
-        // 等待导航生效后读取当前 URL
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        let handle2 = self.handle.clone();
-        let url = tokio::task::block_in_place(|| {
-            let v = control::page_state(&handle2).unwrap_or_default();
-            v["url"].as_str().unwrap_or("").to_string()
-        });
-        Ok(json!({ "back": true, "url": url }))
+        Ok(json!({
+            "back": true,
+            "url": st["url"],
+            "ready": st["ready"],
+            "readyState": st["readyState"],
+            "timedOut": st["timedOut"],
+            "waitedMs": st["waitedMs"],
+        }))
     }
 
     async fn go_forward(&self) -> Result<Value, String> {
         let handle = self.handle.clone();
-        tokio::task::block_in_place(|| {
-            let js = "history.forward(); true";
-            control::eval(&handle, js)
+        let prev = tokio::task::block_in_place(|| control::document_state(&handle).ok())
+            .and_then(|v| v.get("url").and_then(|u| u.as_str()).map(str::to_string))
+            .unwrap_or_default();
+        tokio::task::block_in_place(|| control::eval(&handle, "history.forward(); true"))?;
+        let st = tokio::task::block_in_place(|| {
+            control::wait_ready(&handle, &prev, control::history_timeout_ms())
         })?;
-        // 等待导航生效后读取当前 URL
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        let handle2 = self.handle.clone();
-        let url = tokio::task::block_in_place(|| {
-            let v = control::page_state(&handle2).unwrap_or_default();
-            v["url"].as_str().unwrap_or("").to_string()
-        });
-        Ok(json!({ "forward": true, "url": url }))
+        Ok(json!({
+            "forward": true,
+            "url": st["url"],
+            "ready": st["ready"],
+            "readyState": st["readyState"],
+            "timedOut": st["timedOut"],
+            "waitedMs": st["waitedMs"],
+        }))
     }
 
     async fn resize(&self, body: &Value) -> Result<Value, String> {
