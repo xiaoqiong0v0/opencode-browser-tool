@@ -7,22 +7,19 @@
 //!   - iframe_fill:在 iframe 内容文档内 focus → insertText → 读回
 //! 非 Windows(降级):原生原型 setter + 派发 `input`/`change`(与旧实现一致),返回标注 `degraded`
 
+use std::time::{Duration, Instant};
+
 use serde_json::Value;
 use tauri::AppHandle;
 
-use super::{ControlResult, Outcome};
-
-#[cfg(windows)]
-use super::trusted_available;
-#[cfg(windows)]
-use super::{cdp, keyboard};
+use super::{ControlResult, Outcome, trusted_available};
+use super::keyboard;
 
 /// 填写输入框:可信通道失败时报错,降级路径标注 degraded
 pub fn fill(app: &AppHandle, selector: &str, value: &str) -> ControlResult<Outcome<()>> {
     if selector.is_empty() {
         return Err("selector is required".into());
     }
-    #[cfg(windows)]
     if trusted_available() {
         fill_trusted(app, selector, value)?;
         return Ok(Outcome::trusted(()));
@@ -36,7 +33,6 @@ pub fn clear(app: &AppHandle, selector: &str) -> ControlResult<Outcome<()>> {
     if selector.is_empty() {
         return Err("selector is required".into());
     }
-    #[cfg(windows)]
     if trusted_available() {
         clear_trusted(app, selector)?;
         return Ok(Outcome::trusted(()));
@@ -50,7 +46,6 @@ pub fn select(app: &AppHandle, selector: &str, value: &str) -> ControlResult<Out
     if selector.is_empty() {
         return Err("selector is required".into());
     }
-    #[cfg(windows)]
     if trusted_available() {
         if let Some(actual) = select_trusted_if_supported(app, selector, value)? {
             return Ok(Outcome::trusted(actual));
@@ -79,7 +74,6 @@ pub fn fill_in_iframe(
     if selector.is_empty() {
         return Err("selector is required".into());
     }
-    #[cfg(windows)]
     if trusted_available() {
         fill_in_iframe_trusted(app, iframe_selector, selector, value)?;
         return Ok(Outcome::trusted(()));
@@ -164,7 +158,6 @@ fn fill_in_iframe_fallback(
 // ---- Windows 可信实现 ----
 
 /// 可信 fill:focus → 全选 → insertText → 读回校验
-#[cfg(windows)]
 fn fill_trusted(app: &AppHandle, selector: &str, value: &str) -> ControlResult<()> {
     keyboard::focus_element(app, selector)?;
     select_all(app, selector)?;
@@ -172,13 +165,12 @@ fn fill_trusted(app: &AppHandle, selector: &str, value: &str) -> ControlResult<(
         // 空值:用 Delete 清掉选中内容(insertText("") 可能为空操作)
         keyboard::press_key(app, "Delete", "")?;
     } else {
-        insert_text(app, value)?;
+        keyboard::insert_text(app, value)?;
     }
     verify_value(app, selector, value)
 }
 
 /// 可信 clear:focus → 全选 → Delete → 读回校验
-#[cfg(windows)]
 fn clear_trusted(app: &AppHandle, selector: &str) -> ControlResult<()> {
     keyboard::focus_element(app, selector)?;
     select_all(app, selector)?;
@@ -187,7 +179,6 @@ fn clear_trusted(app: &AppHandle, selector: &str) -> ControlResult<()> {
 }
 
 /// 可信 select:仅单值 select 适用;返回 Some(实际值);`multiple`/`size>1` 返回 None 交给降级
-#[cfg(windows)]
 fn select_trusted_if_supported(
     app: &AppHandle,
     selector: &str,
@@ -206,7 +197,7 @@ fn select_trusted_if_supported(
     for _ in 0..delta.abs() {
         keyboard::press_key(app, key, "")?;
     }
-    let actual = read_value(app, selector)?;
+    let actual = wait_value(app, selector, value, VERIFY_TIMEOUT_MS)?;
     if actual != value {
         return Err(format!(
             "select verification failed: expected {value:?}, got {actual:?} \
@@ -217,7 +208,6 @@ fn select_trusted_if_supported(
 }
 
 /// 可信 iframe_fill:iframe 内 focus → 全选 → insertText → 读回
-#[cfg(windows)]
 fn fill_in_iframe_trusted(
     app: &AppHandle,
     iframe_selector: &str,
@@ -229,9 +219,9 @@ fn fill_in_iframe_trusted(
     if value.is_empty() {
         keyboard::press_key(app, "Delete", "")?;
     } else {
-        insert_text(app, value)?;
+        keyboard::insert_text(app, value)?;
     }
-    let actual = read_value_in_iframe(app, iframe_selector, selector)?;
+    let actual = wait_value_in_iframe(app, iframe_selector, selector, value, VERIFY_TIMEOUT_MS)?;
     if actual != value {
         return Err(format!(
             "iframe fill verification failed: expected {value:?}, got {actual:?}"
@@ -240,16 +230,7 @@ fn fill_in_iframe_trusted(
     Ok(())
 }
 
-/// 发送 CDP `Input.insertText`(在当前聚焦元素处插入/替换选区)
-#[cfg(windows)]
-fn insert_text(app: &AppHandle, text: &str) -> ControlResult<()> {
-    let params = serde_json::json!({ "text": text }).to_string();
-    cdp::call_json(app, "Input.insertText", &params)?;
-    Ok(())
-}
-
 /// 选中目标元素全部内容(input/textarea 用 select()/setSelectionRange,contenteditable 用 Range)
-#[cfg(windows)]
 fn select_all(app: &AppHandle, selector: &str) -> ControlResult<()> {
     let js = format!(
         r#"(function(){{
@@ -274,7 +255,6 @@ fn select_all(app: &AppHandle, selector: &str) -> ControlResult<()> {
 }
 
 /// 读取元素当前值(input/textarea 取 value,contenteditable 取 textContent)
-#[cfg(windows)]
 fn read_value(app: &AppHandle, selector: &str) -> ControlResult<String> {
     let js = format!(
         r#"(function(){{
@@ -289,10 +269,50 @@ fn read_value(app: &AppHandle, selector: &str) -> ControlResult<String> {
     Ok(v.get("value").and_then(Value::as_str).unwrap_or("").to_string())
 }
 
+/// 输入事件异步处理(WebKitGTK 跨进程)时,读回校验的最长等待时间
+const VERIFY_TIMEOUT_MS: u64 = 2500;
+
+/// 轮询读取元素值直到等于期望或超时(超时返回当前值,由调用方判错)
+///
+/// Windows CDP 注入是同步的,首次读取即命中;Linux GDK 注入后 WebKit 跨进程异步更新 DOM,
+/// 需要轮询等待(否则会把"尚未处理"误判为失败)。轮询 sleep 在 worker 线程,主循环照常处理事件。
+fn wait_value(
+    app: &AppHandle,
+    selector: &str,
+    expected: &str,
+    timeout_ms: u64,
+) -> ControlResult<String> {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        let actual = read_value(app, selector)?;
+        if actual == expected || Instant::now() >= deadline {
+            return Ok(actual);
+        }
+        std::thread::sleep(Duration::from_millis(40));
+    }
+}
+
+/// iframe 版本的轮询读回
+fn wait_value_in_iframe(
+    app: &AppHandle,
+    iframe_selector: &str,
+    selector: &str,
+    expected: &str,
+    timeout_ms: u64,
+) -> ControlResult<String> {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        let actual = read_value_in_iframe(app, iframe_selector, selector)?;
+        if actual == expected || Instant::now() >= deadline {
+            return Ok(actual);
+        }
+        std::thread::sleep(Duration::from_millis(40));
+    }
+}
+
 /// 读回校验:实际值必须等于期望值,否则报错(不静默成功)
-#[cfg(windows)]
 fn verify_value(app: &AppHandle, selector: &str, expected: &str) -> ControlResult<()> {
-    let actual = read_value(app, selector)?;
+    let actual = wait_value(app, selector, expected, VERIFY_TIMEOUT_MS)?;
     if actual != expected {
         return Err(format!(
             "fill verification failed: expected {expected:?}, got {actual:?}"
@@ -302,7 +322,6 @@ fn verify_value(app: &AppHandle, selector: &str, expected: &str) -> ControlResul
 }
 
 /// select 元信息(供可信键盘路径判断是否适用)
-#[cfg(windows)]
 struct SelectInfo {
     multiple: bool,
     size: i64,
@@ -311,7 +330,6 @@ struct SelectInfo {
 }
 
 /// 查询 select 的 multiple/size/当前索引/目标值所在索引;未找到目标值 target_index = -1
-#[cfg(windows)]
 fn select_info(app: &AppHandle, selector: &str, value: &str) -> ControlResult<SelectInfo> {
     let js = format!(
         r#"(function(){{
@@ -338,7 +356,6 @@ fn select_info(app: &AppHandle, selector: &str, value: &str) -> ControlResult<Se
 }
 
 /// iframe 内容文档内聚焦元素
-#[cfg(windows)]
 fn focus_in_iframe(app: &AppHandle, iframe_selector: &str, selector: &str) -> ControlResult<()> {
     let js = format!(
         r#"(function(){{
@@ -365,7 +382,6 @@ fn focus_in_iframe(app: &AppHandle, iframe_selector: &str, selector: &str) -> Co
 }
 
 /// iframe 内容文档内全选
-#[cfg(windows)]
 fn select_all_in_iframe(
     app: &AppHandle,
     iframe_selector: &str,
@@ -395,7 +411,6 @@ fn select_all_in_iframe(
 }
 
 /// iframe 内容文档内读取 value/textContent
-#[cfg(windows)]
 fn read_value_in_iframe(
     app: &AppHandle,
     iframe_selector: &str,

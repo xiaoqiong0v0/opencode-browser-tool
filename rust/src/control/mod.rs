@@ -6,9 +6,12 @@ pub mod accessibility;
 /// Windows CDP 通用调用通道(截图/可访问性树/键盘注入共用)
 #[cfg(windows)]
 pub mod cdp;
-/// 拖拽(Windows:CDP 鼠标序列触发原生 HTML5 DnD)
+/// 拖拽(仅 Windows:CDP 鼠标序列触发原生 HTML5 DnD)
 pub mod drag;
-/// 键盘注入(Windows:CDP 可信通道;非 Windows 明确报错)
+/// Linux GDK 可信输入通道(gdk_event_put 注入键盘/指针事件)
+#[cfg(target_os = "linux")]
+pub mod gdk;
+/// 键盘注入(Windows:CDP;Linux:GDK;其余平台明确报错)
 pub mod keyboard;
 /// 文本输入与下拉选择(Windows:CDP 可信通道;非 Windows 降级到 DOM/JS 并标注)
 pub mod input;
@@ -71,9 +74,13 @@ pub fn force_degraded() -> bool {
         .unwrap_or(false)
 }
 
-/// 是否可走可信通道:仅 Windows 且未被强制降级
+/// 是否可走可信通道
+/// - Windows:CDP
+/// - Linux:GDK 事件注入(`gdk_event_put`,已实测可信)
+/// - macOS:无 → false
+/// 置 `BT_FORCE_DEGRADED=1` 时强制 false(便于实测降级分支)
 pub fn trusted_available() -> bool {
-    cfg!(windows) && !force_degraded()
+    (cfg!(windows) || cfg!(target_os = "linux")) && !force_degraded()
 }
 
 /// 执行页面内 JS,返回解析后的值(对象/null/字符串等)

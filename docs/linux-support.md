@@ -84,29 +84,41 @@ WebKitGTK：`WebViewExt::snapshot(SnapshotRegion::Visible, SnapshotOptions::NONE
 
 ### 7.1 统一规则
 
-1. **有可信通道就用可信通道**：Windows/WebView2 走 CDP（`Input.*` / `DOM.setFileInputFiles` 等），产生 `isTrusted=true` 事件、真实命中测试与默认行为。
-2. **没有可信通道（Linux/WebKitGTK、macOS）时，退回原本"确实可用"的 DOM/JS 实现，但必须标注降级**：service 返回 `{degraded:true, degradedReason:"untrusted JS fallback on <os>"}`，插件 `src/index.ts` 统一格式化为 ` (degraded: ...)` 追加到结果文本；**绝不静默假成功**。
+1. **有可信通道就用可信通道**：Windows/WebView2 → CDP（`Input.*` / `DOM.setFileInputFiles`）；Linux/WebKitGTK → GDK `gdk_event_put` 注入原生键盘/指针事件。两者都产生 `isTrusted=true` 事件、真实命中测试与默认行为。
+2. **没有可信通道（macOS）时，退回原本"确实可用"的 DOM/JS 实现，但必须标注降级**：service 返回 `{degraded:true, degradedReason:"untrusted JS fallback on <os>"}`，插件 `src/index.ts` 统一格式化为 ` (degraded: ...)`；**绝不静默假成功**。
 3. **原本就不可用/假成功的实现不做兜底**：保持明确报错（宁可报错也不假成功）。
 4. **"原本是否确实可用"以旧实现行为与实测为准**；不确定处标注存疑。
 
-调试开关：环境变量 **`BT_FORCE_DEGRADED=1`** 会让 Windows 也强制走降级分支，用于在无 Linux 环境实测降级路径与标注文本。判定入口在 `rust/src/control/mod.rs`（`trusted_available()` / `Outcome`）。
+调试开关：环境变量 **`BT_FORCE_DEGRADED=1`** 会在 Windows/Linux 上强制走降级分支，用于实测降级路径与标注文本。判定入口在 `rust/src/control/mod.rs`（`trusted_available()` / `Outcome`）。
 
-### 7.2 命令级现状
+### 7.2 Linux 可信输入实现（GDK）
 
-| 命令 | Windows（可信） | Linux / 其他（降级或报错） | 现状与限制 |
+`rust/src/control/gdk.rs`：在 GTK 主线程（`webview.with_webview`）用 `gdk_event_put` 注入合成 `GdkEvent`（键盘 `GdkEventKey`、指针 `GdkEventMotion`/`GdkEventButton`），由 GTK 分发给 `WebKitWebView`（等于原生事件）。事件的 `window` 指向 webview 的 GdkWindow；若 webview 没有独立 GdkWindow（事件窗口是 toplevel），坐标会自动加上 webview 原点偏移。取证过程与实测输出见 `.tmp/scratch/linux-gdk-evidence.md`。
+
+关键实测结论（WSLg，页面侧读取）：
+
+- 键盘：单字符输入、Enter 提交、方向键、Tab 全部 `isTrusted=true` 且默认行为生效；
+- 指针：点击命中/坐标、CSS `:hover` 均生效（验证时目标须先在视口内，越界坐标会被丢弃）；
+- 文本：`fill` 用 GDK 逐字符注入，`gdk_unicode_to_keyval` 支持大小写/数字/符号。
+
+**异步读回**：WebKitGTK 的输入事件经 GTK → WebKit UI 进程 → Web 进程异步处理，`gdk_event_put` 后立即 `eval` 读回会读到旧值，故 `input.rs` 的 `fill`/`clear`/`select`/`iframe_fill` 读回改为**轮询等待**（最长 2.5s）；Windows 同步路径首次读取即命中，不受影响。
+
+### 7.3 命令级现状
+
+| 命令 | Windows（可信，CDP） | Linux（WebKitGTK） | 现状与限制 |
 |---|---|---|---|
-| `click` | CDP `Input.dispatchMouseEvent`（moved→pressed→released） | **降级**：`el.click()`（untrusted），标注 | Windows 派发前做命中测试/视口/disabled 校验；被遮挡 / 出视口 / disabled → 明确报错 |
-| `hover` | CDP `mouseMoved` | **降级**：合成 `mouseover`/`mouseenter`，标注 | 降级路径**不触发 CSS `:hover`**（实测强制降级下 `matches(':hover')=false`） |
-| `click_and_switch_tab` | 同 `click` | **降级**：`el.click()`，标注 | Rust 侧只负责点击 + 200ms 后读 URL；"切标签"逻辑不在 Rust 侧 |
-| `iframe_click` | iframe 内容坐标换算到顶层视口后 CDP 点击 | **降级**：`contentDocument` 内 `el.click()`，标注 | 仅支持顶层选择器定位的**单层 iframe**；跨域 iframe（`contentDocument==null`）两个平台都明确报错 |
-| `fill` | focus → 全选 → CDP `Input.insertText` → 读回校验 | **降级**：原生原型 setter + 派发 `input`/`change`，标注 | Windows 产生可信 `beforeinput`/`input`（受控组件可用）；读回不一致即报错 |
-| `clear` | focus → 全选 → CDP `Delete` → 读回校验 | **降级**：同 `fill` 空值，标注 | |
-| `select` | focus → 方向键移动选中项 → 读回校验 | **降级**：原生 setter + `input`/`change`，标注 | Windows 仅单值 select 走可信键盘；`multiple`/`size>1` **降级并标注**（实测）；目标 value 不存在 → 报错 |
-| `iframe_fill` | iframe 内容文档内 focus → `insertText` → 读回 | **降级**：`contentDocument` 内原型 setter + 事件，标注 | |
-| `press_key` | CDP `Input.dispatchKeyEvent` | **明确报错**（不做降级） | 旧 JS 只派发 untrusted keydown/keyup，页面 handler 能收到但**不产生输入字符/默认行为**（提交等）→ 属假成功 |
-| `upload_file` | CDP `DOM.setFileInputFiles` + 读回 `el.files` | **明确报错** | 旧 `fetch("file:///…")` 在非 file:// 源被拦且异步未等待 → 确定性假成功 |
-| `drag` | CDP `Input.dispatchMouseEvent` 鼠标序列（触发原生 DnD） | **明确报错** | 旧合成 `DragEvent` 不触发原生 DnD 且 `dataTransfer` 无数据 → 基本不可用 |
+| `click` | `Input.dispatchMouseEvent`（moved→pressed→released） | **可信**：GDK motion+press+release | 两平台派发前均做命中测试/视口/disabled 校验；被遮挡/出视口/disabled → 明确报错 |
+| `hover` | `mouseMoved` | **可信**：GDK motion | 实测触发 CSS `:hover`；强制降级分支不触发 |
+| `click_and_switch_tab` | 同 `click` | **可信**：同 `click` | Rust 侧只负责点击 + 200ms 后读 URL；"切标签"逻辑不在 Rust 侧 |
+| `iframe_click` | 内容坐标换算到顶层视口后 CDP 点击 | **可信**：同 Windows（GDK） | 仅支持顶层选择器定位的**单层 iframe**；跨域 iframe 两平台都明确报错 |
+| `fill` | focus → 全选 → `Input.insertText` → 轮询读回 | **可信**：focus → 全选 → GDK 逐字符按键 → 轮询读回 | 产生可信 `beforeinput`/`input`（受控组件可用）；读回超时不一致即报错 |
+| `clear` | focus → 全选 → `Delete` → 读回 | **可信**：focus → 全选 → GDK `Delete` → 读回 | |
+| `select` | focus → 方向键移动 → 读回 | **可信**：同 Windows（GDK 方向键） | `multiple`/`size>1` 无可信键盘路径 → **两平台降级并标注**；目标 value 不存在 → 报错 |
+| `iframe_fill` | iframe 内 focus → `insertText` → 读回 | **可信**：同 Windows（GDK 逐字符） | |
+| `press_key` | `Input.dispatchKeyEvent` | **可信**：GDK `GdkEventKey` | macOS 无可信通道 → 明确报错 |
+| `upload_file` | `DOM.setFileInputFiles` + 读回 `el.files` | **明确报错** | Linux 无 CDP；候选（WebDriver / JS File 注入）未确证；旧 `fetch("file:///…")` 是确定性假成功 |
+| `drag` | `Input.dispatchMouseEvent` 鼠标序列（原生 HTML5 DnD） | **明确报错** | Linux 上 GDK 鼠标序列能否触发原生 DnD **未验证**，不做未确证实现；旧合成 `DragEvent` 基本不可用 |
 
 > - 未列出的交互/只读命令（`scroll`、`scroll_to_element`、`get_*`、`evaluate` 等）在各平台均为可用实现，不涉及降级/报错。
-> - `drag` 未采用 `Input.dispatchDragEvent` + `setInterceptDrags`：实测普通鼠标序列已能触发可信原生 DnD，且本项目的 CDP 通道是请求/响应式、收不到 `Input.dragIntercepted` 事件。
-> - 非 Windows 的有可信通道候选（WebKitGTK 合成 GdkEvent / WebDriver）均**未确证**，故一律走"降级 + 标注"或"明确报错"，不用未验证实现冒充可信。
+> - `drag`（Windows）未采用 `Input.dispatchDragEvent` + `setInterceptDrags`：实测普通鼠标序列已能触发可信原生 DnD，且本项目 CDP 通道是请求/响应式、收不到 `Input.dragIntercepted` 事件。
+> - macOS：无 CDP / GDK 通道 → 鼠标/文本类命令走"降级 + 标注"，键盘/上传/拖拽明确报错（由 `trusted_available()` 与各命令平台分支决定）。

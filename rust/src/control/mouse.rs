@@ -10,10 +10,7 @@
 use tauri::AppHandle;
 
 use super::{ControlResult, Outcome};
-
-#[cfg(windows)]
 use super::trusted_available;
-#[cfg(windows)]
 use serde_json::Value;
 
 /// 视口坐标点(CSS 像素)
@@ -56,44 +53,77 @@ pub fn mouse_event(
 ///
 /// 返回实际(或估算)的视口坐标;可信路径下中心出视口 / 被遮挡 / 元素不存在返回 Err
 pub fn click(app: &AppHandle, selector: &str) -> ControlResult<Outcome<Point>> {
-    #[cfg(windows)]
     if trusted_available() {
-        return Ok(Outcome::trusted(click_at(app, None, selector)?));
+        let p = resolve_point(app, None, selector)?;
+        ensure_reachable(&p, selector)?;
+        ensure_enabled(&p, selector)?;
+        trusted_click_at(app, p.x, p.y)?;
+        return Ok(Outcome::trusted(Point { x: p.x, y: p.y }));
     }
     Ok(Outcome::degraded(click_fallback(app, selector)?))
 }
 
-/// 悬停元素中心:Windows 可信 mouseMoved(触发 CSS `:hover`);否则降级到合成 mouseover/mouseenter
+/// 悬停元素中心:可信 mouseMoved(触发 CSS `:hover`);否则降级到合成 mouseover/mouseenter
 pub fn hover(app: &AppHandle, selector: &str) -> ControlResult<Outcome<Point>> {
-    #[cfg(windows)]
     if trusted_available() {
         let p = resolve_point(app, None, selector)?;
         ensure_reachable(&p, selector)?;
-        mouse_event(app, "mouseMoved", p.x, p.y, "none", 0, 0)?;
+        trusted_move(app, p.x, p.y)?;
         return Ok(Outcome::trusted(Point { x: p.x, y: p.y }));
     }
     Ok(Outcome::degraded(hover_fallback(app, selector)?))
 }
 
-/// 点击 iframe 内元素:Windows 把内容坐标换算到顶层视口后走可信鼠标序列;否则降级到 `el.click()`
+/// 点击 iframe 内元素:可信路径把内容坐标换算到顶层视口后注入;否则降级到 `el.click()`
 pub fn click_in_iframe(
     app: &AppHandle,
     iframe_selector: &str,
     selector: &str,
 ) -> ControlResult<Outcome<Point>> {
-    #[cfg(windows)]
     if trusted_available() {
-        return Ok(Outcome::trusted(click_at(
-            app,
-            Some(iframe_selector),
-            selector,
-        )?));
+        let p = resolve_point(app, Some(iframe_selector), selector)?;
+        ensure_reachable(&p, selector)?;
+        ensure_enabled(&p, selector)?;
+        trusted_click_at(app, p.x, p.y)?;
+        return Ok(Outcome::trusted(Point { x: p.x, y: p.y }));
     }
     Ok(Outcome::degraded(click_in_iframe_fallback(
         app,
         iframe_selector,
         selector,
     )?))
+}
+
+/// 可信点击(平台实现):Windows CDP 鼠标序列;Linux GDK 事件注入
+#[cfg(windows)]
+fn trusted_click_at(app: &AppHandle, x: f64, y: f64) -> ControlResult<()> {
+    mouse_event(app, "mouseMoved", x, y, "none", 0, 0)?;
+    mouse_event(app, "mousePressed", x, y, "left", 1, 1)?;
+    mouse_event(app, "mouseReleased", x, y, "left", 0, 1)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn trusted_click_at(app: &AppHandle, x: f64, y: f64) -> ControlResult<()> {
+    super::gdk::inject(
+        app,
+        vec![
+            super::gdk::Inj::Move(x, y),
+            super::gdk::Inj::Button(x, y, 1, true),
+            super::gdk::Inj::Button(x, y, 1, false),
+        ],
+    )
+}
+
+/// 可信悬停移动(平台实现)
+#[cfg(windows)]
+fn trusted_move(app: &AppHandle, x: f64, y: f64) -> ControlResult<()> {
+    mouse_event(app, "mouseMoved", x, y, "none", 0, 0)
+}
+
+#[cfg(target_os = "linux")]
+fn trusted_move(app: &AppHandle, x: f64, y: f64) -> ControlResult<()> {
+    super::gdk::inject(app, vec![super::gdk::Inj::Move(x, y)])
 }
 
 // ---- 降级实现(所有平台编译,Windows 强制降级时可实测) ----
@@ -181,24 +211,7 @@ fn point_from(v: &serde_json::Value) -> Point {
     }
 }
 
-/// Windows:解析坐标 → 命中校验 → 注入鼠标按下/抬起
-#[cfg(windows)]
-fn click_at(
-    app: &AppHandle,
-    iframe_selector: Option<&str>,
-    selector: &str,
-) -> ControlResult<Point> {
-    let p = resolve_point(app, iframe_selector, selector)?;
-    ensure_reachable(&p, selector)?;
-    ensure_enabled(&p, selector)?;
-    mouse_event(app, "mouseMoved", p.x, p.y, "none", 0, 0)?;
-    mouse_event(app, "mousePressed", p.x, p.y, "left", 1, 1)?;
-    mouse_event(app, "mouseReleased", p.x, p.y, "left", 0, 1)?;
-    Ok(Point { x: p.x, y: p.y })
-}
-
 /// 禁用元素校验:真实鼠标点击不会在 disabled 控件上派发 click,提前报错避免假成功
-#[cfg(windows)]
 fn ensure_enabled(p: &Resolved, selector: &str) -> ControlResult<()> {
     if p.disabled {
         return Err(format!(
@@ -209,7 +222,6 @@ fn ensure_enabled(p: &Resolved, selector: &str) -> ControlResult<()> {
 }
 
 /// 中心可达性校验:必须在视口内,且命中测试确实落在目标(或其后代/祖先)上
-#[cfg(windows)]
 fn ensure_reachable(p: &Resolved, selector: &str) -> ControlResult<()> {
     if !p.in_viewport {
         return Err(format!(
@@ -227,7 +239,6 @@ fn ensure_reachable(p: &Resolved, selector: &str) -> ControlResult<()> {
 }
 
 /// 命中/坐标解析结果
-#[cfg(windows)]
 struct Resolved {
     x: f64,
     y: f64,
@@ -241,7 +252,6 @@ struct Resolved {
 ///
 /// `iframe_selector` 为 Some 时,在 iframe 内容文档内查询元素,坐标加上 iframe 的
 /// 边框/内边距偏移换算到顶层视口;命中测试在该内容文档内完成。
-#[cfg(windows)]
 fn resolve_point(
     app: &AppHandle,
     iframe_selector: Option<&str>,
