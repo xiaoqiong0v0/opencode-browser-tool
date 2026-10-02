@@ -16,9 +16,11 @@ opencode 插件：Tauri 多 Webview 浏览器外壳 + 零注入视觉元素选�
 ## 二进制获取（bt-shell）
 
 插件依赖 Rust 外壳 `bt-shell`。默认**首次使用时后台自动下载**对应平台的 Release 资产到
-`~/.opencode/plugins-data/opencode-browser-tool/<版本>/<平台三元组>/`（Windows 即
-`%USERPROFILE%\.opencode\plugins-data\opencode-browser-tool\`），并用 Release 的 `SHA256SUMS` 做
-sha256 校验（幂等 + 原子替换 + 并发锁）。下载后台进行、**不阻塞 opencode 启动**；未就绪时工具调用会给出
+`~/.opencode/plugins-data/opencode-browser-tool/<平台三元组>/bt-shell[.exe]`（Windows 即
+`%USERPROFILE%\.opencode\plugins-data\opencode-browser-tool\<triple>\bt-shell.exe`），并**就地覆盖**同一路径
+（不按插件版本建目录）；同目录另有 `bt-shell.version.json` 记录该可执行文件的来源
+（`tag` / `asset` / `sha256` / `size` / `downloadedAt` / `sourceUrl`）。下载用 Release 的 `SHA256SUMS` 做
+sha256 校验（**幂等**：sha 与当前 release 期望值一致即跳过；**原子**替换；跨进程 `.lock`）。下载后台进行、**不阻塞 opencode 启动**；未就绪时工具调用会给出
 明确提示（下载进度 / 失败原因），不会假装成功。
 
 平台支持与系统依赖：
@@ -28,6 +30,14 @@ sha256 校验（幂等 + 原子替换 + 并发锁）。下载后台进行、**�
 - 其它平台：暂不提供预编译，请用 `BT_SHELL_PATH` 指定自行构建的二进制
 
 > 代理：下载优先调用系统 `curl`（自动遵循 `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY`）；无 curl 时回退 Node `fetch`。
+
+## 版本与产物策略
+
+- **中间位（minor）**：只要**动了 Rust / 要发新 exe**，就升 `x.Y.0`（如 `1.2.x → 1.3.0`），并为该 `x.Y.0` 新建/更新 Release 挂上二进制。
+- **末位（patch）**：**只改插件**（TS/配置/文档，不改 Rust）时只升末位（如 `1.2.0 → 1.2.1`），**不新发二进制**。
+- **二进制产物永远只挂在 `x.Y.0` 的 Release 上**：插件的 patch 版本**自动推导**出对应的二进制 tag（把 patch 归 0）：插件 `1.2.1` → 二进制 tag `v1.2.0`；`1.3.0` → `v1.3.0`；`1.3.0-beta.1` → `v1.3.0`。
+- 因此纯插件改动升级时**复用同一份二进制**，不会重下；只有当推导出的 `x.Y.0` 与缓存中二进制的 sha 不一致（发新 exe）时才重新下载。
+- 如需指向别的二进制发布（如临时验证），用 `BT_SHELL_VERSION` 显式覆盖——它表示**二进制发布版本**（形如 `1.2.0`），**原样使用、不做归 0 推导**。
 
 ## 配置
 
@@ -51,7 +61,7 @@ sha256 校验（幂等 + 原子替换 + 并发锁）。下载后台进行、**�
 - `BT_SHELL_PATH` — **启动模式**：指定要 spawn 的 Rust shell 二进制路径（开发用；优先级最高，覆盖自动下载与本地构建）
 - `BT_SHELL_NO_DOWNLOAD` — 设为 `1` 时不自动下载（状态 `disabled`；需自行放置二进制或配合 `BT_SHELL_PATH`）
 - `BT_SHELL_DOWNLOAD_BASE` — 覆盖下载根（默认 GitHub Release `https://github.com/xiaoqiong0v0/opencode-browser-tool/releases/download`），可指向镜像/自建
-- `BT_SHELL_VERSION` — 覆盖下载/缓存使用的版本（默认取插件自身版本，即 Release tag 去掉 `v`）
+- `BT_SHELL_VERSION` — 显式指定**二进制发布版本**（形如 `1.2.0`，即 `x.Y.0` 的 Release；**原样使用、不做归 0 推导**；不设时由插件版本自动推导）
 
 > **附着模式 vs 启动模式**：设置了 `BT_SHELL_URL`（优先）或 `BT_SHELL_PORT` 时进入附着模式——插件**不 spawn** 任何进程，直接连接该地址的外部 shell；两者都未设置时按启动模式 spawn 本地二进制（`BT_SHELL_PATH` 可覆盖查找路径）。附着模式下 `bt_close` 只关闭浏览器窗口并断开连接，**不会**结束外部 shell 进程（进程不归插件管理）。
 
