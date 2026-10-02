@@ -299,29 +299,26 @@ fn element_in_viewport(app: &AppHandle, selector: &str) -> ControlResult<bool> {
     Ok(v.get("inViewport").and_then(Value::as_bool).unwrap_or(false))
 }
 
-/// 滚动到元素并等待其真正进入视口且滚动位置稳定
-///
-/// 返回 `{reached,inViewport,stable,timedOut,waitedMs}`;超时如实返回 `reached:false`。
-pub fn scroll_to_element(app: &AppHandle, selector: &str) -> ControlResult<Value> {
-    let js = format!(
-        r#"(function(){{
-          var el = document.querySelector({sel:?});
-          if (!el) return {{error: "element not found"}};
-          el.scrollIntoView({{behavior:"smooth", block:"center", inline:"center"}});
-          return {{ok:true}};
-        }})()"#,
-        sel = selector
-    );
-    let v = eval(app, &js)?;
-    if let Some(err) = v.get("error").and_then(Value::as_str) {
-        return Err(err.to_string());
-    }
-    let timeout = scroll_timeout_ms();
-    let start = std::time::Instant::now();
-    let deadline = start + std::time::Duration::from_millis(timeout);
+/// 兜底显式滚动后的有界等待(ms)
+const FALLBACK_SCROLL_TIMEOUT_MS: u64 = 800;
+
+/// 轮询等待元素进入视口且窗口滚动稳定;返回 `(reached, stable)`
+fn wait_element_in_view(
+    app: &AppHandle,
+    selector: &str,
+    timeout_ms: u64,
+) -> ControlResult<(bool, bool)> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     let mut last = scroll_pos(app)?;
     let mut stable = 0u32;
     loop {
+        let in_view = element_in_viewport(app, selector)?;
+        if in_view && stable >= SCROLL_STABLE_SAMPLES {
+            return Ok((true, true));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok((false, stable >= SCROLL_STABLE_SAMPLES));
+        }
         std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
         let cur = scroll_pos(app)?;
         if cur == last {
@@ -330,21 +327,76 @@ pub fn scroll_to_element(app: &AppHandle, selector: &str) -> ControlResult<Value
             stable = 0;
             last = cur;
         }
-        let in_view = element_in_viewport(app, selector)?;
-        let is_stable = stable >= SCROLL_STABLE_SAMPLES;
-        if in_view && is_stable {
-            return Ok(json!({
-                "reached": true, "inViewport": true, "stable": true, "timedOut": false,
-                "waitedMs": start.elapsed().as_millis() as u64,
-            }));
-        }
-        if std::time::Instant::now() >= deadline {
-            return Ok(json!({
-                "reached": false, "inViewport": in_view, "stable": is_stable, "timedOut": true,
-                "waitedMs": start.elapsed().as_millis() as u64,
-            }));
-        }
     }
+}
+
+/// 兜底 JS:显式把元素在各级可滚动祖先(内层容器)居中,再对窗口 `scrollBy`
+fn bring_ancestors_into_view_js(selector: &str) -> String {
+    format!(
+        r#"(function(){{
+          var el = document.querySelector({sel:?});
+          if (!el) return {{error: "element not found"}};
+          var node = el.parentElement;
+          while (node && node !== document.body && node !== document.documentElement) {{
+            var cs = getComputedStyle(node);
+            var oy = cs.overflowY;
+            if ((oy === "auto" || oy === "scroll" || oy === "overlay") &&
+                node.scrollHeight > node.clientHeight + 1) {{
+              var r = el.getBoundingClientRect(), nr = node.getBoundingClientRect();
+              node.scrollTop += (r.top - nr.top) - (node.clientHeight - r.height) / 2;
+            }}
+            node = node.parentElement;
+          }}
+          var r = el.getBoundingClientRect();
+          window.scrollBy(0, r.top - (window.innerHeight - r.height) / 2);
+          return {{ok:true}};
+        }})()"#,
+        sel = selector
+    )
+}
+
+/// 滚动到元素并等待其真正进入视口且滚动位置稳定
+///
+/// 主路径用**立即**(非 smooth)的 `scrollIntoView({block:center,inline:center})`,一次性处理元素的
+/// 所有滚动祖先与窗口(实测平滑滚动在**嵌套滚动容器**上不可靠:窗口可能停在中途,元素仍在视口外);
+/// 若仍未进入视口,再显式逐级滚动可滚动祖先 + 窗口。全程有界超时,超时如实返回 `reached:false`
+/// 并给 `reason`。
+pub fn scroll_to_element(app: &AppHandle, selector: &str) -> ControlResult<Value> {
+    let start = std::time::Instant::now();
+    let js = format!(
+        r#"(function(){{
+          var el = document.querySelector({sel:?});
+          if (!el) return {{error: "element not found"}};
+          el.scrollIntoView({{block:"center", inline:"center"}});
+          return {{ok:true}};
+        }})()"#,
+        sel = selector
+    );
+    let v = eval(app, &js)?;
+    if let Some(err) = v.get("error").and_then(Value::as_str) {
+        return Err(err.to_string());
+    }
+    let (reached, stable) = wait_element_in_view(app, selector, scroll_timeout_ms())?;
+    if reached {
+        return Ok(json!({
+            "reached": true, "inViewport": true, "stable": stable, "timedOut": false,
+            "waitedMs": start.elapsed().as_millis() as u64,
+        }));
+    }
+    // 兜底:显式滚动可滚动祖先链 + 窗口,再做一次有界等待
+    let _ = eval(app, &bring_ancestors_into_view_js(selector));
+    let (reached2, stable2) = wait_element_in_view(app, selector, FALLBACK_SCROLL_TIMEOUT_MS)?;
+    let in_view = element_in_viewport(app, selector)?;
+    let mut out = json!({
+        "reached": reached2, "inViewport": in_view, "stable": stable2, "timedOut": !reached2,
+        "waitedMs": start.elapsed().as_millis() as u64,
+    });
+    if !reached2 {
+        out["reason"] = json!(
+            "element not brought into view (possibly outside the document's scrollable range)"
+        );
+    }
+    Ok(out)
 }
 
 /// 等待元素出现(轮询,最多 timeout_ms)

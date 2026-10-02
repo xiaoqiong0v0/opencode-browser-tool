@@ -34,10 +34,11 @@ function stableNote(r: any): string {
   return ` (scroll position not stable after ${r.waitedMs ?? "?"}ms)`;
 }
 
-/** scroll_to_element 到达说明:未进入视口时如实标注 */
+/** scroll_to_element 到达说明:未进入视口时如实标注(含原因) */
 function reachedNote(r: any): string {
   if (!r || r.reached !== false) return "";
-  return ` (element reached=${r.inViewport ? "in viewport" : "not in viewport"} after ${r.waitedMs ?? "?"}ms)`;
+  const why = r.reason ? `: ${r.reason}` : "";
+  return ` (element reached=${r.inViewport ? "in viewport" : "not in viewport"} after ${r.waitedMs ?? "?"}ms${why})`;
 }
 
 /** CLI 命令参数定义:flag=参数名,type=类型(string/boolean) */

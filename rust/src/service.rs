@@ -501,16 +501,20 @@ impl App {
             return Err("selector is required".into());
         }
         let handle = self.handle.clone();
-        // 等待元素真正进入视口且滚动稳定;超时如实返回 reached:false
+        // 等待元素真正进入视口且滚动稳定;超时如实返回 reached:false(+reason)
         let r = tokio::task::block_in_place(|| control::scroll_to_element(&handle, &s))?;
-        Ok(json!({
+        let mut out = json!({
             "scrolled": true,
             "reached": r["reached"],
             "inViewport": r["inViewport"],
             "stable": r["stable"],
             "timedOut": r["timedOut"],
             "waitedMs": r["waitedMs"],
-        }))
+        });
+        if r.get("reason").is_some() {
+            out["reason"] = r["reason"].clone();
+        }
+        Ok(out)
     }
 
     async fn reload(&self) -> Result<Value, String> {

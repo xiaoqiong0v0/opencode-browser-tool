@@ -127,9 +127,10 @@ WebKitGTK：`WebViewExt::snapshot(SnapshotRegion::Visible, SnapshotOptions::NONE
 
 `navigate` / `go_back` / `go_forward` 不再固定 sleep，而是等待就绪信号：`document.readyState` 达到
 `interactive`/`complete`，或观察到导航进展（URL 变化 / 曾进入 `loading`）；`scroll` 等待窗口滚动位置连续多次
-采样不变，`scroll_to_element` 额外校验元素真的进入视口。均有**有界超时**（默认 navigate 15s、history 5s、
+采样不变，`scroll_to_element` 额外校验元素真的进入视口（主路径用**立即** `scrollIntoView`，避免平滑滚动
+在嵌套滚动容器上停在中途；必要时兜底逐级滚动可滚动祖先 + 窗口）。均有**有界超时**（默认 navigate 15s、history 5s、
 scroll 3s），超时**如实回传** `ready:false` / `stable:false` / `reached:false` + `timedOut:true` + `waitedMs`，
-插件在结果文本后追加说明，不假装成功。
+`scroll_to_element` 不可达时另带 `reason`，插件在结果文本后追加说明，不假装成功。
 
 调试覆盖（起实例时设置）：`BT_NAV_TIMEOUT_MS`、`BT_HISTORY_TIMEOUT_MS`、`BT_SCROLL_TIMEOUT_MS`。
 Kali 复验步骤见 `linux-verification.md`。

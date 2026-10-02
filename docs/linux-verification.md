@@ -104,13 +104,17 @@ Post evaluate @{ script = "JSON.stringify({n:__events.length,trusted:__events.fi
 | 13 | `upload-file {"selector":"#file","filePath":"/etc/hostname"}` | **Linux 上预期报错**：`upload_file: not implemented on this platform yet (Windows via CDP ...)`。不返回成功即正确 |
 | 14 | `drag {"sourceSelector":"#drag-src","targetSelector":"#drop-zone"}` | **Linux 上预期报错**：`drag: not implemented on this platform yet (...)`。不返回成功即正确 |
 | 15 | `scroll {"direction":"down","amount":600}` | 成功；`stable:true`；返回后立刻与 250ms 后读 `window.scrollY` 相同（已稳定） |
-| 16 | `scroll-to-element {"selector":"#dump"}` | 成功；`reached:true`/`inViewport:true`；`#dump` 的 `getBoundingClientRect().top` 落在 `[0, innerHeight)` |
+| 16 | `scroll-to-element {"selector":"#dump"}` 与 `{"selector":"#sc-bottom"}`（**内层滚动容器**内） | 均成功；`reached:true`/`inViewport:true`；元素 `getBoundingClientRect()` 与视口相交（`#sc-bottom` 需内层容器与窗口同时滚动到位） |
 | 17 | `navigate` 到 `tests/manual/slow-page.html?block=1200` | 成功且 `ready:true`；返回时 `#slow-ready` 已存在、`readyState` 为 `interactive`/`complete` |
 
 超时/降级的有界行为（可选，用环境变量调小超时，起实例时带 `BT_NAV_TIMEOUT_MS=1500 BT_SCROLL_TIMEOUT_MS=800`）：
 
 - `navigate` 到 `tests/manual/never-ready.html` → ~1.5s 返回，`ready:false, timedOut:true, readyState:"loading"`（**如实报告，不假装成功**）；
 - `navigate` 到 `tests/manual/slow-page.html?autoscroll=1&block=0` 后 `scroll` → ~0.8s 返回，`stable:false, timedOut:true`。
+
+目标**物理不可达**时（例如 `position:fixed` 且位于视口外的元素，滚动无法改变其位置）：`scroll_to_element`
+仍会在有界时间内返回 `reached:false, inViewport:false, timedOut:true`，并附带
+`reason:"element not brought into view (possibly outside the document's scrollable range)"`——**如实说明原因，不假装成功**。
 
 ## 6. 失败时如何取证
 
