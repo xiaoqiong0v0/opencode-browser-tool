@@ -13,6 +13,22 @@ opencode 插件：Tauri 多 Webview 浏览器外壳 + 零注入视觉元素选�
 }
 ```
 
+## 二进制获取（bt-shell）
+
+插件依赖 Rust 外壳 `bt-shell`。默认**首次使用时后台自动下载**对应平台的 Release 资产到
+`~/.opencode/plugins-data/opencode-browser-tool/<版本>/<平台三元组>/`（Windows 即
+`%USERPROFILE%\.opencode\plugins-data\opencode-browser-tool\`），并用 Release 的 `SHA256SUMS` 做
+sha256 校验（幂等 + 原子替换 + 并发锁）。下载后台进行、**不阻塞 opencode 启动**；未就绪时工具调用会给出
+明确提示（下载进度 / 失败原因），不会假装成功。
+
+平台支持与系统依赖：
+
+- Windows x64 → `x86_64-pc-windows-msvc`（WebView2，系统自带）
+- Linux x64 → `x86_64-unknown-linux-gnu`，需系统库 `libwebkit2gtk-4.1` / `libgtk-3`（及 appindicator / rsvg 等，见 [docs/linux-support.md](./docs/linux-support.md) §5）
+- 其它平台：暂不提供预编译，请用 `BT_SHELL_PATH` 指定自行构建的二进制
+
+> 代理：下载优先调用系统 `curl`（自动遵循 `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY`）；无 curl 时回退 Node `fetch`。
+
 ## 配置
 
 配置文件：`~/.config/opencode/browser-tool.jsonc`（首次运行自动生成）
@@ -32,7 +48,10 @@ opencode 插件：Tauri 多 Webview 浏览器外壳 + 零注入视觉元素选�
 - `BT_BROWSERS_PATH` — 浏览器缓存目录
 - `BT_SHELL_URL` — **附着模式**：连接到已运行的 shell（完整基地址，如 `http://127.0.0.1:18280`），优先级最高
 - `BT_SHELL_PORT` — **附着模式**：仅指定端口，等价于 `http://127.0.0.1:<port>`
-- `BT_SHELL_PATH` — **启动模式**：指定要 spawn 的 Rust shell 二进制路径（开发用）
+- `BT_SHELL_PATH` — **启动模式**：指定要 spawn 的 Rust shell 二进制路径（开发用；优先级最高，覆盖自动下载与本地构建）
+- `BT_SHELL_NO_DOWNLOAD` — 设为 `1` 时不自动下载（状态 `disabled`；需自行放置二进制或配合 `BT_SHELL_PATH`）
+- `BT_SHELL_DOWNLOAD_BASE` — 覆盖下载根（默认 GitHub Release `https://github.com/xiaoqiong0v0/opencode-browser-tool/releases/download`），可指向镜像/自建
+- `BT_SHELL_VERSION` — 覆盖下载/缓存使用的版本（默认取插件自身版本，即 Release tag 去掉 `v`）
 
 > **附着模式 vs 启动模式**：设置了 `BT_SHELL_URL`（优先）或 `BT_SHELL_PORT` 时进入附着模式——插件**不 spawn** 任何进程，直接连接该地址的外部 shell；两者都未设置时按启动模式 spawn 本地二进制（`BT_SHELL_PATH` 可覆盖查找路径）。附着模式下 `bt_close` 只关闭浏览器窗口并断开连接，**不会**结束外部 shell 进程（进程不归插件管理）。
 

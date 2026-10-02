@@ -4,6 +4,8 @@ import { existsSync } from "fs";
 import { fileURLToPath } from "url";
 import createLogger from "@xiaoqiong0v0/opencode-plugin-logger";
 
+import { cachedBinaryPath, describeBinaryStatus, ensureBinary } from "./binary.js";
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 /** 就绪轮询超时(ms) */
@@ -11,13 +13,16 @@ const READY_TIMEOUT_MS = 20000;
 /** 就绪轮询间隔(ms) */
 const READY_POLL_INTERVAL_MS = 300;
 
-// Rust 二进制查找:dist/bin/bt-shell-{platform} 或环境变量覆盖(仅启动模式使用)
+// Rust 二进制查找:优先级 BT_SHELL_PATH → 本地开发构建 → 下载缓存(binary.ts)
 function resolveShellBinary(): string {
   const platform = process.platform === "win32" ? "win-x64" : "linux-x64";
   const bin = process.platform === "win32" ? "bt-shell.exe" : "bt-shell";
+  // 1) 显式指定:最优先(即使文件暂不存在也返回,由 startService 给出明确错误)
+  const envPath = process.env.BT_SHELL_PATH;
+  if (envPath) return envPath;
+  // 2) 本地开发构建(保持开发者流程不变)
   const cargoTargetDir = process.env.CARGO_TARGET_DIR;
   const candidates = [
-    process.env.BT_SHELL_PATH,
     resolve(__dirname, "bin", `bt-shell-${platform}.exe`),
     resolve(__dirname, "bin", `bt-shell-${platform}`),
     resolve(__dirname, "..", "rust", "target", "release", bin),
@@ -29,8 +34,8 @@ function resolveShellBinary(): string {
   for (const c of candidates) {
     if (c && existsSync(c)) return c;
   }
-  // 默认:开发环境用 cargo target 产物(release 优先)
-  return resolve(__dirname, "..", "rust", "target", "release", bin);
+  // 3) 下载缓存(未下载时由 startService 先 ensureBinary)
+  return cachedBinaryPath();
 }
 
 /** 解析附着模式目标地址:BT_SHELL_URL 优先,其次 BT_SHELL_PORT;均未设置返回 null */
@@ -142,7 +147,18 @@ export async function startService(
 ): Promise<void> {
   const log = createLogger("opencode-browser-tool");
   attachMode = false;
-  const shell = resolveShellBinary();
+  let shell = resolveShellBinary();
+  // 未就绪:先(有界)等待下载完成;失败/超时给出明确提示
+  if (!existsSync(shell)) {
+    if (process.env.BT_SHELL_PATH) {
+      throw new Error(`BT_SHELL_PATH 指向的二进制不存在：${shell}`);
+    }
+    const st = await ensureBinary(20000);
+    if (st.state !== "ready" || !st.path) {
+      throw new Error(describeBinaryStatus(st));
+    }
+    shell = st.path;
+  }
   // 显式指定端口(release 模式 GUI 程序无控制台,无法解析 stdout)
   const port = 18000 + Math.floor(Math.random() * 1000);
   const args = ["--browsers-path", browsersPath || "", "--port", String(port)];

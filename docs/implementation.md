@@ -33,6 +33,7 @@
 - Mutex 加锁注意提前 drop，避免同一线程重入死锁（emit_mode_state 曾卡死 HTTP 服务）
 - 前端 build 的 copyHtml 可能不更新 dist HTML（esbuild 缓存）→ 需手动 Copy-Item src/*.html dist/
 - 调试注意：非 DPI 感知进程读取 GetWindowRect 得到虚拟化坐标，截图会错位
+- **二进制分发/下载（`src/binary.ts`）**：首次使用后台从 GitHub Release 下载到 `~/.opencode/plugins-data/opencode-browser-tool/<version>/<triple>/`；**幂等**（已存在且 sha256 与 Release `SHA256SUMS` 一致即跳过）、**原子**（下到 `<asset>.part`，校验通过后 `rename` 替换）、**并发**（同进程共享 Promise；跨进程 `<asset>.lock` 原子创建、陈旧锁可接管、抢不到则等待复用）、**有界**（`ensureBinary(timeoutMs)` 不无限等待）；**取不到 SHA256SUMS 就明确失败，绝不跳过校验**；下载优先用系统 `curl`（自动遵循 `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY`），无 curl 时回退 Node `fetch`。二进制解析优先级：`BT_SHELL_PATH` → 本地开发构建（`CARGO_TARGET_DIR`/`rust/target`）→ 下载缓存
 - **插件持有 exe 文件锁 → 部署新二进制必须先退出 opencode**：opencode 启动时 spawn `rust/target/release/bt-shell.exe`，运行期间该文件被锁，此时 `cargo build --release` 会在最后一步报 `failed to remove file ... (os error 5)`（编译已完成，只是拷贝被拒），**磁盘上的产物不可信任**。部署顺序：退出 opencode（确认 shell 也已退出）→ 在 `rust/` 执行 `cargo build --release` → 重新启动 opencode（插件用它拉起 shell）；构建失败后不要依赖旧产物，退出 opencode 后重跑构建。同理，插件 TS（`dist/`）的改动也需要重启 opencode 才会生效
 
 ## 待办

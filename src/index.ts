@@ -10,6 +10,7 @@ import { registerLocale, t } from "./i18n/index.js";
 import en from "./i18n/en.js";
 import zh from "./i18n/zh.js";
 import { configureService, setUserDataDir, ensureService, openWindow, isRunning, stopService, service } from "./client.js";
+import { startDownload } from "./binary.js";
 import { tool, type Plugin } from "@opencode-ai/plugin";
 import createLogger from "@xiaoqiong0v0/opencode-plugin-logger";
 
@@ -242,6 +243,9 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree }) => {
       // 多用户配置:默认用当前激活配置的独立 WebView2 用户数据目录
       userDataDir: getProfileDir(getActiveProfile()),
     });
+
+    // 启动即后台下载 bt-shell(fire-and-forget:不阻塞启动,失败不抛出;状态见 getBinaryStatus)
+    startDownload();
 
     // 轮询批注发送队列(面板"发送全部" → 推送到对话)
     void startAnnotatePoller(client, log);

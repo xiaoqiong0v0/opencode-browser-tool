@@ -1,0 +1,463 @@
+//! 二进制分发:从 GitHub Release 下载 bt-shell 到插件数据目录并校验
+//!
+//! 设计要点:
+//! - 幂等:目标文件已存在且 sha256 与 Release 的 SHA256SUMS 一致即跳过
+//! - 原子:下载到 `<asset>.part`,校验通过后 `rename` 替换到最终路径
+//! - 并发:同进程共享 Promise;跨进程用 `<asset>.lock`(未过期则等待复用,避免重复下载)
+//! - 有界:`ensureBinary(timeoutMs)` 等待至就绪/超时,不无限等待
+//! - 代理:优先用系统 `curl`(自动遵循 HTTPS_PROXY/HTTP_PROXY),不可用时回退 `fetch`
+//!
+//! 环境变量:BT_SHELL_PATH / BT_SHELL_NO_DOWNLOAD / BT_SHELL_DOWNLOAD_BASE / BT_SHELL_VERSION
+
+import { spawn, spawnSync } from "child_process";
+import { createHash } from "crypto";
+import {
+  closeSync,
+  createWriteStream,
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "fs";
+import { dirname, resolve } from "path";
+import { fileURLToPath, pathToFileURL } from "url";
+import { getPluginDataDir } from "./config/index.js";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+/** 默认下载根(不含 `/v<version>/<asset>`),可用 BT_SHELL_DOWNLOAD_BASE 覆盖 */
+const DEFAULT_DOWNLOAD_BASE = "https://github.com/xiaoqiong0v0/opencode-browser-tool/releases/download";
+/** 跨进程锁过期时间(ms):超过则视为陈旧锁可接管 */
+const LOCK_STALE_MS = 10 * 60 * 1000;
+/** 等待其它进程下载完成的上限(ms) */
+const WAIT_OTHER_PROCESS_MS = 60 * 1000;
+
+export type BinaryState = "idle" | "ready" | "downloading" | "failed" | "disabled" | "unsupported";
+
+export interface BinaryStatus {
+  state: BinaryState;
+  /** 下载进度百分比(0-100;总大小未知时为 undefined) */
+  progress?: number;
+  /** 失败/禁用/不支持的可读原因 */
+  reason?: string;
+  /** 二进制最终路径(就绪时存在) */
+  path?: string;
+}
+
+interface PlatformInfo {
+  triple: string;
+  assetName: string;
+}
+
+/** 当前平台 → Release 资产信息;不支持的平台返回 null */
+export function platformInfo(): PlatformInfo | null {
+  const { platform, arch } = process;
+  if (platform === "win32" && arch === "x64") {
+    return { triple: "x86_64-pc-windows-msvc", assetName: "bt-shell-x86_64-pc-windows-msvc.exe" };
+  }
+  if (platform === "linux" && arch === "x64") {
+    return { triple: "x86_64-unknown-linux-gnu", assetName: "bt-shell-x86_64-unknown-linux-gnu" };
+  }
+  return null;
+}
+
+/** 插件自身版本:BT_SHELL_VERSION 优先,其次读包元数据 */
+export function pluginVersion(): string {
+  const env = process.env.BT_SHELL_VERSION?.trim();
+  if (env) return env;
+  try {
+    const pkg = JSON.parse(readFileSync(resolve(__dirname, "..", "package.json"), "utf-8"));
+    if (pkg?.version) return String(pkg.version);
+  } catch {
+    // 忽略:回退占位版本
+  }
+  return "0.0.0";
+}
+
+/** Release 下载根(含版本):`<base>/v<version>` */
+function releaseBase(): string {
+  const base = (process.env.BT_SHELL_DOWNLOAD_BASE?.trim() || DEFAULT_DOWNLOAD_BASE).replace(/\/+$/, "");
+  return `${base}/v${pluginVersion()}`;
+}
+
+/** 下载缓存路径:`<pluginDataDir>/<version>/<triple>/<assetName>` */
+export function cachedBinaryPath(): string {
+  const info = platformInfo();
+  const triple = info?.triple ?? `${process.platform}-${process.arch}`;
+  const name = info?.assetName ?? (process.platform === "win32" ? "bt-shell.exe" : "bt-shell");
+  return resolve(getPluginDataDir(), pluginVersion(), triple, name);
+}
+
+/** 供外部(工具提示)使用:二进制的版本/三元组/文件名/下载 URL/缓存路径 */
+export function getBinaryInfo() {
+  const info = platformInfo();
+  if (!info) return null;
+  const path = cachedBinaryPath();
+  return {
+    version: pluginVersion(),
+    triple: info.triple,
+    assetName: info.assetName,
+    url: `${releaseBase()}/${info.assetName}`,
+    sumsUrl: `${releaseBase()}/SHA256SUMS`,
+    path,
+  };
+}
+
+// ---- 状态机 ----
+let current: BinaryStatus = { state: "idle", path: undefined };
+/** 同进程内共享的下载 Promise(并发只下载一次) */
+let inflight: Promise<void> | null = null;
+
+export function getBinaryStatus(): BinaryStatus {
+  return { ...current };
+}
+
+function setStatus(next: BinaryStatus): void {
+  current = next;
+}
+
+/** 触发后台下载(幂等;fire-and-forget,失败不抛出) */
+export function startDownload(): void {
+  if (inflight) return;
+  if (current.state === "ready" || current.state === "disabled" || current.state === "unsupported") return;
+  inflight = doDownload()
+    .catch(() => {
+      // 失败原因已写入状态;这里吞掉,避免影响调用方(opencode 启动)
+    })
+    .finally(() => {
+      inflight = null;
+    });
+}
+
+/** 等待二进制就绪或超时(不无限等待);超时返回当前状态 */
+export async function ensureBinary(timeoutMs = 20000): Promise<BinaryStatus> {
+  startDownload();
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const s = getBinaryStatus();
+    if (s.state !== "idle" && s.state !== "downloading") return s;
+    await sleep(200);
+  }
+  return getBinaryStatus();
+}
+
+/** 就绪状态的可读提示文案(供工具在未就绪时返回) */
+export function describeBinaryStatus(s: BinaryStatus): string {
+  switch (s.state) {
+    case "ready":
+      return s.path ?? "ready";
+    case "downloading":
+      return `bt-shell 正在下载（${s.progress ?? 0}%）… 稍后重试`;
+    case "failed":
+      return `bt-shell 下载失败：${s.reason ?? "未知原因"}；可用 BT_SHELL_DOWNLOAD_BASE 换源、或 BT_SHELL_PATH 手动指定二进制`;
+    case "disabled":
+      return `bt-shell 自动下载已禁用（BT_SHELL_NO_DOWNLOAD=1）；请用 BT_SHELL_PATH 指定二进制，或把它放到 ${s.path ?? cachedBinaryPath()}`;
+    case "unsupported":
+      return `bt-shell 暂不支持当前平台：${s.reason ?? `${process.platform}/${process.arch}`}`;
+    default:
+      return "bt-shell 尚未就绪，请稍后重试";
+  }
+}
+
+// ---- 下载主流程 ----
+async function doDownload(): Promise<void> {
+  const path = cachedBinaryPath();
+  if (process.env.BT_SHELL_NO_DOWNLOAD === "1") {
+    setStatus({ state: "disabled", reason: "BT_SHELL_NO_DOWNLOAD=1", path });
+    return;
+  }
+  const info = platformInfo();
+  if (!info) {
+    setStatus({ state: "unsupported", reason: `${process.platform}/${process.arch}`, path });
+    return;
+  }
+
+  const finalPath = path;
+  const partPath = `${finalPath}.part`;
+  const sumsPath = resolve(dirname(finalPath), "SHA256SUMS");
+  const lockPath = `${finalPath}.lock`;
+  mkdirSync(dirname(finalPath), { recursive: true });
+  setStatus({ state: "downloading", progress: 0, path: finalPath });
+
+  // 1) 已存在:优先用本地缓存的 SHA256SUMS 校验(免网络);一致即就绪
+  if (existsSync(finalPath) && existsSync(sumsPath)) {
+    const expected = parseSums(readFileSync(sumsPath, "utf-8"), info.assetName);
+    if (expected && sha256File(finalPath) === expected) {
+      setStatus({ state: "ready", path: finalPath });
+      return;
+    }
+  }
+
+  // 2) 获取 SHA256SUMS(取不到则明确失败,绝不跳过校验)
+  const sumsUrl = `${releaseBase()}/SHA256SUMS`;
+  let sumsText: string;
+  try {
+    sumsText = await fetchText(sumsUrl);
+  } catch (e) {
+    setStatus({ state: "failed", reason: `无法获取 SHA256SUMS（不跳过校验）：${errMsg(e)}`, path: finalPath });
+    return;
+  }
+  const expected = parseSums(sumsText, info.assetName);
+  if (!expected) {
+    setStatus({ state: "failed", reason: `SHA256SUMS 中未找到 ${info.assetName}`, path: finalPath });
+    return;
+  }
+
+  // 3) 已存在且与最新校验和一致 → 就绪(写回 sums 缓存)
+  if (existsSync(finalPath) && sha256File(finalPath) === expected) {
+    try {
+      writeFileSync(sumsPath, sumsText, "utf-8");
+    } catch {}
+    setStatus({ state: "ready", path: finalPath });
+    return;
+  }
+
+  // 4) 跨进程锁:抢不到则等其它进程下载完成
+  if (!acquireLock(lockPath)) {
+    const ok = await waitForValidFile(finalPath, expected, WAIT_OTHER_PROCESS_MS);
+    if (ok) {
+      setStatus({ state: "ready", path: finalPath });
+    } else {
+      setStatus({ state: "failed", reason: "等待其它进程下载超时（可删除 .lock 后重试）", path: finalPath });
+    }
+    return;
+  }
+
+  try {
+    const url = `${releaseBase()}/${info.assetName}`;
+    try {
+      if (existsSync(partPath)) unlinkSync(partPath);
+    } catch {}
+    await downloadTo(url, partPath, (p) => setStatus({ state: "downloading", progress: p, path: finalPath }));
+    const got = sha256File(partPath);
+    if (got !== expected) {
+      safeUnlink(partPath);
+      setStatus({
+        state: "failed",
+        reason: `sha256 校验失败：期望 ${expected.slice(0, 12)}… 实际 ${got.slice(0, 12)}…`,
+        path: finalPath,
+      });
+      return;
+    }
+    renameSync(partPath, finalPath); // 原子替换
+    if (process.platform !== "win32") {
+      try {
+        chmodSync(finalPath, 0o755);
+      } catch {}
+    }
+    try {
+      writeFileSync(sumsPath, sumsText, "utf-8");
+    } catch {}
+    setStatus({ state: "ready", path: finalPath });
+  } catch (e) {
+    safeUnlink(partPath);
+    setStatus({ state: "failed", reason: errMsg(e), path: finalPath });
+  } finally {
+    releaseLock(lockPath);
+  }
+}
+
+// ---- 下载实现:curl 优先(自动遵循系统代理),回退 fetch ----
+let curlChecked = false;
+let curlOk = false;
+function curlAvailable(): boolean {
+  if (!curlChecked) {
+    curlChecked = true;
+    try {
+      curlOk = spawnSync("curl", ["--version"], { stdio: "ignore" }).status === 0;
+    } catch {
+      curlOk = false;
+    }
+  }
+  return curlOk;
+}
+
+async function downloadTo(url: string, dest: string, onProgress: (p?: number) => void): Promise<void> {
+  if (curlAvailable()) return downloadWithCurl(url, dest, onProgress);
+  return downloadWithFetch(url, dest, onProgress);
+}
+
+/** 用系统 curl 下载(curl 自动读取 HTTPS_PROXY/HTTP_PROXY/NO_PROXY 并跟随重定向) */
+async function downloadWithCurl(url: string, dest: string, onProgress: (p?: number) => void): Promise<void> {
+  const total = curlContentLength(url);
+  await new Promise<void>((resolvePromise, reject) => {
+    const child = spawn("curl", ["-L", "--fail", "--silent", "--show-error", "-o", dest, url], {
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    let stderr = "";
+    child.stderr?.on("data", (d) => {
+      stderr += d.toString();
+    });
+    const timer = setInterval(() => {
+      try {
+        const size = statSync(dest).size;
+        onProgress(total ? Math.min(100, Math.floor((size * 100) / total)) : undefined);
+      } catch {
+        // .part 尚未创建
+      }
+    }, 200);
+    child.on("error", (e) => {
+      clearInterval(timer);
+      reject(e);
+    });
+    child.on("close", (code) => {
+      clearInterval(timer);
+      if (code === 0) resolvePromise();
+      else reject(new Error(`curl exit ${code}: ${stderr.trim() || "下载失败"}`));
+    });
+  });
+}
+
+/** HEAD 取 Content-Length(取不到返回 undefined;进度仍可降级为未知) */
+function curlContentLength(url: string): number | undefined {
+  try {
+    const r = spawnSync("curl", ["-sIL", url], { encoding: "utf-8", maxBuffer: 8 * 1024 * 1024 });
+    if (r.status !== 0 || !r.stdout) return undefined;
+    let total: number | undefined;
+    for (const line of r.stdout.split(/\r?\n/)) {
+      const m = line.match(/^content-length:\s*(\d+)/i);
+      if (m) {
+        const n = Number(m[1]);
+        if (n > 0) total = n;
+      }
+    }
+    return total;
+  } catch {
+    return undefined;
+  }
+}
+
+async function downloadWithFetch(url: string, dest: string, onProgress: (p?: number) => void): Promise<void> {
+  const res = await fetch(url, { redirect: "follow" });
+  if (!res.ok || !res.body) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+  const total = Number(res.headers.get("content-length") || 0) || undefined;
+  const out = createWriteStream(dest);
+  const reader = res.body.getReader();
+  let received = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        received += value.length;
+        out.write(Buffer.from(value));
+        onProgress(total ? Math.min(100, Math.floor((received * 100) / total)) : undefined);
+      }
+    }
+  } finally {
+    await new Promise<void>((r) => out.end(() => r()));
+  }
+}
+
+/** 取文本:fetch 优先(无代理时直连);失败回退 curl(代理环境) */
+async function fetchText(url: string): Promise<string> {
+  try {
+    const res = await fetch(url, { redirect: "follow" });
+    if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+    return await res.text();
+  } catch (e) {
+    if (curlAvailable()) return curlText(url);
+    throw e;
+  }
+}
+
+function curlText(url: string): string {
+  const r = spawnSync("curl", ["-sL", "--fail", url], { encoding: "utf-8", maxBuffer: 8 * 1024 * 1024 });
+  if (r.status !== 0) throw new Error(`curl exit ${r.status}: ${(r.stderr || "").trim() || "获取失败"}`);
+  return r.stdout || "";
+}
+
+// ---- 校验/锁/工具 ----
+/** 计算文件 sha256(hex,流式读取,避免大文件占内存) */
+function sha256File(path: string): string {
+  const hash = createHash("sha256");
+  const fd = openSync(path, "r");
+  const buf = Buffer.alloc(1024 * 256);
+  try {
+    for (;;) {
+      const n = readSync(fd, buf, 0, buf.length, null);
+      if (n <= 0) break;
+      hash.update(buf.subarray(0, n));
+    }
+  } finally {
+    closeSync(fd);
+  }
+  return hash.digest("hex");
+}
+
+/** 从 SHA256SUMS 解析目标资产的 sha256;找不到返回 null */
+function parseSums(text: string, assetName: string): string | null {
+  for (const line of text.split(/\r?\n/)) {
+    const m = line.trim().match(/^([0-9a-fA-F]{64})\s+\*?(.+)$/);
+    if (m && m[2].trim() === assetName) return m[1].toLowerCase();
+  }
+  return null;
+}
+
+/** 抢占跨进程锁(原子创建);陈旧锁可接管;失败返回 false(表示其它进程在下载) */
+function acquireLock(lockPath: string): boolean {
+  try {
+    writeFileSync(lockPath, `${process.pid} ${Date.now()}`, { flag: "wx" });
+    return true;
+  } catch (e: any) {
+    if (e?.code !== "EEXIST") return true; // 其它错误不阻塞下载
+    try {
+      const age = Date.now() - statSync(lockPath).mtimeMs;
+      if (age > LOCK_STALE_MS) {
+        unlinkSync(lockPath);
+        return acquireLock(lockPath);
+      }
+    } catch {
+      // 锁文件刚被删除等:重试一次
+      return acquireLock(lockPath);
+    }
+    return false;
+  }
+}
+
+function releaseLock(lockPath: string): void {
+  safeUnlink(lockPath);
+}
+
+async function waitForValidFile(path: string, expected: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      if (existsSync(path) && sha256File(path) === expected) return true;
+    } catch {}
+    await sleep(300);
+  }
+  return false;
+}
+
+function safeUnlink(path: string): void {
+  try {
+    if (existsSync(path)) unlinkSync(path);
+  } catch {}
+}
+
+function errMsg(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// ---- 独立运行:`node dist/binary.js [--timeout=ms]`〔便于测试〕----
+const isMain = process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
+if (isMain) {
+  const arg = process.argv.find((a) => a.startsWith("--timeout="));
+  const timeout = arg ? Number(arg.split("=")[1]) : 20000;
+  startDownload();
+  ensureBinary(Number.isFinite(timeout) ? timeout : 20000).then((s) => {
+    console.log(JSON.stringify(s, null, 2));
+    process.exit(s.state === "ready" || s.state === "disabled" || s.state === "unsupported" ? 0 : 1);
+  });
+}
