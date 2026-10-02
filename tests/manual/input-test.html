@@ -33,6 +33,21 @@
   #log .ln.un { color: #ffd43b; }
   #dump { width: 100%; box-sizing: border-box; font-family: Consolas, monospace; font-size: 12px; }
   .hint { font-size: 12px; color: #868e96; }
+  #file-info, #drag-info { font-family: Consolas, monospace; font-size: 13px; margin-top: 6px; color: #1971c2; }
+  #drag-src { display: inline-block; padding: 10px 18px; margin-right: 12px; border: 2px dashed #1971c2;
+              border-radius: 6px; background: #e7f5ff; cursor: grab; user-select: none; }
+  #drop-zone { display: inline-block; padding: 18px 26px; border: 2px dashed #868e96; border-radius: 6px;
+               background: #f8f9fa; vertical-align: middle; }
+  #drop-zone.hot { border-color: #2b8a3e; background: #d3f9d8; }
+  #drop-zone.done { border-color: #2b8a3e; background: #b2f2bb; }
+  #cover-wrap { position: relative; display: inline-block; }
+  #cover-overlay { position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+                   background: rgba(220, 50, 50, 0.30); z-index: 2; }
+  #mb-info, #covered-info, #hover-info, #ifr-info { font-family: Consolas, monospace; font-size: 13px;
+                   margin-top: 6px; color: #1971c2; }
+  #hover-target { display: inline-block; padding: 14px 22px; background: #dee2e6;
+                  border: 1px solid #868e96; border-radius: 6px; }
+  #hover-target:hover { background: #2b8a3e; color: #fff; }
 </style>
 </head>
 <body>
@@ -42,6 +57,14 @@
   <b>isTrusted=false</b> 表示合成事件（自动化工具派发，红底），true 表示真实用户操作（绿底）。
   ② 状态条若停留在「尚未收到任何事件」、或只有 click 而没有 key 事件 → 按键没有到达页面。
   ③ 「清空日志」按钮重置状态条、日志面板、window.__events 与 #dump。
+  ④ 验证上传：`upload_file --selector #file --filePath <存在的文件>` 后看 #file-info 的
+  <b>files.length</b> 与文件名，并应出现一条 <b>change</b> 事件；不存在的路径应直接报错。
+  ⑤ 验证拖拽：`drag --sourceSelector #drag-src --targetSelector #drop-zone` 后看 #drag-info 的
+  dragstart/dragover/drop 计数与 drop 时 <b>getData('text/plain')</b> 的值（真实 DnD 应为 DRAG-OK）。
+  ⑥ 验证点击/悬停：`click --selector #mb` 后看 #mb-info 的 mousedown/mouseup/click 计数与 last 坐标（isTrusted 应为 true）；
+  `click --selector #covered-btn` 应报「被遮挡」错误且 #covered-info 计数不变（对照 `#synth-covered` 走 el.click() 会 +1）。
+  ⑦ 悬停：`hover --selector #hover-target` 后 #hover-info 的 <b>matches:hover=true</b> 且 bg 变绿；
+  iframe 内用 `iframe_click --iframeSelector #ifr --selector #ifr-btn`，看 #ifr-info 计数。
 </p>
 
 <div id="status" class="idle">尚未收到任何事件</div>
@@ -75,6 +98,53 @@
   <label><input type="radio" name="rg" value="r2"> 单选 B</label><br>
   <button id="counterBtn" type="button">按钮点击次数：0</button>
   <a href="#link-ok" id="lk">锚点链接（点击只改 hash，不跳走）</a>
+</fieldset>
+
+<h2>文件上传</h2>
+<fieldset>
+  <legend>文件输入 #file（验证 upload_file 是否真挂上文件；change 由全局捕获记录）</legend>
+  <input type="file" id="file" multiple>
+  <div id="file-info">files.length=0  names=[]</div>
+</fieldset>
+
+<h2>拖拽（原生 HTML5 DnD）</h2>
+<fieldset>
+  <legend>拖拽源 #drag-src（draggable）→ 放置区 #drop-zone</legend>
+  <div id="drag-src" draggable="true">拖我</div>
+  <div id="drop-zone">放到这里</div>
+  <div id="drag-info">dragstart=0 dragover=0 drop=0 data=（未拖拽）</div>
+</fieldset>
+
+<h2>鼠标事件（坐标 + isTrusted）</h2>
+<fieldset>
+  <legend>#mb 记录 mousedown/mouseup/click 的坐标与 isTrusted</legend>
+  <button id="mb" type="button">鼠标事件按钮 #mb</button>
+  <div id="mb-info">mousedown=0 mouseup=0 click=0 last=（—）</div>
+</fieldset>
+
+<h2>遮挡命中测试</h2>
+<fieldset>
+  <legend>#covered-btn 被半透明 #cover-overlay 覆盖；可信点击应命中遮挡层而非按钮</legend>
+  <div id="cover-wrap">
+    <button id="covered-btn" type="button">被遮挡的按钮 #covered-btn</button>
+    <div id="cover-overlay" title="覆盖层"></div>
+  </div>
+  <div id="covered-info">covered click=0（旧 el.click() 会 +1）</div>
+  <button id="synth-covered" type="button">对照：对 #covered-btn 调 el.click()（untrusted，会 +1）</button>
+</fieldset>
+
+<h2>CSS :hover</h2>
+<fieldset>
+  <legend>#hover-target 默认灰底，:hover 变绿；同时记录 mouseover/mouseenter/mouseleave</legend>
+  <div id="hover-target">悬停我 #hover-target</div>
+  <div id="hover-info">bg=（—） matches:hover=false</div>
+</fieldset>
+
+<h2>iframe 内点击</h2>
+<fieldset>
+  <legend>同源 iframe #ifr（内部按钮 #ifr-btn，含 3px 边框），验证坐标换算</legend>
+  <iframe id="ifr" width="300" height="120" style="border:3px solid #1971c2;"></iframe>
+  <div id="ifr-info">iframe clicks=0</div>
 </fieldset>
 
 <h2>滚动与视口</h2>
@@ -114,6 +184,12 @@ var EVENTS = window.__events;
 function handleEvent(e) {
   var el = e.target;
   var isFormField = el && /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName);
+  var dtData = null;
+  try {
+    if (e.dataTransfer && typeof e.dataTransfer.getData === 'function') {
+      dtData = e.dataTransfer.getData('text/plain');
+    }
+  } catch (err) { dtData = null; }
   var rec = {
     t: Date.now(),
     type: e.type,
@@ -121,12 +197,13 @@ function handleEvent(e) {
     code: (typeof e.code === 'string') ? e.code : null,
     isTrusted: !!e.isTrusted,
     value: (isFormField && typeof el.value === 'string') ? el.value : null,
+    data: dtData,
     target: targetName(el)
   };
   EVENTS.push(rec);
   console.log('[EVT] ' + JSON.stringify({
     t: rec.t, type: rec.type, key: rec.key, code: rec.code,
-    isTrusted: rec.isTrusted, value: rec.value, target: rec.target
+    isTrusted: rec.isTrusted, value: rec.value, data: rec.data, target: rec.target
   }));
   seq += 1;
 
@@ -175,7 +252,8 @@ function appendLog(rec) {
     ' code=' + (rec.code === null ? '-' : rec.code) +
     ' trusted=' + rec.isTrusted +
     ' target=' + rec.target +
-    (rec.value === null ? '' : ' value=' + JSON.stringify(rec.value));
+    (rec.value === null ? '' : ' value=' + JSON.stringify(rec.value)) +
+    (rec.data === null ? '' : ' data=' + JSON.stringify(rec.data));
   var line = document.createElement('div');
   line.className = 'ln ' + (rec.isTrusted ? 'tr' : 'un');
   line.textContent = text;
@@ -186,7 +264,9 @@ function appendLog(rec) {
 
 // ===== 事件监听：document 捕获阶段统一收（focus/blur 不冒泡，必须捕获） =====
 ['keydown', 'keyup', 'keypress', 'beforeinput', 'input', 'change',
- 'submit', 'click', 'focus', 'blur'].forEach(function (tp) {
+ 'submit', 'click', 'focus', 'blur',
+ 'mousedown', 'mouseup', 'mouseover', 'mouseenter', 'mouseleave',
+ 'dragstart', 'dragenter', 'dragover', 'drop', 'dragend'].forEach(function (tp) {
   document.addEventListener(tp, handleEvent, true);
 });
 
@@ -208,6 +288,112 @@ document.getElementById('counterBtn').addEventListener('click', function () {
   clickCount += 1;
   this.textContent = '按钮点击次数：' + clickCount;
 });
+
+// ===== 文件上传显示（files.length 与文件名，供 evaluate / 目视核对） =====
+function updateFileInfo() {
+  var f = document.getElementById('file');
+  var names = [];
+  for (var i = 0; i < f.files.length; i++) { names.push(f.files[i].name); }
+  document.getElementById('file-info').textContent =
+    'files.length=' + f.files.length + '  names=' + JSON.stringify(names);
+}
+document.getElementById('file').addEventListener('change', updateFileInfo);
+
+// ===== 拖拽计数（原生 DnD：drop-zone 必须在 dragover 里 preventDefault 才允许 drop） =====
+var dragState = { start: 0, over: 0, drop: 0, data: null };
+window.__drag = dragState;
+function updateDragInfo() {
+  document.getElementById('drag-info').textContent =
+    'dragstart=' + dragState.start + ' dragover=' + dragState.over +
+    ' drop=' + dragState.drop +
+    ' data=' + (dragState.data === null ? '（未拖拽）' : JSON.stringify(dragState.data));
+}
+document.getElementById('drag-src').addEventListener('dragstart', function (e) {
+  dragState.start += 1;
+  try { e.dataTransfer.setData('text/plain', 'DRAG-OK'); } catch (err) {}
+  updateDragInfo();
+});
+document.getElementById('drop-zone').addEventListener('dragover', function (e) {
+  e.preventDefault();               // 允许 drop
+  dragState.over += 1;
+  updateDragInfo();
+});
+document.getElementById('drop-zone').addEventListener('dragenter', function () {
+  this.classList.add('hot');
+});
+document.getElementById('drop-zone').addEventListener('dragleave', function () {
+  this.classList.remove('hot');
+});
+document.getElementById('drop-zone').addEventListener('drop', function (e) {
+  e.preventDefault();
+  dragState.drop += 1;
+  try { dragState.data = e.dataTransfer.getData('text/plain'); } catch (err) { dragState.data = null; }
+  this.classList.add('done');
+  updateDragInfo();
+});
+updateFileInfo();
+updateDragInfo();
+
+// ===== 鼠标事件记录（坐标 + isTrusted） =====
+var mouseState = { down: 0, up: 0, click: 0, last: null };
+window.__mouse = mouseState;
+function updateMouseInfo() {
+  document.getElementById('mb-info').textContent =
+    'mousedown=' + mouseState.down + ' mouseup=' + mouseState.up + ' click=' + mouseState.click +
+    ' last=' + (mouseState.last === null ? '（—）' : JSON.stringify(mouseState.last));
+}
+['mousedown', 'mouseup', 'click'].forEach(function (tp) {
+  document.getElementById('mb').addEventListener(tp, function (e) {
+    if (tp === 'mousedown') { mouseState.down += 1; }
+    else if (tp === 'mouseup') { mouseState.up += 1; }
+    else { mouseState.click += 1; }
+    mouseState.last = { type: e.type, x: e.clientX, y: e.clientY, isTrusted: e.isTrusted };
+    updateMouseInfo();
+  });
+});
+updateMouseInfo();
+
+// ===== 遮挡用例：#covered-btn 被 #cover-overlay 半透明覆盖 =====
+window.__covered = { clicks: 0 };
+document.getElementById('covered-btn').addEventListener('click', function () {
+  window.__covered.clicks += 1;
+  document.getElementById('covered-info').textContent =
+    'covered click=' + window.__covered.clicks + '（旧 el.click() 会 +1）';
+});
+document.getElementById('synth-covered').addEventListener('click', function () {
+  document.getElementById('covered-btn').click();
+});
+
+// ===== CSS :hover 用例 =====
+var hoverState = { over: 0, enter: 0, leave: 0 };
+window.__hover = hoverState;
+function updateHoverInfo() {
+  var el = document.getElementById('hover-target');
+  document.getElementById('hover-info').textContent =
+    'bg=' + getComputedStyle(el).backgroundColor + ' matches:hover=' + el.matches(':hover');
+}
+document.getElementById('hover-target').addEventListener('mouseover', function () { hoverState.over += 1; updateHoverInfo(); });
+document.getElementById('hover-target').addEventListener('mouseenter', function () { hoverState.enter += 1; updateHoverInfo(); });
+document.getElementById('hover-target').addEventListener('mouseleave', function () { hoverState.leave += 1; updateHoverInfo(); });
+updateHoverInfo();
+
+// ===== iframe 内容与点击计数（同源 about:blank） =====
+window.__iframeClicks = 0;
+(function initIframe() {
+  var ifr = document.getElementById('ifr');
+  var idoc = ifr.contentDocument;
+  if (!idoc) { document.getElementById('ifr-info').textContent = 'contentDocument unavailable'; return; }
+  idoc.open();
+  idoc.write('<!DOCTYPE html><html><body style="margin:0">' +
+    '<button id="ifr-btn" style="margin:16px;padding:8px 12px">iframe 按钮 #ifr-btn</button>' +
+    '</body></html>');
+  idoc.close();
+  idoc.getElementById('ifr-btn').addEventListener('click', function () {
+    window.__iframeClicks += 1;
+    document.getElementById('ifr-info').textContent = 'iframe clicks=' + window.__iframeClicks;
+  });
+  document.getElementById('ifr-info').textContent = 'iframe clicks=0';
+})();
 
 // ===== 视口尺寸实时显示 =====
 function updateVp() {

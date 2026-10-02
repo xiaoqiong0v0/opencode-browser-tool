@@ -10,14 +10,11 @@ use crate::ui::{self, AnnotationRecord, PendingShot, RECORD_ANNOTATE, RECORD_SCR
 const HOVER_COLOR: u32 = 0xFFC107;
 
 /// 批注/截图状态机
-pub struct Annotator {
-    /// 当前悬停高亮
-    hover: Option<(i32, i32, i32, i32)>,
-}
+pub struct Annotator {}
 
 impl Annotator {
     pub fn new() -> Self {
-        Self { hover: None }
+        Self {}
     }
 
     /// 切换批注模式(覆盖层显示/隐藏)
@@ -386,7 +383,7 @@ impl Annotator {
 }
 
 /// 注册批注相关事件监听
-pub fn register(app: &AppHandle, state: tauri::State<'_, UiState>) {
+pub fn register(_app: &AppHandle, state: tauri::State<'_, UiState>) {
     let _ = state;
     let _ = json!({});
 }

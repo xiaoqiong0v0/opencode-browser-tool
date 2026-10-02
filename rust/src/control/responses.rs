@@ -73,7 +73,7 @@ pub fn setup(app: &AppHandle, webview: &tauri::webview::Webview) {
                                 if let (Ok(req), Ok(res)) = (args.Request(), args.Response()) {
                                     let mut uri_out = windows::core::PWSTR::null();
                                     let url = if req.Uri(&mut uri_out).is_ok() {
-                                        unsafe { uri_out.to_hstring().to_string() }
+                                        uri_out.to_hstring().to_string()
                                     } else {
                                         String::new()
                                     };

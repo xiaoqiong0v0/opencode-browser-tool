@@ -55,7 +55,7 @@ pub fn setup(app: &AppHandle, webview: &tauri::webview::Webview) {
                                 // 读取目标地址并标记已处理(阻止默认忽略行为)
                                 let mut uri_out = windows::core::PWSTR::null();
                                 let uri = if args.Uri(&mut uri_out).is_ok() {
-                                    unsafe { uri_out.to_hstring().to_string() }
+                                    uri_out.to_hstring().to_string()
                                 } else {
                                     String::new()
                                 };

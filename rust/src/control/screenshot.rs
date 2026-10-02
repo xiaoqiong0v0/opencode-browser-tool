@@ -48,7 +48,6 @@ fn screenshot_impl(
         unsafe {
             use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2;
             use webview2_com::CallDevToolsProtocolMethodCompletedHandler;
-            use windows::core::Interface;
 
             let webview_result: Result<ICoreWebView2, String> = controller
                 .CoreWebView2()

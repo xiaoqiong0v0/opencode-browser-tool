@@ -166,16 +166,6 @@ impl App {
         }
     }
 
-    /// 在 tokio 线程中执行同步控制操作(避免阻塞 worker)
-    fn run<T, F>(&self, f: F) -> Result<T, String>
-    where
-        T: Send + 'static,
-        F: FnOnce(&AppHandle) -> Result<T, String> + Send + 'static,
-    {
-        let handle = self.handle.clone();
-        tokio::task::block_in_place(|| f(&handle))
-    }
-
     // ---- 端点实现(全部通过 control 驱动页面 Webview) ----
 
     async fn status(&self) -> Result<Value, String> {
@@ -234,9 +224,13 @@ impl App {
 
     async fn click(&self, body: &Value) -> Result<Value, String> {
         let s = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if s.is_empty() {
+            return Err("selector is required".into());
+        }
         let handle = self.handle.clone();
-        tokio::task::block_in_place(|| control::click(&handle, &s))?;
-        Ok(json!({ "clicked": true }))
+        // 可信点击:Windows 走 CDP 鼠标序列(命中测试 + 真实默认行为),非 Windows 明确报错
+        let p = tokio::task::block_in_place(|| control::mouse::click(&handle, &s))?;
+        Ok(json!({ "clicked": true, "x": p.x, "y": p.y }))
     }
 
     async fn fill(&self, body: &Value) -> Result<Value, String> {
@@ -278,22 +272,13 @@ impl App {
 
     async fn hover(&self, body: &Value) -> Result<Value, String> {
         let s = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let handle = self.handle.clone();
-        let js = format!(
-            r#"(function(){{
-              const el = document.querySelector({s:?});
-              if (!el) return {{error:"not found"}};
-              el.dispatchEvent(new MouseEvent("mouseover", {{bubbles:true}}));
-              el.dispatchEvent(new MouseEvent("mouseenter", {{bubbles:true}}));
-              return {{ok:true}};
-            }})()"#,
-            s = s
-        );
-        let r = tokio::task::block_in_place(|| control::eval(&handle, &js))?;
-        if r.get("error").is_some() {
-            return Err(r["error"].as_str().unwrap_or("hover failed").to_string());
+        if s.is_empty() {
+            return Err("selector is required".into());
         }
-        Ok(json!({ "hovered": true }))
+        let handle = self.handle.clone();
+        // 可信悬停:Windows 走 CDP mouseMoved(真实移动触发 CSS :hover),非 Windows 明确报错
+        let p = tokio::task::block_in_place(|| control::mouse::hover(&handle, &s))?;
+        Ok(json!({ "hovered": true, "x": p.x, "y": p.y }))
     }
 
     async fn press_key(&self, body: &Value) -> Result<Value, String> {
@@ -310,52 +295,31 @@ impl App {
 
     async fn drag(&self, body: &Value) -> Result<Value, String> {
         let from = body.get("sourceSelector").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let to = body.get("targetSelector").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let handle = self.handle.clone();
-        let js = format!(
-            r#"(function(){{
-              const src = document.querySelector({from:?});
-              const dst = document.querySelector({to:?});
-              if (!src || !dst) return {{error:"element not found"}};
-              const dataTransfer = new DataTransfer();
-              src.dispatchEvent(new DragEvent("dragstart", {{bubbles:true,dataTransfer}}));
-              dst.dispatchEvent(new DragEvent("dragover", {{bubbles:true,dataTransfer}}));
-              dst.dispatchEvent(new DragEvent("drop", {{bubbles:true,dataTransfer}}));
-              src.dispatchEvent(new DragEvent("dragend", {{bubbles:true,dataTransfer}}));
-              return {{ok:true}};
-            }})()"#,
-            from = from,
-            to = to
-        );
-        let r = tokio::task::block_in_place(|| control::eval(&handle, &js))?;
-        if r.get("error").is_some() {
-            return Err(r["error"].as_str().unwrap_or("drag failed").to_string());
+        if from.is_empty() {
+            return Err("sourceSelector is required".into());
         }
+        let to = body.get("targetSelector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if to.is_empty() {
+            return Err("targetSelector is required".into());
+        }
+        let handle = self.handle.clone();
+        // 原生 DnD:Windows 走 CDP 鼠标序列(真实发起 dragstart/dragover/drop);非 Windows 明确报错
+        tokio::task::block_in_place(|| control::drag::drag(&handle, &from, &to))?;
         Ok(json!({ "dragged": true }))
     }
 
     async fn upload_file(&self, body: &Value) -> Result<Value, String> {
         let s = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if s.is_empty() {
+            return Err("selector is required".into());
+        }
         let path = body.get("filePath").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if path.is_empty() {
+            return Err("filePath is required".into());
+        }
         let handle = self.handle.clone();
-        // WebView 文件上传:通过 eval 创建 File 对象注入
-        let js = format!(
-            r#"(function(){{
-              const el = document.querySelector({s:?});
-              if (!el) return {{error:"not found"}};
-              const path = {p:?};
-              fetch("file:///"+path).then(r=>r.blob()).then(b=>{{
-                const dt = new DataTransfer();
-                dt.items.add(new File([b], path.split('/').pop()));
-                el.files = dt.files;
-                el.dispatchEvent(new Event("change", {{bubbles:true}}));
-              }});
-              return {{ok:true}};
-            }})()"#,
-            s = s,
-            p = path
-        );
-        tokio::task::block_in_place(|| control::eval(&handle, &js))?;
+        // 可信上传:Windows 走 CDP DOM.setFileInputFiles 并回读校验;非 Windows 明确报错
+        tokio::task::block_in_place(|| control::upload::set_file(&handle, &s, &path))?;
         Ok(json!({ "uploaded": true }))
     }
 
@@ -699,28 +663,19 @@ impl App {
     /// 在 iframe 中点击元素
     async fn iframe_click(&self, body: &Value) -> Result<Value, String> {
         let iframe = body.get("iframeSelector").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let sel = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let handle = self.handle.clone();
-        let js = format!(
-            r#"(function(){{
-              const f = document.querySelector({iframe:?});
-              if (!f) return {{error:"iframe not found"}};
-              const d = f.contentDocument;
-              if (!d) return {{error:"cross-origin iframe not accessible"}};
-              const el = d.querySelector({sel:?});
-              if (!el) return {{error:"element not found"}};
-              el.scrollIntoView({{block:"center"}});
-              el.click();
-              return {{ok:true}};
-            }})()"#,
-            iframe = iframe,
-            sel = sel
-        );
-        let r = tokio::task::block_in_place(|| control::eval(&handle, &js))?;
-        if r.get("error").is_some() {
-            return Err(r["error"].as_str().unwrap_or("iframe click failed").to_string());
+        if iframe.is_empty() {
+            return Err("iframeSelector is required".into());
         }
-        Ok(json!({ "clicked": true }))
+        let sel = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if sel.is_empty() {
+            return Err("selector is required".into());
+        }
+        let handle = self.handle.clone();
+        // 可信 iframe 点击:iframe 内容坐标换算到顶层视口后走 CDP 鼠标序列
+        let p = tokio::task::block_in_place(|| {
+            control::mouse::click_in_iframe(&handle, &iframe, &sel)
+        })?;
+        Ok(json!({ "clicked": true, "x": p.x, "y": p.y }))
     }
 
     /// 在 iframe 中填写输入框
@@ -757,16 +712,19 @@ impl App {
 
     async fn click_switch_tab(&self, body: &Value) -> Result<Value, String> {
         let s = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if s.is_empty() {
+            return Err("selector is required".into());
+        }
         let handle = self.handle.clone();
-        tokio::task::block_in_place(|| control::click(&handle, &s))?;
-        // 点击后读取当前 URL(点击可能触发导航)
+        // 可信点击(与 click 同通道),点击可能触发导航 → 读取当前 URL
+        let p = tokio::task::block_in_place(|| control::mouse::click(&handle, &s))?;
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let handle2 = self.handle.clone();
         let url = tokio::task::block_in_place(|| {
             let v = control::page_state(&handle2).unwrap_or_default();
             v["url"].as_str().unwrap_or("").to_string()
         });
-        Ok(json!({ "clicked": true, "url": url }))
+        Ok(json!({ "clicked": true, "url": url, "x": p.x, "y": p.y }))
     }
 
     // ---- 批注状态机端点 ----

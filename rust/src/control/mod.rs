@@ -6,13 +6,19 @@ pub mod accessibility;
 /// Windows CDP 通用调用通道(截图/可访问性树/键盘注入共用)
 #[cfg(windows)]
 pub mod cdp;
+/// 拖拽(Windows:CDP 鼠标序列触发原生 HTML5 DnD)
+pub mod drag;
 /// 键盘注入(Windows:CDP 可信通道;其余平台未实现)
 pub mod keyboard;
 /// 媒体权限放行(Windows/Linux:摄像头/麦克风统一放行,配合页面模拟脚本)
 #[cfg(any(windows, target_os = "linux"))]
 pub mod media;
+/// 可信鼠标注入(Windows:CDP Input.dispatchMouseEvent;点击/悬停/iframe 点击)
+pub mod mouse;
 pub mod responses;
 pub mod screenshot;
+/// 文件上传(Windows:CDP DOM.setFileInputFiles)
+pub mod upload;
 
 use serde_json::Value;
 use tauri::AppHandle;
@@ -39,25 +45,6 @@ pub fn navigate(app: &AppHandle, url: &str) -> ControlResult<()> {
 /// 执行任意 JS,返回结果(自动 JSON 序列化)
 pub fn evaluate(app: &AppHandle, script: &str) -> ControlResult<Value> {
     eval(app, &format!("(function(){{ return {script}; }})()"))
-}
-
-/// 点击元素(selector 定位)
-pub fn click(app: &AppHandle, selector: &str) -> ControlResult<()> {
-    let js = format!(
-        r#"(function(){{
-          const el = document.querySelector({sel:?});
-          if (!el) return {{error: "element not found"}};
-          el.scrollIntoView({{block:"center"}});
-          el.click();
-          return {{ok:true}};
-        }})()"#,
-        sel = selector
-    );
-    let v = eval(app, &js)?;
-    if v.get("error").is_some() {
-        return Err(v["error"].as_str().unwrap_or("click failed").to_string());
-    }
-    Ok(())
 }
 
 /// 填写输入框

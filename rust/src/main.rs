@@ -285,7 +285,7 @@ async fn toolbar_navigate(app: tauri::AppHandle, state: State<'_, ui::UiState>, 
 #[tauri::command]
 fn toolbar_toggle_panel(app: tauri::AppHandle, state: State<'_, ui::UiState>) -> Result<bool, String>
 {
-    let mut open = state.panel_open.lock().unwrap();
+    let open = state.panel_open.lock().unwrap();
     let now = !*open;
     drop(open);
     if now {
