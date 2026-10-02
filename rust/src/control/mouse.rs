@@ -7,11 +7,21 @@
 //! 命中校验(仅可信路径):注入前用 `document.elementFromPoint` 在目标中心做命中测试;
 //!   中心不在视口内、或被其它元素遮挡时返回明确错误,避免"点到了别处却报成功"。
 
+use std::time::{Duration, Instant};
+
 use tauri::AppHandle;
 
 use super::{ControlResult, Outcome};
 use super::trusted_available;
 use serde_json::Value;
+
+/// 滚动/布局稳定等待:超时与采样间隔(ms)
+const SETTLE_TIMEOUT_MS: u64 = 700;
+const SETTLE_POLL_MS: u64 = 40;
+/// hover 注入后确认 `:hover` 的重试次数 / 每次轮询预算 / 轮询间隔
+const HOVER_RETRIES: u32 = 5;
+const HOVER_POLL_MS: u64 = 250;
+const HOVER_POLL_INTERVAL_MS: u64 = 40;
 
 /// 视口坐标点(CSS 像素)
 #[derive(Clone, Copy, Debug)]
@@ -54,7 +64,7 @@ pub fn mouse_event(
 /// 返回实际(或估算)的视口坐标;可信路径下中心出视口 / 被遮挡 / 元素不存在返回 Err
 pub fn click(app: &AppHandle, selector: &str) -> ControlResult<Outcome<Point>> {
     if trusted_available() {
-        let p = resolve_point(app, None, selector)?;
+        let p = resolve_stable(app, None, selector)?;
         ensure_reachable(&p, selector)?;
         ensure_enabled(&p, selector)?;
         trusted_click_at(app, p.x, p.y)?;
@@ -64,12 +74,22 @@ pub fn click(app: &AppHandle, selector: &str) -> ControlResult<Outcome<Point>> {
 }
 
 /// 悬停元素中心:可信 mouseMoved(触发 CSS `:hover`);否则降级到合成 mouseover/mouseenter
+///
+/// 注入前等滚动/布局稳定,注入后轮询 `matches(':hover')` 确认;未生效则重发(有界)。
+/// 仍未生效时返回明确错误(不假装成功)。
 pub fn hover(app: &AppHandle, selector: &str) -> ControlResult<Outcome<Point>> {
     if trusted_available() {
-        let p = resolve_point(app, None, selector)?;
+        let p = resolve_stable(app, None, selector)?;
         ensure_reachable(&p, selector)?;
-        trusted_move(app, p.x, p.y)?;
-        return Ok(Outcome::trusted(Point { x: p.x, y: p.y }));
+        for _ in 0..HOVER_RETRIES {
+            trusted_move(app, p.x, p.y)?;
+            if wait_hovered(app, selector, HOVER_POLL_MS)? {
+                return Ok(Outcome::trusted(Point { x: p.x, y: p.y }));
+            }
+        }
+        return Err(format!(
+            "hover verification failed: element did not become :hover after {HOVER_RETRIES} attempts: {selector}"
+        ));
     }
     Ok(Outcome::degraded(hover_fallback(app, selector)?))
 }
@@ -81,7 +101,7 @@ pub fn click_in_iframe(
     selector: &str,
 ) -> ControlResult<Outcome<Point>> {
     if trusted_available() {
-        let p = resolve_point(app, Some(iframe_selector), selector)?;
+        let p = resolve_stable(app, Some(iframe_selector), selector)?;
         ensure_reachable(&p, selector)?;
         ensure_enabled(&p, selector)?;
         trusted_click_at(app, p.x, p.y)?;
@@ -92,6 +112,70 @@ pub fn click_in_iframe(
         iframe_selector,
         selector,
     )?))
+}
+
+/// 解析坐标并等滚动/布局稳定后再返回最终坐标(有界超时后返回当前结果)
+///
+/// 解决竞态:`scrollIntoView` 已改布局,但合成器/命中测试尚未反映新滚动位置时注入指针,
+/// 会命中旧位置(GDK 甚至丢弃视口外坐标)。复用 `resolve_point` 与窗口滚动位置采样;
+/// 对 iframe 同样适用(`resolve_point` 内部计算的是顶层视口坐标)。
+fn resolve_stable(
+    app: &AppHandle,
+    iframe_selector: Option<&str>,
+    selector: &str,
+) -> ControlResult<Resolved> {
+    let deadline = Instant::now() + Duration::from_millis(SETTLE_TIMEOUT_MS);
+    let mut last = super::scroll_pos(app)?;
+    let mut stable = 0u32;
+    let mut best = resolve_point(app, iframe_selector, selector)?;
+    loop {
+        if best.in_viewport && best.hit_ok && stable >= 2 {
+            return Ok(best);
+        }
+        if Instant::now() >= deadline {
+            return Ok(best);
+        }
+        std::thread::sleep(Duration::from_millis(SETTLE_POLL_MS));
+        best = resolve_point(app, iframe_selector, selector)?;
+        let cur = super::scroll_pos(app)?;
+        if best.in_viewport && best.hit_ok && cur == last {
+            stable += 1;
+        } else {
+            stable = 0;
+            last = cur;
+        }
+    }
+}
+
+/// 元素当前是否处于 `:hover`
+fn is_hovered(app: &AppHandle, selector: &str) -> ControlResult<bool> {
+    let js = format!(
+        r#"(function(){{
+          var el = document.querySelector({sel:?});
+          if (!el) return {{error: "element not found"}};
+          return {{hovered: el.matches(':hover')}};
+        }})()"#,
+        sel = selector
+    );
+    let v = super::eval(app, &js)?;
+    if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
+        return Err(err.to_string());
+    }
+    Ok(v.get("hovered").and_then(|b| b.as_bool()).unwrap_or(false))
+}
+
+/// 在 `timeout_ms` 内轮询元素是否 `:hover`
+fn wait_hovered(app: &AppHandle, selector: &str, timeout_ms: u64) -> ControlResult<bool> {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        if is_hovered(app, selector)? {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(HOVER_POLL_INTERVAL_MS));
+    }
 }
 
 /// 可信点击(平台实现):Windows CDP 鼠标序列;Linux GDK 事件注入
