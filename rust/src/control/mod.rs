@@ -178,48 +178,57 @@ pub fn element_state(app: &AppHandle, selector: &str) -> ControlResult<Value> {
     )
 }
 
-/// 文档就绪状态快照 {readyState,url,title}
+/// 文档就绪状态快照 {readyState,url,title,timeOrigin}
+///
+/// `timeOrigin` 是**文档身份**信号:每次新文档加载都会变;SPA(`pushState`)不变(靠 URL 变化识别);
+/// bfcache 恢复的是原文档对象,其 `timeOrigin` 仍是该文档创建时的值(与当前离开的文档不同)。
 pub fn document_state(app: &AppHandle) -> ControlResult<Value> {
     eval(
         app,
-        "(function(){return {readyState: document.readyState, url: location.href, title: document.title};})()",
+        "(function(){return {readyState: document.readyState, url: location.href, title: document.title, timeOrigin: (window.performance && typeof performance.timeOrigin === \"number\") ? performance.timeOrigin : null};})()",
     )
 }
 
-/// 等待页面就绪:readyState 达到 interactive/complete 且已观察到导航进展
+/// 等待页面就绪:必须**确认发生了导航**(文档身份或 URL 变化)后才接受 `readyState>=interactive`
 ///
-/// 进展 = URL 相对 `prev_url` 已变化(SPA/导航),或曾观察到 `readyState=="loading"`。
-/// `prev_url` 传空串表示不要求 URL 变化(仅要求 isLoading→loaded,并留 150ms 最小观察窗)。
-/// 返回 `{ready,readyState,url,title,timedOut,waitedMs}`;超时如实返回 `ready:false`(不假装成功)。
-pub fn wait_ready(app: &AppHandle, prev_url: &str, timeout_ms: u64) -> ControlResult<Value> {
+/// 导航判据(覆盖三类场景):
+/// - 文档身份变化:`performance.timeOrigin` 与导航前不同 → 新文档加载 / 同 URL 重载;
+/// - URL 变化 → SPA(`pushState`)/普通导航/bfcache 前进后退(恢复文档的 timeOrigin 不同);
+/// 只有 `navigated && loaded` 才算就绪,避免把**旧文档的 complete** 当成就绪。
+/// 保留有界超时:超时如实返回 `ready:false, timedOut:true`(+当前 `readyState`/`navigated`)。
+pub fn wait_ready(
+    app: &AppHandle,
+    prev_url: &str,
+    prev_time_origin: Option<f64>,
+    timeout_ms: u64,
+) -> ControlResult<Value> {
     let start = std::time::Instant::now();
     let deadline = start + std::time::Duration::from_millis(timeout_ms);
-    let mut saw_loading = false;
-    let mut saw_change = false;
     loop {
         let st = document_state(app)?;
         let rs = st.get("readyState").and_then(Value::as_str).unwrap_or("loading").to_string();
         let url = st.get("url").and_then(Value::as_str).unwrap_or("").to_string();
         let title = st.get("title").and_then(Value::as_str).unwrap_or("").to_string();
-        if rs == "loading" {
-            saw_loading = true;
-        }
-        if !prev_url.is_empty() && url != prev_url {
-            saw_change = true;
-        }
+        let to = st.get("timeOrigin").and_then(Value::as_f64);
+        let url_changed = !prev_url.is_empty() && url != prev_url;
+        let ident_changed = match (prev_time_origin, to) {
+            (Some(a), Some(b)) => a != b,
+            _ => false,
+        };
+        let navigated = url_changed || ident_changed;
         let loaded = rs == "interactive" || rs == "complete";
-        // 最小观察窗:prev_url 为空(如同一 URL 导航)时避免命中"旧文档已完成"
-        let min_window_ok = !prev_url.is_empty() || start.elapsed().as_millis() >= 150;
-        if loaded && (saw_change || saw_loading || min_window_ok) {
+        if navigated && loaded {
             return Ok(json!({
                 "ready": true, "readyState": rs, "url": url, "title": title,
-                "timedOut": false, "waitedMs": start.elapsed().as_millis() as u64,
+                "navigated": true, "timedOut": false,
+                "waitedMs": start.elapsed().as_millis() as u64,
             }));
         }
         if std::time::Instant::now() >= deadline {
             return Ok(json!({
                 "ready": false, "readyState": rs, "url": url, "title": title,
-                "timedOut": true, "waitedMs": start.elapsed().as_millis() as u64,
+                "navigated": navigated, "timedOut": true,
+                "waitedMs": start.elapsed().as_millis() as u64,
             }));
         }
         std::thread::sleep(std::time::Duration::from_millis(POLL_MS));

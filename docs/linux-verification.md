@@ -105,12 +105,14 @@ Post evaluate @{ script = "JSON.stringify({n:__events.length,trusted:__events.fi
 | 14 | `drag {"sourceSelector":"#drag-src","targetSelector":"#drop-zone"}` | **Linux 上预期报错**：`drag: not implemented on this platform yet (...)`。不返回成功即正确 |
 | 15 | `scroll {"direction":"down","amount":600}` | 成功；`stable:true`；返回后立刻与 250ms 后读 `window.scrollY` 相同（已稳定） |
 | 16 | `scroll-to-element {"selector":"#dump"}` 与 `{"selector":"#sc-bottom"}`（**内层滚动容器**内） | 均成功；`reached:true`/`inViewport:true`；元素 `getBoundingClientRect()` 与视口相交（`#sc-bottom` 需内层容器与窗口同时滚动到位） |
-| 17 | `navigate` 到 `tests/manual/slow-page.html?block=1200` | 成功且 `ready:true`；返回时 `#slow-ready` 已存在、`readyState` 为 `interactive`/`complete` |
+| 17 | `navigate` 到 `tests/manual/slow-page.html?block=1200` | 成功且 `ready:true`、`navigated:true`；**返回时 `location.href` 已是目标页**、`#slow-ready` 已存在、`readyState` 为 `interactive`/`complete`（就绪判定要求**文档身份/URL 已变化**，不会把旧页的 `complete` 误判为就绪） |
 
 超时/降级的有界行为（可选，用环境变量调小超时，起实例时带 `BT_NAV_TIMEOUT_MS=1500 BT_SCROLL_TIMEOUT_MS=800`）：
 
-- `navigate` 到 `tests/manual/never-ready.html` → ~1.5s 返回，`ready:false, timedOut:true, readyState:"loading"`（**如实报告，不假装成功**）；
+- `navigate` 到 `tests/manual/never-ready.html` → ~1.5s 返回，`ready:false, navigated:true, timedOut:true, readyState:"loading"`（**如实报告，不假装成功**；`navigated` 表示文档已切换但未加载完）；
 - `navigate` 到 `tests/manual/slow-page.html?autoscroll=1&block=0` 后 `scroll` → ~0.8s 返回，`stable:false, timedOut:true`。
+
+> 就绪判定依据：**文档身份变化**（`performance.timeOrigin`，覆盖新文档加载与**同 URL 重载**）或 **URL 变化**（覆盖 SPA `pushState` 与 bfcache 前进/后退）。`go_back`/`go_forward` 共用该判定。
 
 目标**物理不可达**时（例如 `position:fixed` 且位于视口外的元素，滚动无法改变其位置）：`scroll_to_element`
 仍会在有界时间内返回 `reached:false, inViewport:false, timedOut:true`，并附带

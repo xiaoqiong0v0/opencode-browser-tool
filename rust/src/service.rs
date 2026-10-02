@@ -197,22 +197,25 @@ impl App {
         // 裸域名自动补 http://
         let url = ui::normalize_url(&url);
         let handle = self.handle.clone();
-        // 记录导航前 URL:用于判断"已提交/SPA URL 变化"这一就绪进展
-        let prev = tokio::task::block_in_place(|| control::document_state(&handle).ok())
+        // 记录导航前的文档身份(URL + timeOrigin):用于确认导航真的发生(覆盖 SPA/同 URL 重载/bfcache)
+        let prev = tokio::task::block_in_place(|| control::document_state(&handle).ok());
+        let prev_url = prev
+            .as_ref()
             .and_then(|v| v.get("url").and_then(|u| u.as_str()).map(str::to_string))
             .unwrap_or_default();
+        let prev_to = prev.as_ref().and_then(|v| v.get("timeOrigin").and_then(|t| t.as_f64()));
         tokio::task::block_in_place(|| control::navigate(&handle, &url))?;
         // 同步激活标签的 URL(工具栏显示一致)
         ui::sync_active_tab(&self.handle, &url, "");
-        // 等待就绪(readyState>=interactive,或观察到导航进展);有界超时,超时如实返回 ready:false
-        let prev_ref = if prev == url { "" } else { prev.as_str() };
+        // 等待就绪(需先确认导航发生,readyState>=interactive);有界超时,超时如实返回 ready:false
         let st = tokio::task::block_in_place(|| {
-            control::wait_ready(&handle, prev_ref, control::nav_timeout_ms())
+            control::wait_ready(&handle, &prev_url, prev_to, control::nav_timeout_ms())
         })?;
         Ok(json!({
             "url": url,
             "ready": st["ready"],
             "readyState": st["readyState"],
+            "navigated": st["navigated"],
             "timedOut": st["timedOut"],
             "waitedMs": st["waitedMs"],
         }))
@@ -530,19 +533,24 @@ impl App {
 
     async fn go_back(&self) -> Result<Value, String> {
         let handle = self.handle.clone();
-        let prev = tokio::task::block_in_place(|| control::document_state(&handle).ok())
+        // 记录历史导航前的文档身份;history.back 可能是 bfcache 恢复(timeOrigin 变化)或重载
+        let prev = tokio::task::block_in_place(|| control::document_state(&handle).ok());
+        let prev_url = prev
+            .as_ref()
             .and_then(|v| v.get("url").and_then(|u| u.as_str()).map(str::to_string))
             .unwrap_or_default();
+        let prev_to = prev.as_ref().and_then(|v| v.get("timeOrigin").and_then(|t| t.as_f64()));
         tokio::task::block_in_place(|| control::eval(&handle, "history.back(); true"))?;
-        // 等待导航就绪(URL 变化 + readyState);有界超时,超时如实返回 ready:false
+        // 等待导航就绪(文档身份/URL 变化 + readyState);有界超时,超时如实返回 ready:false
         let st = tokio::task::block_in_place(|| {
-            control::wait_ready(&handle, &prev, control::history_timeout_ms())
+            control::wait_ready(&handle, &prev_url, prev_to, control::history_timeout_ms())
         })?;
         Ok(json!({
             "back": true,
             "url": st["url"],
             "ready": st["ready"],
             "readyState": st["readyState"],
+            "navigated": st["navigated"],
             "timedOut": st["timedOut"],
             "waitedMs": st["waitedMs"],
         }))
@@ -550,18 +558,22 @@ impl App {
 
     async fn go_forward(&self) -> Result<Value, String> {
         let handle = self.handle.clone();
-        let prev = tokio::task::block_in_place(|| control::document_state(&handle).ok())
+        let prev = tokio::task::block_in_place(|| control::document_state(&handle).ok());
+        let prev_url = prev
+            .as_ref()
             .and_then(|v| v.get("url").and_then(|u| u.as_str()).map(str::to_string))
             .unwrap_or_default();
+        let prev_to = prev.as_ref().and_then(|v| v.get("timeOrigin").and_then(|t| t.as_f64()));
         tokio::task::block_in_place(|| control::eval(&handle, "history.forward(); true"))?;
         let st = tokio::task::block_in_place(|| {
-            control::wait_ready(&handle, &prev, control::history_timeout_ms())
+            control::wait_ready(&handle, &prev_url, prev_to, control::history_timeout_ms())
         })?;
         Ok(json!({
             "forward": true,
             "url": st["url"],
             "ready": st["ready"],
             "readyState": st["readyState"],
+            "navigated": st["navigated"],
             "timedOut": st["timedOut"],
             "waitedMs": st["waitedMs"],
         }))
