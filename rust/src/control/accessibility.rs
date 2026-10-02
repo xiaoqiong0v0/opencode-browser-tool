@@ -405,33 +405,65 @@ fn build_tree_from(
         id_node.insert(id.to_string(), n);
     }
 
+    /// 读取 AX 节点的 name 值:CDP 的 name 对象总是存在(值为空串或缺失),
+    /// 因此不能用 name.is_none() 判断"没有名字"
+    fn node_name(n: &serde_json::Value) -> &str {
+        n.get("name").and_then(|m| m.get("value")).and_then(|v| v.as_str()).unwrap_or("")
+    }
+
+    /// 拼接文本上限(与 Linux 侧 DOM_AX_JS 的 120 字符对齐)
+    const TEXT_MAX_LEN: usize = 120;
+
     fn convert(
         id: &str,
         id_node: &HashMap<String, &serde_json::Value>,
         children_map: &HashMap<String, Vec<String>>,
     ) -> Vec<serde_json::Value> {
         let Some(n) = id_node.get(id) else { return Vec::new() };
-        // 过滤忽略/遮挡节点
         let role = n.get("role").and_then(|r| r.get("value")).and_then(|v| v.as_str()).unwrap_or("");
-        let skip = n.get("ignored").and_then(|v| v.as_bool()).unwrap_or(false)
-            || role.is_empty()
-            || (role == "generic" && n.get("name").is_none());
-        // 子节点(保持 DOM 顺序),被过滤的节点自身不输出但其子树提升到父级
-        let mut children_out = Vec::new();
+        // 先转换子节点(被过滤的节点自身不输出、其子树提升到当前层)
+        let mut child_nodes: Vec<serde_json::Value> = Vec::new();
         if let Some(ids) = children_map.get(id) {
             for cid in ids {
-                children_out.extend(convert(cid, id_node, children_map));
+                child_nodes.extend(convert(cid, id_node, children_map));
             }
         }
+        // CDP 会把一段文本拆成多个(甚至逐字符的)StaticText 子节点:
+        // 按顺序拼接其文本;本节点自身无 name 时以拼接结果(截断)为 name,
+        // 已有 name 则保留不覆盖;这些 StaticText 不再单独输出(避免重复)
+        let mut merged = String::new();
+        let mut kept: Vec<serde_json::Value> = Vec::with_capacity(child_nodes.len());
+        let mut statics: Vec<serde_json::Value> = Vec::new();
+        for cn in child_nodes {
+            if cn.get("role").and_then(|r| r.as_str()) == Some("StaticText") {
+                if let Some(t) = cn.get("name").and_then(|v| v.as_str()) {
+                    merged.push_str(t);
+                }
+                statics.push(cn);
+            } else {
+                kept.push(cn);
+            }
+        }
+        let own = node_name(n);
+        let name = if !own.is_empty() {
+            own.to_string()
+        } else {
+            merged.trim().chars().take(TEXT_MAX_LEN).collect::<String>()
+        };
+        // 过滤:ignored / 空 role / 纯排版叶子 InlineTextBox / 无名 generic(按 name 值判断)
+        let skip = n.get("ignored").and_then(|v| v.as_bool()).unwrap_or(false)
+            || role.is_empty()
+            || role == "InlineTextBox"
+            || (role == "generic" && name.is_empty());
         if skip {
-            return children_out;
+            // 未输出的节点不吞文本:把 StaticText 放回,让文本冒泡到最近的可输出祖先再合并
+            kept.extend(statics);
+            return kept;
         }
         let mut node = serde_json::Map::new();
         node.insert("role".into(), json!(role));
-        if let Some(v) = n.get("name").and_then(|m| m.get("value")).and_then(|v| v.as_str()) {
-            if !v.is_empty() {
-                node.insert("name".into(), json!(v));
-            }
+        if !name.is_empty() {
+            node.insert("name".into(), json!(name));
         }
         // value 可能是字符串或其它(如数字),统一转字符串
         let raw = n.get("value").and_then(|m| m.get("value"));
@@ -450,8 +482,8 @@ fn build_tree_from(
             }
         }
         let mut obj = serde_json::Value::Object(node);
-        if !children_out.is_empty() {
-            obj.as_object_mut().unwrap().insert("children".into(), serde_json::Value::Array(children_out));
+        if !kept.is_empty() {
+            obj.as_object_mut().unwrap().insert("children".into(), serde_json::Value::Array(kept));
         }
         vec![obj]
     }
