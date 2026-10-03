@@ -31,7 +31,8 @@
 | 函数 | 作用 |
 |---|---|
 | `reparent(app, labels)` | 把子 Webview 从 GtkBox 迁入自建 `Fixed`（幂等） |
-| `place(app, label, x, y, w, h)` | 绝对定位（`move_` + `set_size_request`） |
+| `place(app, label, x, y, w, h)` | 绝对定位（`move_` + `set_size_request`）；x/y/w/h 均为 **GTK 逻辑像素** |
+| `logical_window_size(app, label)` | 读取该 webview 所属顶层 `GtkWindow::allocation()` 的**逻辑宽高**（GTK 逻辑像素，与 `move_`/`set_size_request` 同口径）；窗口尚未 map（`allocation` 为 0）或取不到时返回 `None` |
 | `raise(app, label)` | remove+put 置顶（**只在"显示浮层"时调用一次**，勿每帧调用） |
 | `poke(app, label)` | GTK 侧主动重排+重绘（`queue_resize`/`queue_draw`，含顶层） |
 | `BtFixed` | `gtk::Fixed` 的 Rust 子类，**只把自身 preferred size 谎报为 (1,1)** —— 否则子控件的 `size_request` 会把容器 minimum 顶成"当前窗口尺寸"，导致窗口**只能放大不能缩小** |
@@ -41,6 +42,7 @@
 - 所有"显示子 Webview"的地方统一走 `show_webview(app, label)`：`show()` 后 Linux 额外 `poke` + `kick_render`（WebKit 渲染进程只在 DOM 变化/输入/尺寸变化时出帧，否则新显示的 Webview 白屏、要等鼠标移入才绘制；并由 `kick_render` 在 250/800/1600ms 延迟补驱动，覆盖冷启动页面尚未加载完的情况）。
 - 覆盖层/面板**用显式 `show()`/`hide()` 管理可见性**，不要靠"宽度归零"隐藏：Wayland 下宽度归零后输入区域不会随 resize 恢复，表现为"可见但点不动、事件穿透到下层页面"。
 - `GtkFixed` 中子控件顺序即 z 序；动态新建标签的页面 Webview 会盖住先创建的浮层，故显示浮层时 `raise` 一次即可（切换/新建标签都会先关闭面板与模式）。
+- **布局尺寸口径（v1.5.0 修复）**：`apply_layout` 在 Linux 正常路径改用 `logical_window_size` 返回的**顶层 GtkWindow 逻辑尺寸**，并以 `layout_scale = 1.0` 计算（`TOOLBAR_HEIGHT`/`PANEL_WIDTH` 本身就是逻辑常数），`place()` 因此收到与 GTK 定位 API **同口径的逻辑像素**（坐标口径=GTK 逻辑像素）；仅在取不到逻辑尺寸（窗口未 map，`allocation` 为 0）时回退到 `size` + `scale` 的物理口径。原因：`tauri` 的 `inner_size()`/`scale_factor()` 是物理/浮点口径，在 GNOME **分数缩放**（如 1.5x，GTK 内部取整为 2x）下与 tao 的 `scale_factor` 不一致，直接用物理值会把子视图放大并裁切，表现为"内容区超出窗口"（HiDPI 同源问题）。
 
 ## 3. 硬性约定与禁忌
 

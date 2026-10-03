@@ -710,7 +710,8 @@ pub fn create_ui(app: &AppHandle) -> tauri::Result<()> {
 }
 
 /// 设置子 webview 边界(Windows: tauri 原生 set_position/set_size;Linux: gtk::Fixed 绝对定位)
-/// 参数:app tauri 应用句柄;label webview 标签;x/y 左上角坐标(物理像素);w/h 尺寸(物理像素)
+/// 参数:app tauri 应用句柄;label webview 标签;x/y 左上角坐标;w/h 尺寸
+/// 坐标口径:Windows 为物理像素;Linux 为 GTK 逻辑像素(apply_layout 在 Linux 已统一为逻辑口径)
 /// 返回值:Windows 分支透传 tauri 设置失败的错误;其余平台恒 Ok
 fn set_webview_bounds(app: &AppHandle, label: &str, x: i32, y: i32, w: i32, h: i32) -> tauri::Result<()> {
     #[cfg(windows)]
@@ -736,11 +737,24 @@ fn set_webview_bounds(app: &AppHandle, label: &str, x: i32, y: i32, w: i32, h: i
 /// 工具栏占顶部固定高度;所有页面 Webview(每标签一个)占工具栏下方全宽;
 /// 覆盖层叠加在页面区;面板为右侧覆盖式浮层(关闭时尺寸归零)
 /// size 为窗口物理内尺寸,scale 为窗口缩放因子
+/// size/scale 仅在 Windows 与 Linux 回退路径使用;Linux 正常路径改用 GTK 逻辑尺寸(见下)
 pub fn apply_layout(app: &AppHandle, size: tauri::PhysicalSize<u32>, scale: f64) -> tauri::Result<()> {
-    let toolbar_h = (TOOLBAR_HEIGHT * scale) as i32;
-    let panel_w = (PANEL_WIDTH * scale) as i32;
-    let page_w = size.width as i32;
-    let page_h = size.height as i32 - toolbar_h;
+    // Linux: 子视图经 GTK 用逻辑坐标定位(move_/set_size_request),而 tauri 的 size/scale 是物理口径。
+    // 非整数缩放下 tao 的 scale_factor 与 GTK 内部整数 scale 不一致,按物理值换算会放大裁切 ——
+    // 直接采用 GTK 顶层窗口 allocation 的逻辑宽高,并以 scale=1 计算(TOOLBAR_HEIGHT/PANEL_WIDTH
+    // 本身即逻辑常数),使 place() 收到与定位 API 同口径的坐标。窗口未 map(allocation 为 0)时回退。
+    #[cfg(target_os = "linux")]
+    let (win_w, win_h, layout_scale) = match linux_layout::logical_window_size(app, TOOLBAR_WEBVIEW) {
+        Some((w, h)) => (w, h, 1.0),
+        None => (size.width as i32, size.height as i32, scale),
+    };
+    #[cfg(not(target_os = "linux"))]
+    let (win_w, win_h, layout_scale) = (size.width as i32, size.height as i32, scale);
+
+    let toolbar_h = (TOOLBAR_HEIGHT * layout_scale) as i32;
+    let panel_w = (PANEL_WIDTH * layout_scale) as i32;
+    let page_w = win_w;
+    let page_h = win_h - toolbar_h;
 
     // 1. 工具栏 Webview(顶部横条)
     set_webview_bounds(app, TOOLBAR_WEBVIEW, 0, 0, page_w.max(0), toolbar_h.max(0))?;

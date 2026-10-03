@@ -141,7 +141,7 @@ pub fn reparent(app: &tauri::AppHandle, labels: &[&str]) {
 }
 
 /// 绝对定位指定子 webview(仅 Linux)
-/// 参数:app tauri 应用句柄;label webview 标签;x/y 左上角坐标(物理像素);w/h 尺寸(物理像素,负值按 0 处理)
+/// 参数:app tauri 应用句柄;label webview 标签;x/y 左上角坐标(GTK 逻辑像素);w/h 尺寸(GTK 逻辑像素,负值按 0 处理)
 pub fn place(app: &tauri::AppHandle, label: &str, x: i32, y: i32, w: i32, h: i32) {
     // 先记录边界(供 raise 复位),即使 webview 暂未迁移也不丢坐标
     record_bounds(label, x, y, w, h);
@@ -262,6 +262,35 @@ pub fn poke(app: &tauri::AppHandle, label: &str) {
     });
 }
 
+/// 读取窗口的逻辑尺寸(GTK 逻辑像素,即本模块 `move_`/`set_size_request` 所用单位)
+///
+/// GTK3 的绝对定位 API 以逻辑像素为单位,而 tauri 的 `inner_size()`/`scale_factor()` 是物理/浮点
+/// 口径;在非整数缩放(如 GNOME 1.5x 下 GTK 内部取整为 2x)时二者比例与 tao 的 scale_factor 不一致,
+/// 直接用物理值会使子视图被放大并裁切。这里直接取该 webview 所属顶层 GtkWindow 的 `allocation()`,
+/// 得到与定位 API 完全同口径的逻辑宽高,无需猜测/换算 scale。
+///
+/// 参数:app tauri 应用句柄;label 任一已创建的 webview 标签(取其顶层窗口)
+/// 返回值:Some((width, height)) 逻辑宽高(均 > 0);窗口尚未 map(allocation 为 0)或取不到时 None
+pub fn logical_window_size(app: &tauri::AppHandle, label: &str) -> Option<(i32, i32)> {
+    let wv = app.get_webview(label)?;
+    // with_webview 在 GTK 主线程执行:主线程调用时同步执行(闭包先于 recv 完成);
+    // 后台线程调用时经事件循环投递,本线程阻塞等待、不占用主循环(同 screenshot.rs Linux 分支)。
+    let (tx, rx) = std::sync::mpsc::channel::<Option<(i32, i32)>>();
+    let _ = wv.with_webview(move |pw| {
+        let widget = pw.inner();
+        let size = widget
+            .toplevel()
+            .map(|top| {
+                let rect = top.allocation();
+                (rect.width(), rect.height())
+            })
+            .filter(|(w, h)| *w > 0 && *h > 0);
+        let _ = tx.send(size);
+    });
+    // 超时兜底:同步路径立即可得;异步路径约一个主循环周期即回。取不到则返回 None 由调用方回退。
+    rx.recv_timeout(std::time::Duration::from_millis(500)).ok().flatten()
+}
+
 /// 读取当前主线程的 Fixed 句柄
 /// 返回值:已创建则 Some(Fixed),否则 None
 fn current_fixed() -> Option<gtk::Fixed> {
@@ -269,7 +298,7 @@ fn current_fixed() -> Option<gtk::Fixed> {
 }
 
 /// 记录某 webview 最近一次边界
-/// 参数:label webview 标签;x/y/w/h 边界(物理像素)
+/// 参数:label webview 标签;x/y/w/h 边界(GTK 逻辑像素)
 fn record_bounds(label: &str, x: i32, y: i32, w: i32, h: i32) {
     BOUNDS.with(|m| {
         m.borrow_mut().insert(label.to_string(), (x, y, w, h));
