@@ -1,6 +1,6 @@
 {
   "name": "@xiaoqiong0v0/opencode-browser-tool",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "description": "opencode 浏览器工具插件：WebView2 外壳渲染 + 零注入视觉元素选取面板",
   "main": "dist/index.js",
   "scripts": {

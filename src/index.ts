@@ -263,15 +263,14 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree, directory,
     return {
       event: async ({ event }) => {
         // 缓存最近会话 id:这是投递批注最可靠的 sessionID 来源
-        if (event.type !== "session.deleted") {
-          sessionCache.updateFromEvent(event);
-        } else {
+        if (event.type === "session.deleted") {
+          // 删除会话:只清缓存,**绝不触碰 shell** —— 否则会经 service.closeSession → callApi → ensureService
+          // → spawn(bt-shell) 弹出浏览器窗口(而 /api/close-session 是空壳,唯一实际效果就是启动浏览器)
           const delId = extractSessionIDFromEvent(event);
-          if (delId) {
-            sessionCache.clearIf(delId);
-            try { await service.closeSession({ _sessionId: delId }); } catch {}
-          }
+          if (delId) sessionCache.clearIf(delId);
+          return;
         }
+        sessionCache.updateFromEvent(event);
       },
       // 用户发消息 / 调工具时刷新当前会话 id(参考项目用 ctx.sessionID,此处为等价钩子来源)
       "chat.message": async (input: any) => {

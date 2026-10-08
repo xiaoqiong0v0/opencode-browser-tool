@@ -43,9 +43,11 @@ cleanup() {
     if [ "$KEEP" = "1" ]; then
       log "[keep] 实例保留运行: PID $PID (port $PORT)"
     else
+      # 只按 PID:先 TERM,有界等待(最多 5s),仍存活才 KILL
       kill -TERM "$PID" 2>/dev/null
-      sleep 1
-      if kill -0 "$PID" 2>/dev/null; then kill -9 "$PID" 2>/dev/null; fi
+      i=0
+      while kill -0 "$PID" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+      if kill -0 "$PID" 2>/dev/null; then kill -KILL "$PID" 2>/dev/null; fi
       log "[cleanup] 已停止自起实例 PID $PID"
     fi
   fi

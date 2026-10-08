@@ -247,14 +247,42 @@ export async function startService(
   log.info(`Shell service ready on port ${port} (${shell})`);
 }
 
+/** 等待子进程退出(有界超时);已退出/出错返回 true,超时返回 false */
+function waitForExit(proc: any, timeoutMs: number): Promise<boolean> {
+  return new Promise<boolean>((resolveExit) => {
+    if (!proc || proc.exitCode !== null || proc.signalCode !== null) return resolveExit(true);
+    let done = false;
+    const finish = (v: boolean) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolveExit(v);
+    };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    proc.once("exit", () => finish(true));
+    proc.once("error", () => finish(true));
+  });
+}
+
 export async function stopService(): Promise<void> {
   if (attachMode) {
-    // 附着模式:外部 shell 进程不归插件管,只清空本地状态
+    // 附着模式:外部 shell 进程不归插件管,**绝不 kill**,只清空本地状态
     log.info("Detached from external bt-shell (process left running)");
-  } else if (serviceProcess) {
-    try {
-      serviceProcess.kill("SIGTERM");
-    } catch {}
+    serviceReady = false;
+    serviceBaseUrl = "";
+    attachMode = false;
+    return;
+  }
+  const proc = serviceProcess;
+  if (proc) {
+    // 先等 shell 自己退出(Rust /api/close 已 app.exit(0) 优雅退出);有界 5s,仍存活才按该 PID 补 SIGTERM
+    const exited = await waitForExit(proc, 5000);
+    if (exited) {
+      log.info("bt-shell exited gracefully");
+    } else {
+      log.info(`bt-shell did not exit within 5s; sending SIGTERM to pid=${proc.pid}`);
+      try { proc.kill("SIGTERM"); } catch {}
+    }
     serviceProcess = null;
   }
   serviceReady = false;
@@ -345,7 +373,6 @@ export const service = {
   expectResponse: cmd("expect-response"),
   assertResponse: cmd("assert-response"),
   panelConfig: cmd("panel-config"),
-  closeSession: cmd("close-session"),
   status: cmd("status"),
   tabs: cmd("tabs"),
   annotateToggle: cmd("annotate/toggle"),
