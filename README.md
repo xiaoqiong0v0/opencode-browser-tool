@@ -102,6 +102,8 @@ opencode（Bun）
 - 除 spawn 本地 shell 外，也可用 `BT_SHELL_URL` / `BT_SHELL_PORT` **附着到已运行的 shell**（不 spawn，适用于 shell 跑在 WSL/Linux、插件跑在 Windows）
 - 跨平台：Windows / Linux / macOS
 - 真多标签：每标签独立 page Webview，切换不重载；`target=_blank` / `window.open` 链接通过 WebView2 原生事件拦截并打开为新标签
+- 地址栏/标题/图标**事件驱动同步（无轮询）**：导航用 `on_navigation`（请求即更新）+ `on_page_load`（完成后读真实 `location.href`/`title`）；站内 SPA（`pushState`/`replaceState`/`popstate`/`hashchange`）与标题/图标变化由注入脚本上报 `POST /api/page-event`。`TabState.url` 只反映**最后一次真实导航请求**，内部/错误 scheme（`chrome-error:`/`about:`/`tauri:`/`data:` 等）不覆盖地址栏
+- 刷新语义：标签处于错误页（`errored`）时，工具栏刷新 / `bt_reload` **重新导航原 URL**（而非刷错误页）；否则走原生 reload
 - 窗口无标题栏，自定义窗口按钮在标签行右侧；最小尺寸 500×400（逻辑像素）
 
 ## 工具
@@ -140,7 +142,7 @@ opencode（Bun）
 | `bt_resize` | `width`, `height`(number) 必填 | 调整窗口尺寸（逻辑像素） |
 | `bt_set_device` | `name`(string) 可选 | 应用设备预设（空参数列出 13 种预设） |
 | `bt_devtools` | `action`(string)：`toggle`/`open`/`close` | 开关开发者工具 |
-| `bt_reload` | 无 | 刷新当前页面，返回 URL |
+| `bt_reload` | 无 | 刷新当前页面；若当前为错误页则**重新导航原 URL**（返回 `retried`） |
 | `bt_close` | 无 | 退出浏览器外壳 |
 | `bt_show_notification` | `message`(string), `type`(string)：`ok`/`bad`/`err` | 显示页面通知气泡 |
 | `bt_scroll` | `direction`(string)：`up`/`down`/`left`/`right`, `amount`(number) | 滚动页面 |

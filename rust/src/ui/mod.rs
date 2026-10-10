@@ -38,6 +38,8 @@ pub struct TabState {
     pub title: String,
     /// 标签图标地址(页面 <link rel=icon> 或 origin/favicon.ico;空串表示无)
     pub icon: String,
+    /// 最近一次导航是否落到错误页(chrome-error: 等);true 时刷新应重试原 URL
+    pub errored: bool,
     /// 对应独立页面 Webview 的 label(真多标签,每标签一个 webview)
     #[serde(skip)]
     pub webview: Option<String>,
@@ -136,7 +138,7 @@ impl UiState {
             devtools_open: Mutex::new(false),
             service_port: Mutex::new(0),
             panel_open: Mutex::new(false),
-            tabs: Mutex::new(vec![TabState { id: 1, url: "about:blank".into(), title: "新标签页".into(), icon: String::new(), webview: None }]),
+            tabs: Mutex::new(vec![TabState { id: 1, url: "about:blank".into(), title: "新标签页".into(), icon: String::new(), errored: false, webview: None }]),
             active_tab: Mutex::new(1),
             next_tab_id: Mutex::new(2),
             pending_click: Mutex::new(None),
@@ -197,6 +199,139 @@ const PAGE_BRIDGE_JS: &str = r##"
   });
 })();
 "##;
+
+/// 页面事件上报脚本(注入页面 Webview):SPA 路由 / 标题 / 图标变化时**主动上报**给 shell。
+/// 通道:HTTP POST 到 127.0.0.1:<port>/api/page-event(http.rs 已开 CORS,跨源可用;
+/// Tauri 自带 IPC 在远程页面被能力门禁挡住,实测 invoke 一直 pending,故不用)。
+/// 端口/label 由 Rust 逐 webview 注入(window.__btEventPort / window.__btPageLabel)。
+const PAGE_EVENT_JS: &str = r##"
+(function(){
+  var P=window.__btEventPort;
+  if(!P||typeof fetch!=="function")return;
+  var last="";
+  function iconHref(){
+    try{
+      var l=document.querySelector('link[rel~="icon"]');
+      if(l&&l.href)return l.href;
+      var p=location.protocol,o=location.origin;
+      if(o&&o!=="null"&&p!=="tauri:"&&p!=="about:")return o+"/favicon.ico";
+    }catch(e){}
+    return "";
+  }
+  function report(){
+    try{
+      var s=JSON.stringify({label:window.__btPageLabel||"",url:location.href,title:document.title,icon:iconHref()});
+      if(s===last)return;
+      last=s;
+      fetch("http://127.0.0.1:"+P+"/api/page-event",{method:"POST",body:s,mode:"no-cors",keepalive:true}).catch(function(){});
+    }catch(e){}
+  }
+  try{
+    ["pushState","replaceState"].forEach(function(m){
+      var o=history[m];
+      history[m]=function(){var r=o.apply(this,arguments);setTimeout(report,0);return r;};
+    });
+  }catch(e){}
+  addEventListener("popstate",function(){setTimeout(report,0);});
+  addEventListener("hashchange",function(){setTimeout(report,0);});
+  function observe(){
+    try{
+      var mo=new MutationObserver(function(){report();});
+      if(document.head)mo.observe(document.head,{subtree:true,childList:true,characterData:true,attributes:true,attributeFilter:["href","rel"]});
+    }catch(e){}
+  }
+  if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",function(){observe();report();});
+  else{observe();report();}
+})();
+"##;
+
+/// 生成页面 Webview 的注入脚本(页面桥 + 媒体模拟 + 事件上报;含事件端口与 webview label)
+fn page_init_script(label: &str, port: u16) -> String {
+    format!("window.__btEventPort={port};window.__btPageLabel=\"{label}\";\n{PAGE_BRIDGE_JS}{MEDIA_FAKE_JS}{PAGE_EVENT_JS}")
+}
+
+/// 错误页 scheme(chromium/webview2 导航失败后的文档地址)
+pub fn is_error_url(url: &str) -> bool {
+    url.starts_with("chrome-error:") || url.starts_with("edge-error:")
+}
+
+/// 内部 scheme:不作为"用户可见地址栏"内容(不覆盖 TabState.url)
+pub fn is_internal_url(url: &str) -> bool {
+    const P: [&str; 8] = ["about:", "tauri:", "data:", "chrome:", "devtools:", "edge:", "chrome-error:", "edge-error:"];
+    P.iter().any(|p| url.starts_with(p))
+}
+
+/// 用页面/导航事件更新某 webview(label) 对应标签的 URL/标题/图标。
+/// 守卫:错误页只置 `errored`、**不覆盖 url**;其它内部 scheme 也不覆盖 url。
+/// 返回是否有变化(调用方据此决定是否 emit_tabs_changed)。
+pub fn apply_page_state(app: &AppHandle, label: &str, url: Option<&str>, title: Option<&str>, icon: Option<&str>) -> bool {
+    let state = app.state::<UiState>();
+    let mut tabs = state.tabs.lock().unwrap();
+    let Some(t) = tabs.iter_mut().find(|t| t.webview.as_deref() == Some(label)) else {
+        return false;
+    };
+    let before = (t.url.clone(), t.title.clone(), t.icon.clone(), t.errored);
+    if let Some(u) = url.filter(|u| !u.is_empty()) {
+        if is_error_url(u) {
+            t.errored = true; // 错误页:保留最后真实导航 URL
+        } else {
+            t.errored = false;
+            if !is_internal_url(u) {
+                t.url = u.to_string();
+            }
+        }
+    }
+    if let Some(s) = title.filter(|s| !s.is_empty()) {
+        t.title = s.to_string();
+    }
+    if let Some(i) = icon.filter(|i| !i.is_empty()) {
+        t.icon = i.to_string();
+    }
+    before != (t.url.clone(), t.title.clone(), t.icon.clone(), t.errored)
+}
+
+/// 加载完成后异步读一次真实文档状态(location.href/title):
+/// - 错误页真实 href 是 `chrome-error://…`(on_page_load 只给请求 URL),据此置 errored 且不覆盖地址栏
+/// - 普通页面同步最终 url/title(SPA/标题/图标后续由页面脚本上报)
+fn schedule_after_load(handle: AppHandle, label: String) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        if let Ok(p) = tokio::task::block_in_place(|| crate::control::document_state(&handle)) {
+            let url = p.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            let title = p.get("title").and_then(|v| v.as_str()).unwrap_or("");
+            let changed = apply_page_state(
+                &handle,
+                &label,
+                if url.is_empty() { None } else { Some(url) },
+                if title.is_empty() { None } else { Some(title) },
+                None,
+            );
+            if changed {
+                emit_tabs_changed(&handle);
+            }
+        }
+    });
+}
+
+/// 刷新激活标签:处于错误页(errored)时**重新导航原 URL**(而非刷错误页);否则原生 reload。
+/// 调用方需保证在阻塞线程执行(内部会 eval/navigate)。
+pub fn reload_active_tab(app: &AppHandle) -> Result<serde_json::Value, String> {
+    let state = app.state::<UiState>();
+    let active = *state.active_tab.lock().unwrap();
+    let tab = state.tabs.lock().unwrap().iter().find(|t| t.id == active).cloned();
+    if let Some(t) = tab {
+        if t.errored && !t.url.is_empty() {
+            let url = t.url.clone();
+            crate::control::navigate(app, &url).map_err(|e| format!("retry navigate failed: {e}"))?;
+            return Ok(serde_json::json!({ "reloaded": true, "retried": url }));
+        }
+    }
+    active_page_webview(app)
+        .ok_or("page webview not ready")?
+        .reload()
+        .map_err(|e| format!("reload failed: {e}"))?;
+    Ok(serde_json::json!({ "reloaded": true }))
+}
 
 /// 媒体模拟脚本(注入页面 Webview,覆盖 getUserMedia 实现模拟/真实设备切换)
 /// 模式:simulate(默认,fake 流不占真实硬件) / real(真实设备,无设备自动回退模拟)
@@ -573,7 +708,7 @@ fn with_data_dir<R: Runtime>(builder: WebviewBuilder<R>, dir: &Option<String>) -
 
 /// 创建主窗口 + 四 Webview(工具栏/页面/覆盖层/面板)
 /// 布局以窗口实际物理尺寸为准(避免 DPI 感知时序导致窗口与子 webview 缩放不一致)
-pub fn create_ui(app: &AppHandle) -> tauri::Result<()> {
+pub fn create_ui(app: &AppHandle, service_port: u16) -> tauri::Result<()> {
     // 用户数据目录(多用户配置):所有 webview 共用同一目录 → 共享同一用户配置
     let data_dir = app.state::<UiState>().user_data_dir.lock().unwrap().clone();
     // 主窗口(逻辑 1100x700:150% DPI 下物理 1650x1050,适配常见 1920x1080 屏幕)
@@ -606,6 +741,11 @@ pub fn create_ui(app: &AppHandle) -> tauri::Result<()> {
     // 保证创建顺序 toolbar → page-N → overlay → panel,使 overlay/panel 位于最上
     for i in 1..=MAX_TABS {
         let label = format!("{PAGE_WEBVIEW}-{i}");
+        let script = page_init_script(&label, service_port);
+        let nav_handle = app.clone();
+        let nav_label = label.clone();
+        let load_handle = app.clone();
+        let load_label = label.clone();
         let w = window.add_child(
             with_data_dir(
                 WebviewBuilder::new(
@@ -613,7 +753,20 @@ pub fn create_ui(app: &AppHandle) -> tauri::Result<()> {
                     // 初始加载自定义新标签页(背景跟随主题,不依赖 webview 默认背景)
                     WebviewUrl::App("newtab.html".into()),
                 )
-                .initialization_script(format!("{PAGE_BRIDGE_JS}{MEDIA_FAKE_JS}")),
+                .initialization_script(script)
+                // 导航事件:请求发出即更新地址栏(地址栏 = 最后真实导航请求)
+                .on_navigation(move |url| {
+                    if apply_page_state(&nav_handle, &nav_label, Some(url.as_str()), None, None) {
+                        emit_tabs_changed(&nav_handle);
+                    }
+                    true
+                })
+                // 加载完成:异步读真实文档状态(错误页 → errored,不覆盖地址栏)
+                .on_page_load(move |_wv, payload| {
+                    if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
+                        schedule_after_load(load_handle.clone(), load_label.clone());
+                    }
+                }),
                 &data_dir,
             ),
             tauri::PhysicalPosition::new(0, 0),
@@ -901,11 +1054,28 @@ pub fn create_tab_webview(app: &AppHandle, id: u32) -> Result<tauri::webview::We
     // 用户数据目录与预创建 webview 保持一致(共享同一 WebView2 environment)
     let data_dir = app.state::<UiState>().user_data_dir.lock().unwrap().clone();
     let label = format!("{PAGE_WEBVIEW}-{id}");
+    let service_port = *app.state::<UiState>().service_port.lock().unwrap();
+    let script = page_init_script(&label, service_port);
+    let nav_handle = app.clone();
+    let nav_label = label.clone();
+    let load_handle = app.clone();
+    let load_label = label.clone();
     let w = window
         .add_child(
             with_data_dir(
                 WebviewBuilder::new(&label, WebviewUrl::App("newtab.html".into()))
-                    .initialization_script(format!("{PAGE_BRIDGE_JS}{MEDIA_FAKE_JS}")),
+                    .initialization_script(script)
+                    .on_navigation(move |url| {
+                        if apply_page_state(&nav_handle, &nav_label, Some(url.as_str()), None, None) {
+                            emit_tabs_changed(&nav_handle);
+                        }
+                        true
+                    })
+                    .on_page_load(move |_wv, payload| {
+                        if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
+                            schedule_after_load(load_handle.clone(), load_label.clone());
+                        }
+                    }),
                 &data_dir,
             ),
             tauri::PhysicalPosition::new(0, 0),
@@ -968,18 +1138,26 @@ pub fn toolbar_webview(app: &AppHandle) -> Option<tauri::webview::Webview> {
     app.get_webview(TOOLBAR_WEBVIEW)
 }
 
-/// 同步激活标签的 URL/标题(页面导航后调用,保持工具栏显示一致)
+/// 同步激活标签的 URL/标题(页面导航后调用,保持工具栏显示一致);
+/// 走 apply_page_state 同一守卫:错误页/内部 scheme 不覆盖地址栏
 pub fn sync_active_tab(app: &AppHandle, url: &str, title: &str) {
     let state = app.state::<UiState>();
     let active = *state.active_tab.lock().unwrap();
-    let mut tabs = state.tabs.lock().unwrap();
-    if let Some(t) = tabs.iter_mut().find(|t| t.id == active) {
-        if !url.is_empty() {
-            t.url = url.to_string();
-        }
-        if !title.is_empty() {
-            t.title = title.to_string();
-        }
+    let label = state
+        .tabs
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|t| t.id == active)
+        .and_then(|t| t.webview.clone());
+    if let Some(label) = label {
+        apply_page_state(
+            app,
+            &label,
+            if url.is_empty() { None } else { Some(url) },
+            if title.is_empty() { None } else { Some(title) },
+            None,
+        );
     }
 }
 
@@ -1210,7 +1388,7 @@ pub fn open_new_tab(app: &AppHandle, url: &str) -> Result<(), String> {
             t.title = "新标签页".into();
             t.webview = Some(label);
         } else {
-            tabs.push(TabState { id, url: url.clone(), title: "新标签页".into(), icon: String::new(), webview: Some(label) });
+            tabs.push(TabState { id, url: url.clone(), title: "新标签页".into(), icon: String::new(), errored: false, webview: Some(label) });
         }
         *state.active_tab.lock().unwrap() = id;
     }
@@ -1283,7 +1461,7 @@ pub fn close_tab(app: &AppHandle, id: u32) -> Result<(), String> {
             *n += 1;
             nid
         };
-        tabs.push(TabState { id: nid, url: NEWTAB_URL.to_string(), title: "新标签页".into(), icon: String::new(), webview: None });
+        tabs.push(TabState { id: nid, url: NEWTAB_URL.to_string(), title: "新标签页".into(), icon: String::new(), errored: false, webview: None });
         new_active = nid;
     } else {
         // 优先激活右侧标签,否则左侧

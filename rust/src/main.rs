@@ -168,55 +168,8 @@ fn panel_set_theme(app: tauri::AppHandle, state: State<'_, ui::UiState>, theme: 
     Ok(())
 }
 
-// ---- 标签状态统一管理:后台轮询检测变化,有变更才广播事件,前端只响应事件不轮询 ----
-
-/// 页面图标地址 JS:优先 <link rel~="icon">,回退 origin/favicon.ico;无则返回空串
-/// (tauri:/about: 等内部页面不生成图标地址)
-const ICON_JS: &str = r#"(function(){try{var l=document.querySelector('link[rel~="icon"]');if(l&&l.href)return l.href;var p=location.protocol;var o=location.origin;if(o&&o!=='null'&&p!=='tauri:'&&p!=='about:')return o+'/favicon.ico';}catch(e){}return '';})()"#;
-
-/// 后台轮询:刷新激活标签的标题/URL/图标(页面导航后变化),返回是否有变化
-fn poll_tab_title(app: &tauri::AppHandle) -> bool {
-    let state = app.state::<ui::UiState>();
-    let active = *state.active_tab.lock().unwrap();
-    // 当前激活标签的 title/url/icon 快照
-    let before = state
-        .tabs
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|t| t.id == active)
-        .map(|t| (t.title.clone(), t.url.clone(), t.icon.clone()));
-    // 从页面 webview 读取最新状态(阻塞线程 eval)
-    let handle = app.clone();
-    let page = tokio::task::block_in_place(move || control::page_state(&handle)).ok();
-    // 图标地址:同一阻塞上下文再 eval 一次(空串表示无图标)
-    let icon_handle = app.clone();
-    let icon = tokio::task::block_in_place(move || control::eval(&icon_handle, ICON_JS))
-        .ok()
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .unwrap_or_default();
-    let mut changed = false;
-    if let Some(page) = page {
-        let url = page["url"].as_str().unwrap_or("").to_string();
-        let title = page["title"].as_str().unwrap_or("").to_string();
-        let state = app.state::<ui::UiState>();
-        let mut tabs = state.tabs.lock().unwrap();
-        if let Some(t) = tabs.iter_mut().find(|t| t.id == active) {
-            if !url.is_empty() {
-                t.url = url.clone();
-            }
-            if !title.is_empty() {
-                t.title = title.clone();
-            }
-            // 仅在拿到非空图标时更新,避免页面短暂无图标时闪烁
-            if !icon.is_empty() {
-                t.icon = icon.clone();
-            }
-            changed = before != Some((t.title.clone(), t.url.clone(), t.icon.clone()));
-        }
-    }
-    changed
-}
+// ---- 标签状态统一管理:事件驱动(on_navigation/on_page_load + 页面 /api/page-event 上报),
+//      有变更才广播 tabs-changed;前端只响应事件,无轮询 ----
 
 // ---- 工具栏命令:标签(伪多标签) + 地址栏导航 + 面板浮层开关 ----
 // 注意:tauri command 默认在主线程执行,而 control::eval 的回调也需要主线程事件循环,
@@ -236,14 +189,18 @@ where
 #[tauri::command]
 async fn toolbar_state(app: tauri::AppHandle, state: State<'_, ui::UiState>) -> Result<serde_json::Value, String> {
     let active = *state.active_tab.lock().unwrap();
-    // 从页面 webview 刷新激活标签的 url/title(阻塞线程执行,避免死锁)
-    if let Ok(page) = ui_block(&app, |h| control::page_state(h)) {
-        let url = page["url"].as_str().unwrap_or("").to_string();
-        let title = page["title"].as_str().unwrap_or("").to_string();
-        let mut tabs = state.tabs.lock().unwrap();
-        if let Some(t) = tabs.iter_mut().find(|t| t.id == active) {
-            if !url.is_empty() { t.url = url; }
-            if !title.is_empty() { t.title = title; }
+    // 从页面 webview 读一次状态(非轮询,仅工具栏拉取时);走同一守卫,错误页不覆盖地址栏
+    if let Some(label) = ui::active_page_webview(&app).map(|w| w.label().to_string()) {
+        if let Ok(page) = ui_block(&app, |h| control::page_state(h)) {
+            let url = page["url"].as_str().unwrap_or("");
+            let title = page["title"].as_str().unwrap_or("");
+            ui::apply_page_state(
+                &app,
+                &label,
+                if url.is_empty() { None } else { Some(url) },
+                if title.is_empty() { None } else { Some(title) },
+                None,
+            );
         }
     }
     let tabs = state.tabs.lock().unwrap().clone();
@@ -282,12 +239,32 @@ async fn toolbar_navigate(app: tauri::AppHandle, state: State<'_, ui::UiState>, 
     // 裸域名自动补 http://
     let url = ui::normalize_url(&url);
     let active = *state.active_tab.lock().unwrap();
-    let mut tabs = state.tabs.lock().unwrap();
-    if let Some(t) = tabs.iter_mut().find(|t| t.id == active) {
-        t.url = url.clone();
+    {
+        let mut tabs = state.tabs.lock().unwrap();
+        if let Some(t) = tabs.iter_mut().find(|t| t.id == active) {
+            t.url = url.clone();
+            t.errored = false;
+        }
     }
-    drop(tabs);
-    ui_block(&app, move |h| control::navigate(h, &url))?;
+    // 记录导航前文档身份,用于确认导航确实发生(与 /api/navigate 同口径)
+    let prev = ui_block(&app, |h| control::document_state(h))?;
+    let prev_url = prev.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let prev_to = prev.get("timeOrigin").and_then(|v| v.as_f64());
+    let nav_url = url.clone();
+    let nav_res = ui_block(&app, move |h| control::navigate(h, &nav_url));
+    if let Err(e) = &nav_res {
+        eprintln!("[toolbar] navigate failed: {url} -> {e}");
+    }
+    nav_res?;
+    // 有界等待就绪;未就绪至少留痕(此前静默"成功")
+    let wait_url = url.clone();
+    match ui_block(&app, move |h| control::wait_ready(h, &prev_url, prev_to, control::nav_timeout_ms())) {
+        Ok(st) if st.get("ready").and_then(|v| v.as_bool()) == Some(false) => {
+            eprintln!("[toolbar] navigate not ready: {wait_url} -> {st}")
+        }
+        Err(e) => eprintln!("[toolbar] navigate wait failed: {wait_url} -> {e}"),
+        _ => {}
+    }
     ui::emit_tabs_changed(&app);
     Ok(())
 }
@@ -340,10 +317,10 @@ async fn toolbar_go_forward(app: tauri::AppHandle) -> Result<(), String> {
     ui_block(&app, |h| control::eval(h, "history.forward()").map(|_| ()))
 }
 
-/// 页面刷新(通过 eval location.reload)
+/// 页面刷新:错误页(chrome-error:)时重新导航原 URL,否则原生 reload
 #[tauri::command]
 async fn toolbar_reload(app: tauri::AppHandle) -> Result<(), String> {
-    ui_block(&app, |h| control::eval(h, "location.reload()").map(|_| ()))
+    ui_block(&app, |h| ui::reload_active_tab(h).map(|_| ()))
 }
 
 fn main() {
@@ -377,23 +354,19 @@ fn main() {
             toolbar_reload
         ])
         .setup(move |app| {
-            // 设置用户数据目录(多用户配置隔离),再创建 Webview(create_ui 据此设置 data_directory)
+            // 用户数据目录 + 服务端口 + 通知地址:必须在 create_ui 前写好
+            // (create_ui 读取端口,注入页面事件上报脚本 window.__btEventPort)
             {
                 let state = app.state::<ui::UiState>();
                 *state.user_data_dir.lock().unwrap() = user_data_dir.clone();
-            }
-            // 创建三 Webview 布局
-            ui::create_ui(app.handle())?;
-
-            // 记录服务端口供面板查询
-            {
-                let state = app.state::<ui::UiState>();
                 *state.service_port.lock().unwrap() = port;
                 // 推送式投递:记录插件通知地址(来自 --notify-url / BT_SHELL_NOTIFY_URL;可被 /api/notify-url 覆盖)
                 if notify_url.is_some() {
                     *state.notify_url.lock().unwrap() = notify_url.clone();
                 }
             }
+            // 创建 Webview 布局(工具栏/页面/覆盖层/面板)
+            ui::create_ui(app.handle(), port)?;
 
             // 启动 HTTP 服务(端口由 --port 指定,默认 0 随机)
             let http_app = Arc::new(bt_shell::service::App::new(
@@ -417,19 +390,8 @@ fn main() {
                 });
             }
 
-            // 标签状态统一管理:后台每秒轮询检测标题/URL 变化,有变更才广播 tabs-changed
-            {
-                let handle = app.handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    loop {
-                        let changed = tokio::task::block_in_place(|| poll_tab_title(&handle));
-                        if changed {
-                            ui::emit_tabs_changed(&handle);
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-                    }
-                });
-            }
+            // 标签状态为事件驱动,无轮询:导航/加载由 on_navigation/on_page_load 更新;
+            // SPA/标题/图标由页面脚本上报 /api/page-event(见 ui::PAGE_EVENT_JS)
             Ok(())
         })
         .build(tauri::generate_context!())

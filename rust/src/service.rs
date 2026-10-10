@@ -139,6 +139,8 @@ impl App {
             "/api/scroll" => self.scroll(&body).await,
             "/api/scroll-to-element" => self.scroll_to_element(&body).await,
             "/api/reload" => self.reload().await,
+            // 页面事件上报(SPA 路由/标题/图标;注入脚本 POST)
+            "/api/page-event" => self.page_event(&body).await,
             "/api/go-back" => self.go_back().await,
             "/api/go-forward" => self.go_forward().await,
             "/api/resize" => self.resize(&body).await,
@@ -523,14 +525,25 @@ impl App {
     }
 
     async fn reload(&self) -> Result<Value, String> {
+        // 错误页 -> 重新导航原 URL;否则原生 reload(见 ui::reload_active_tab)
         let handle = self.handle.clone();
-        tokio::task::block_in_place(|| {
-            ui::active_page_webview(&handle)
-                .ok_or("page webview not ready")?
-                .reload()
-                .map_err(|e| format!("reload failed: {e}"))
-        })?;
-        Ok(json!({ "reloaded": true }))
+        tokio::task::block_in_place(|| ui::reload_active_tab(&handle))
+    }
+
+    /// 页面事件上报(SPA 路由/标题/图标变化;注入脚本 POST 到此,http.rs 已开 CORS)
+    async fn page_event(&self, body: &Value) -> Result<Value, String> {
+        let label = body.get("label").and_then(|v| v.as_str()).unwrap_or("");
+        if label.is_empty() {
+            return Ok(json!({ "ok": false, "reason": "missing label" }));
+        }
+        let url = body.get("url").and_then(|v| v.as_str());
+        let title = body.get("title").and_then(|v| v.as_str());
+        let icon = body.get("icon").and_then(|v| v.as_str());
+        let changed = crate::ui::apply_page_state(&self.handle, label, url, title, icon);
+        if changed {
+            crate::ui::emit_tabs_changed(&self.handle);
+        }
+        Ok(json!({ "ok": true, "changed": changed }))
     }
 
     async fn go_back(&self) -> Result<Value, String> {
@@ -686,7 +699,7 @@ impl App {
         let tabs = state.tabs.lock().unwrap().clone();
         let list: Vec<serde_json::Value> = tabs
             .iter()
-            .map(|t| json!({ "id": t.id, "url": t.url, "title": t.title }))
+            .map(|t| json!({ "id": t.id, "url": t.url, "title": t.title, "icon": t.icon, "errored": t.errored }))
             .collect();
         Ok(json!({ "tabs": list }))
     }
