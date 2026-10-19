@@ -3,7 +3,7 @@ import type { LocaleStrings } from "./types.js";
 const en: LocaleStrings = {
   tool: {
     "tool.cli.desc":
-      "Browser automation via a CLI-style dispatcher: pass a single command string, e.g. \"navigate --url https://...\" or \"help\". Omit to list all commands.",
+      "Browser automation via a CLI-style dispatcher: pass a single command string, e.g. \"navigate --url https://...\" or \"help\". Omit to list all commands. screenshot with --selector scrolls the element into view first.",
     "tool.cli.arg.args": "Command line string: \"<command> [--flag value ...]\", e.g. \"navigate --url https://...\" (\"help\" lists all)",
 
     "cli.header": "bt_cli — browser automation CLI",
@@ -27,7 +27,7 @@ const en: LocaleStrings = {
     "cli.cmd.drag": "Drag element to a target",
     "cli.cmd.press_key": "Press a keyboard key",
     "cli.cmd.upload_file": "Upload a file to an input",
-    "cli.cmd.screenshot": "Take a screenshot (returns image attachment)",
+    "cli.cmd.screenshot": "Take a screenshot (returns image attachment; with --selector it scrolls the element into view first)",
     "cli.cmd.evaluate": "Execute JS in the page, return result",
     "cli.cmd.get_visible_text": "Get visible page text",
     "cli.cmd.get_visible_html": "Get page HTML structure",

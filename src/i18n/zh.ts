@@ -3,7 +3,7 @@ import type { LocaleStrings } from "./types.js";
 const zh: LocaleStrings = {
   tool: {
     "tool.cli.desc":
-      "CLI 风格的浏览器自动化控制：单个字符串命令行，如 \"navigate --url https://...\" 或 \"help\"。省略列出全部命令。",
+      "CLI 风格的浏览器自动化控制：单个字符串命令行，如 \"navigate --url https://...\" 或 \"help\"。省略列出全部命令。screenshot 带 --selector 会先自动滚动到元素再截取。",
     "tool.cli.arg.args": "命令行字符串：\"<command> [--flag 值 ...]\"，如 \"navigate --url https://...\"（\"help\" 列出全部）",
 
     "cli.header": "bt_cli — 浏览器自动化 CLI",
@@ -27,7 +27,7 @@ const zh: LocaleStrings = {
     "cli.cmd.drag": "拖拽元素到目标",
     "cli.cmd.press_key": "按下键盘按键",
     "cli.cmd.upload_file": "上传文件到输入框",
-    "cli.cmd.screenshot": "截取页面/元素截图（返回图片）",
+    "cli.cmd.screenshot": "截取页面/元素截图（返回图片；--selector 会先滚动到元素再截取）",
     "cli.cmd.evaluate": "在页面执行 JS，返回结果",
     "cli.cmd.get_visible_text": "获取页面可见文本",
     "cli.cmd.get_visible_html": "获取页面 HTML 结构",
