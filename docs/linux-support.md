@@ -54,10 +54,12 @@
 
 ## 4. 截图实现（Linux）
 
-WebKitGTK：`WebViewExt::snapshot(SnapshotRegion::Visible, SnapshotOptions::NONE, Cancellable::NONE, cb)`。
+WebKitGTK：`WebViewExt::snapshot(region, SnapshotOptions::NONE, Cancellable::NONE, cb)`。
 注意：
 
-- `SnapshotRegion` **只有 `Visible` / `FullDocument`，没有矩形参数** → 区域截图要"先截 Visible，再用 cairo 偏移 `set_source_surface` + `paint` 裁剪"。
+- `SnapshotRegion` **只有 `Visible` / `FullDocument`，没有矩形参数** → 常规区域截图"截 Visible（原点=视口左上角），再用 cairo 偏移 `set_source_surface` + `paint` 裁剪"；元素比视口还大（v1.7.0 越界路径）时改截 `FullDocument`，裁剪前先把视口坐标换算成**文档**坐标（原点=文档 (0,0)）。
+- **WSLg 实测（v1.7.0，dpr=1）**：`FullDocument` 快照原点=文档 (0,0)（3000px 高元素截图=520×3000，顶部绿带在第 2–25 行、底部黄带在第 2974–2997 行，均与文档坐标吻合）；`Visible` 快照原点=视口（滚动后截视口内小元素内容正确）。
+- **sticky/fixed 成像（越界路径实测）**：`sticky` 只成像一次、位于其**自然流位置**（整页渲染无视口，不会吸顶）；`fixed` 元素（如左上角徽标）**绘制在文档顶部**（body 整页截图中出现在第 0 行起）——与 Windows 越界路径（绘制在截图瞬间的视口位置 ≈ scrollY 处）不同。
 - PNG 编码需 `cairo-rs` 且**必须显式开 `features = ["png"]`**（gtk 0.18 未启用）；base64 用 `base64` crate。
 - 调用方都在后台线程，`with_webview` 在非主线程只投递消息到 GTK 主线程，因此后台线程阻塞 `recv_timeout` 不会死锁。
 

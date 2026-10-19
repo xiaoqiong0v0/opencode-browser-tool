@@ -2,6 +2,7 @@
 //! Windows:通过 with_webview 拿 ICoreWebView2Controller → CDP Page.captureScreenshot
 //! Linux:通过 with_webview 拿 webkit2gtk::WebView → WebKitGTK snapshot → cairo → PNG base64
 //! macOS:WKWebView snapshot(待实现)
+//! 两条路径各有常规(视口 clip)与越界(整块截全,元素比视口还大)两种模式,见各函数注释
 
 #[cfg(any(windows, target_os = "linux"))]
 use std::sync::mpsc;
@@ -18,10 +19,12 @@ use crate::ui;
 
 /// 截图页面 Webview,返回 PNG base64
 pub fn screenshot(app: &AppHandle) -> Result<String, String> {
-    screenshot_impl(app, None)
+    screenshot_impl(app, None, false)
 }
 
-/// 截取页面指定区域(视口 CSS 像素坐标),返回 PNG base64
+/// 截取页面指定区域(**视口** CSS 像素坐标),返回 PNG base64
+///
+/// 内部统一换算成文档坐标再交给平台实现(CDP clip 实测恒为文档坐标,见 `screenshot_impl` 注释)
 pub fn screenshot_clip(
     app: &AppHandle,
     x: i32,
@@ -29,15 +32,56 @@ pub fn screenshot_clip(
     w: i32,
     h: i32,
 ) -> Result<String, String> {
-    screenshot_impl(app, Some((x, y, w, h)))
+    screenshot_impl(app, Some((x, y, w, h)), false)
 }
 
+/// 越界截取页面指定区域(**视口** CSS 像素坐标),返回 PNG base64
+///
+/// 用于元素比视口还高/宽的场景(rect 无法完全落进视口),平台实现:
+/// - Windows:CDP `Page.captureScreenshot` + `captureBeyondViewport:true`(内部换算为文档坐标)
+/// - Linux:WebKitGTK `SnapshotRegion::FullDocument` 整页快照后按文档坐标裁剪
+pub fn screenshot_clip_beyond(
+    app: &AppHandle,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+) -> Result<String, String> {
+    screenshot_impl(app, Some((x, y, w, h)), true)
+}
+
+/// 读取窗口滚动偏移(整像素),用于视口坐标 → 文档坐标换算
+///
+/// 实测依据(v1.7.0):CDP `Page.captureScreenshot` 的 `clip` **恒为文档坐标**
+/// (`captureBeyondViewport` true/false 均如此),视口坐标传入会截到文档靠顶部的错误区域
+#[cfg(any(windows, target_os = "linux"))]
+fn scroll_offset(app: &AppHandle) -> Result<(i32, i32), String> {
+    let v = super::eval(app, "(function(){return {x:window.scrollX,y:window.scrollY};})()")?;
+    Ok((
+        v.get("x").and_then(|n| n.as_f64()).unwrap_or(0.0).round() as i32,
+        v.get("y").and_then(|n| n.as_f64()).unwrap_or(0.0).round() as i32,
+    ))
+}
+
+/// 平台分支实现入口
+///
+/// 参数:`clip` 截图选区 (x, y, w, h),**视口 CSS 像素**坐标(平台实现内换算为文档坐标),
+/// `None` 表示整幅视口;`beyond` 为 true 时走越界路径(元素比视口还大,整块截全)
 #[cfg(windows)]
 fn screenshot_impl(
     app: &AppHandle,
     clip: Option<(i32, i32, i32, i32)>,
+    beyond: bool,
 ) -> Result<String, String> {
     let page = ui::active_page_webview(app).ok_or("page webview not ready")?;
+    // CDP clip 恒为**文档坐标**(实测,与 captureBeyondViewport 取值无关) → 视口坐标先换算
+    let clip = match clip {
+        Some((x, y, w, h)) => {
+            let (sx, sy) = scroll_offset(app)?;
+            Some((x + sx, y + sy, w, h))
+        }
+        None => None,
+    };
     // 结果通道:completed 回调 → 本线程
     let (tx, rx) = mpsc::channel::<Result<String, String>>();
     let tx2 = tx.clone();
@@ -55,12 +99,14 @@ fn screenshot_impl(
             match webview_result {
                 Err(e) => { let _ = tx.send(Err(e)); }
                 Ok(webview) => {
-                    // 区域截图:CDP clip 用视口 CSS 像素坐标,scale=1 按 device 像素输出
+                    // 区域截图(clip 已换算为文档坐标;实测见文件头 scroll_offset 注释):
+                    // - captureBeyondViewport:false → 仅截视口表面(clip 须完全落在可见视口内)
+                    // - captureBeyondViewport:true → 越界整块截全(元素比视口还大时用)
                     let params = match clip {
                         Some((cx, cy, cw, ch)) => format!(
-                            r#"{{"format":"png","captureBeyondViewport":false,"clip":{{"x":{cx},"y":{cy},"width":{cw},"height":{ch},"scale":1}}}}"#
+                            r#"{{"format":"png","captureBeyondViewport":{beyond},"clip":{{"x":{cx},"y":{cy},"width":{cw},"height":{ch},"scale":1}}}}"#
                         ),
-                        None => r#"{"format":"png","captureBeyondViewport":false}"#.to_string(),
+                        None => format!(r#"{{"format":"png","captureBeyondViewport":{beyond}}}"#),
                     };
                     let method = windows::core::HSTRING::from("Page.captureScreenshot");
                     let params = windows::core::HSTRING::from(params);
@@ -105,9 +151,13 @@ fn screenshot_impl(
 /// Linux:WebKitGTK 快照 → cairo 图像面 → PNG base64
 ///
 /// 区域语义:WebKitGTK 的 `WebView::snapshot` 只接受 `Visible`/`FullDocument` 两种区域、
-/// 没有矩形参数;因此区域截图统一先截 `Visible`(与 Windows 分支 `captureBeyondViewport:false`
-/// 一致,均为视口可见区域),再用 cairo 按视口 CSS 像素坐标裁剪,不做缩放
-/// (Linux 下假定 CSS 像素与设备像素 1:1)。
+/// 没有矩形参数;因此:
+/// - 常规区域(`beyond=false`):截 `Visible`(视口可见区域,与 Windows 分支
+///   `captureBeyondViewport:false` 对应),裁剪用**视口** CSS 像素(快照原点=视口左上角);
+/// - 越界区域(`beyond=true`,元素比视口还高/宽):截 `FullDocument` 整页快照,
+///   裁剪前先把视口坐标换算成**文档**坐标(快照原点=文档 (0,0),与 Windows 的 CDP
+///   clip 文档坐标口径一致)。
+/// 两条路径都用 cairo 裁剪,不做缩放(Linux 下假定 CSS 像素与设备像素 1:1)。
 ///
 /// 线程模型:本函数的全部调用方(service.rs / ui/annotate.rs / main.rs)都在后台线程调用。
 /// `with_webview` 在非主线程只是把闭包投递到 GTK 主线程(tauri-runtime-wry 的
@@ -117,8 +167,17 @@ fn screenshot_impl(
 fn screenshot_impl(
     app: &AppHandle,
     clip: Option<(i32, i32, i32, i32)>,
+    beyond: bool,
 ) -> Result<String, String> {
     let page = ui::active_page_webview(app).ok_or("page webview not ready")?;
+    // 越界路径裁剪用文档坐标(FullDocument 原点=文档 0,0);常规路径保持视口坐标(Visible 原点=视口)
+    let clip = match clip {
+        Some((x, y, w, h)) if beyond => {
+            let (sx, sy) = scroll_offset(app)?;
+            Some((x + sx, y + sy, w, h))
+        }
+        other => other,
+    };
     // 结果通道:snapshot 回调(主线程) → 本线程
     let (tx, rx) = mpsc::channel::<Result<String, String>>();
     // with_webview 在 GTK 主线程执行
@@ -126,8 +185,12 @@ fn screenshot_impl(
         // PlatformWebview::inner() 在 Linux 返回 webkit2gtk::WebView
         let webview = platform_webview.inner();
         webview.snapshot(
-            // 视口可见区域(非整页)
-            SnapshotRegion::Visible,
+            // 越界:整页快照(原点=文档 0,0);常规:视口可见区域
+            if beyond {
+                SnapshotRegion::FullDocument
+            } else {
+                SnapshotRegion::Visible
+            },
             SnapshotOptions::NONE,
             // 不提供 Cancellable
             gtk::gio::Cancellable::NONE,
@@ -148,8 +211,9 @@ fn screenshot_impl(
 
 /// 把 cairo 快照面编码为 PNG 并做标准 base64(可先按 CSS 像素坐标裁剪)
 ///
-/// 参数:`surface` WebKitGTK 返回的快照面;`clip` 视口 CSS 像素选区 (x, y, w, h),
-/// `None` 表示整幅可见区域
+/// 参数:`surface` WebKitGTK 返回的快照面;`clip` 选区 (x, y, w, h) —— 坐标系随快照区域而定
+/// (常规=视口 CSS 像素/Visible 快照,越界=文档 CSS 像素/FullDocument 快照),
+/// `None` 表示整幅快照不裁剪
 /// 返回:PNG 数据的标准 base64 字符串(不带 `data:` 前缀,与 Windows 分支输出格式一致)
 #[cfg(target_os = "linux")]
 fn encode_surface_png_base64(
@@ -175,8 +239,8 @@ fn encode_surface_png_base64(
 
 /// 用 cairo 从快照面裁出指定 CSS 像素区域(1:1 设备像素,不做缩放)
 ///
-/// 参数:`src` 源快照面;`x`/`y` 选区左上角(视口 CSS 像素,可为负);
-/// `w`/`h` 选区尺寸(负值按 0 处理)
+/// 参数:`src` 源快照面;`x`/`y` 选区左上角(坐标系与快照面一致:常规=视口,越界=文档;
+/// 可为负);`w`/`h` 选区尺寸(负值按 0 处理)
 /// 返回:裁剪后的 ARGB32 图像面
 #[cfg(target_os = "linux")]
 fn crop_surface(
@@ -206,6 +270,7 @@ fn crop_surface(
 fn screenshot_impl(
     _app: &AppHandle,
     _clip: Option<(i32, i32, i32, i32)>,
+    _beyond: bool,
 ) -> Result<String, String> {
     Err("screenshot not implemented on this platform yet".into())
 }

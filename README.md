@@ -132,7 +132,7 @@ opencode（Bun）
 | `bt_drag` | `sourceSelector`, `targetSelector`(string) 必填 | 从源元素拖到目标元素 |
 | `bt_press_key` | `key`(string) 必填, `selector`(string) 可选 | 按键（如 Enter/Escape）；可指定聚焦元素 |
 | `bt_upload_file` | `selector`, `filePath`(string) 必填 | 向文件输入框上传文件 |
-| `bt_screenshot` | `selector`(string) 可选 | 截取视口；指定 `selector` 时截该元素区域（PNG 图片附件） |
+| `bt_screenshot` | `selector`(string) 可选 | 截取视口；指定 `selector` 时先滚动到可见再截该元素区域，**元素比视口还大也能整块截全**（PNG 图片附件） |
 | `bt_evaluate` | `script`(string) 必填 | 在页面执行 JS 并返回 JSON 结果 |
 | `bt_get_visible_text` | `selector`(string) 可选 | 返回页面/元素可见文本 |
 | `bt_get_visible_html` | `selector`, `removeScripts`(boolean), `removeComments`(boolean), `maxLength`(number) | 返回页面/元素 HTML |
@@ -170,6 +170,28 @@ opencode（Bun）
 | `bt_get_accessibility_tree` | `selector`, `maxDepth`(number) | 返回页面可访问性树（role/name/value 嵌套结构） |
 | `bt_list_records` | 无 | 列出批注/截图记录（索引/标签/说明；截图带 `+img`，已发送带 `[sent]`） |
 | `bt_read_record_content` | `id`(number) 必填 | 读取单条记录详情（截图附带图片大小与落盘路径） |
+
+### 元素截图行为（v1.7.0 起统一）
+
+`bt_screenshot --selector <css>` 固定流程：
+
+1. **先滚动**：复用 `scroll_to_element`（立即 `scrollIntoView` 居中 + 轮询等滚动稳定）；未到达/未稳定**不吞错**，结果带 `reached`/`stable`/`waitedMs`，工具输出追加对应提示
+2. **重测 rect**：滚动稳定后重新取元素视口矩形（覆盖懒加载/布局变化后的真位置）
+3. **rect 完全落在视口内** → 常规 clip 路径（`captureBeyondViewport:false`，同旧版）
+4. **rect 仍超出视口**（元素比视口还高/宽）→ **越界路径，整块截全**（不做尺寸上限）
+   - Windows：CDP `Page.captureScreenshot` + `clip` + `captureBeyondViewport:true`
+   - Linux：WebKitGTK `SnapshotRegion::FullDocument` 整页快照 + cairo 按文档坐标裁剪（该 API 只有 Visible/FullDocument 两档、无矩形参数）
+5. 无 `selector` = 整视口截图（保持现状，无 `--full` 参数）
+
+**坐标系（实测，v1.7.0）**：CDP `clip` **恒为文档坐标**（`captureBeyondViewport` true/false 均如此）——传视口坐标会在滚动后的页面截到错误区域（旧版元素截图在滚动页面上即踩此坑）；截图层内部统一做 视口坐标 + `scrollX/Y` 换算，调用方一律传视口坐标。
+
+错误口径不变：`element not found: <sel>` / `element has zero size: <sel>`。输出图片尺寸 = 元素 rect × devicePixelRatio。
+
+**已知限制**
+
+- **sticky/fixed 在越界路径只成像一次**，且两端位置不同：Windows 绘制在「截图瞬间它们在视口中的位置」（换算到文档坐标 ≈ scrollY 处）；Linux `FullDocument` 整页渲染下 `sticky` 停在自然流位置、`fixed` 绘制在**文档顶部**
+- Linux（含 WSLg）截图路径已实测通过（见 `docs/implementation.md`）；**真实 Linux 桌面（GNOME/KDE）仍待复验**
+- 折下懒加载图（`loading=lazy`）经 cache-bust 实测：滚动前 `complete=false`，自动滚动后加载完成、截图内容非空白
 
 ## 设备预设
 

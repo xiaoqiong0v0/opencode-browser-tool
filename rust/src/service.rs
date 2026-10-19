@@ -360,15 +360,26 @@ impl App {
         Ok(json!({ "uploaded": true }))
     }
 
-    /// 截图:有 selector 时截该元素区域(视口 CSS 像素),否则整视口(行为不变)
+    /// 截图:无 selector → 整视口(行为不变);有 selector → 统一元素截图流程:
+    /// ① exists 校验 ② 滚动到可见并等稳定(复用 scroll_to_element) ③ 重测 rect
+    /// ④ rect 完全在视口内 → 常规 clip(原路径);仍超出视口 → 越界路径(beyond,整块截全)
+    /// 滚动 reached/stable 不吞错:如实写进返回(beyondViewport/reached/stable/…)
     async fn screenshot(&self, body: &Value) -> Result<Value, String> {
         let selector = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let handle = self.handle.clone();
-        let base64 = tokio::task::block_in_place(|| -> Result<String, String> {
+        let (base64, meta) = tokio::task::block_in_place(|| -> Result<(String, Value), String> {
             if selector.is_empty() {
-                return crate::control::screenshot::screenshot(&handle);
+                // 无 selector:整视口截图,保持现状
+                return Ok((crate::control::screenshot::screenshot(&handle)?, json!({})));
             }
-            // 元素矩形(视口 CSS 像素)由 element_state 提供
+            // ① 元素存在性校验(错误口径与旧版一致)
+            let st = crate::control::element_state(&handle, &selector)?;
+            if !st.get("exists").and_then(|v| v.as_bool()).unwrap_or(false) {
+                return Err(format!("element not found: {selector}"));
+            }
+            // ② 先滚动到可见并等滚动稳定(超时如实返回 reached/stable,不吞错)
+            let scroll = crate::control::scroll_to_element(&handle, &selector)?;
+            // ③ 滚动后重测 rect(视口 CSS 像素,含懒加载/布局变化后的真实位置)
             let st = crate::control::element_state(&handle, &selector)?;
             if !st.get("exists").and_then(|v| v.as_bool()).unwrap_or(false) {
                 return Err(format!("element not found: {selector}"));
@@ -381,9 +392,43 @@ impl App {
             if w <= 0 || h <= 0 {
                 return Err(format!("element has zero size: {selector}"));
             }
-            crate::control::screenshot::screenshot_clip(&handle, x, y, w, h)
+            // ④ 判定 rect 是否完全落在视口内(需视口尺寸;越界与否决定截图路径)
+            let vp = crate::control::eval(
+                &handle,
+                "(function(){return {w:window.innerWidth,h:window.innerHeight};})()",
+            )?;
+            let vw = vp.get("w").and_then(|v| v.as_f64()).unwrap_or(0.0).round() as i32;
+            let vh = vp.get("h").and_then(|v| v.as_f64()).unwrap_or(0.0).round() as i32;
+            // 完全在视口内 → 常规 clip;任一边超出 → 越界路径(元素比视口还大,整块截全)。
+            // 两条路径都传**视口**坐标,截图层内部统一换算文档坐标(CDP clip 实测恒为文档坐标)
+            let beyond = x < 0 || y < 0 || x + w > vw || y + h > vh;
+            let base64 = if beyond {
+                crate::control::screenshot::screenshot_clip_beyond(&handle, x, y, w, h)?
+            } else {
+                crate::control::screenshot::screenshot_clip(&handle, x, y, w, h)?
+            };
+            let meta = json!({
+                "beyondViewport": beyond,
+                "reached": scroll.get("reached").cloned().unwrap_or(Value::Bool(false)),
+                "inViewport": scroll.get("inViewport").cloned().unwrap_or(Value::Bool(false)),
+                "stable": scroll.get("stable").cloned().unwrap_or(Value::Bool(false)),
+                "waitedMs": scroll.get("waitedMs").cloned().unwrap_or(Value::Null),
+            });
+            // 滚动未到达时的 reason 原样带出(与 scroll_to_element 返回口径一致)
+            let mut meta = meta;
+            if let Some(reason) = scroll.get("reason") {
+                meta["reason"] = reason.clone();
+            }
+            Ok((base64, meta))
         })?;
-        Ok(json!({ "base64": base64, "mime": "image/png" }))
+        let mut out = json!({ "base64": base64, "mime": "image/png" });
+        // 越界/滚动元信息(无 selector 时 meta 为空对象,保持返回形状稳定)
+        if let Some(m) = meta.as_object() {
+            for (k, v) in m {
+                out[k] = v.clone();
+            }
+        }
+        Ok(out)
     }
 
     async fn evaluate(&self, body: &Value) -> Result<Value, String> {

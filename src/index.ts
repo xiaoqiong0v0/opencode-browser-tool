@@ -70,7 +70,9 @@ const COMMANDS: Record<string, CmdDef> = {
   upload_file: { usage: "--selector --filePath", descKey: "cli.cmd.upload_file", args: [{ flag: "selector" }, { flag: "filePath" }], run: async (a) => { await service.uploadFile(a); return "Uploaded"; } },
   screenshot: { usage: "[--selector]", descKey: "cli.cmd.screenshot", args: [{ flag: "selector" }], run: async (a) => {
     const r = await service.screenshot(a);
-    return { output: `Screenshot taken${a.selector ? ` (element: ${a.selector})` : " (full page)"}`, attachments: [{ type: "file", mime: r.mime || "image/png", url: `data:${r.mime || "image/png"};base64,${r.base64}` }] };
+    // 元素截图:先滚动到可见再截;rect 超出视口时走越界路径(截全),滚动未稳定/未到达如实标注
+    const note = (r as any)?.beyondViewport ? " (element larger than viewport, captured beyond viewport)" : "";
+    return { output: `Screenshot taken${a.selector ? ` (element: ${a.selector})` : " (full page)"}` + note + reachedNote(r) + stableNote(r), attachments: [{ type: "file", mime: r.mime || "image/png", url: `data:${r.mime || "image/png"};base64,${r.base64}` }] };
   } },
   evaluate: { usage: "--script", descKey: "cli.cmd.evaluate", args: [{ flag: "script" }], run: async (a) => JSON.stringify(await service.evaluate(a), null, 2) },
   get_visible_text: { usage: "[--selector]", descKey: "cli.cmd.get_visible_text", args: [{ flag: "selector" }], run: async (a) => (await service.visibleText(a))?.text || "(no visible text)" },

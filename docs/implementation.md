@@ -31,6 +31,7 @@
 - [x] Linux 布局尺寸口径修复（v1.5.0，动 Rust）：`apply_layout` 在 Linux 正常路径改用顶层 GtkWindow `allocation()` 的 **GTK 逻辑尺寸**（新增 `rust/src/ui/linux_layout.rs::logical_window_size`）并以 `layout_scale = 1.0` 计算，取不到时回退 `size`+`scale` 物理口径；修复 GNOME 分数缩放/HiDPI 下子视图按物理值放大、内容区超出窗口（坐标口径=GTK 逻辑像素，见 `linux-support.md` §2）
 
 - [x] 地址栏/标题/图标改**事件驱动**（删除 `main.rs` 的 `poll_tab_title` 1 秒轮询）：导航级 `on_navigation`（请求即更新地址栏）+ `on_page_load`（完成后异步读真实 `location.href`/`title`）；站内 SPA（包装 `pushState`/`replaceState`、`popstate`/`hashchange`）与标题/图标变化由注入脚本经 **HTTP `POST /api/page-event`** 上报。守卫：`is_internal_url`/`is_error_url` 不覆盖 `TabState.url`，错误页置 `errored`。刷新语义：错误页 → 重新导航原 URL（`/api/reload` 与工具栏共用 `ui::reload_active_tab`），否则原生 reload；工具栏导航不再静默（未就绪写日志）
+- [x] **元素截图统一行为**（v1.7.0，动 Rust）：`screenshot --selector` 固定为 exists 校验 → `scroll_to_element`（等稳定，未稳定如实带 `stable:false`/`reached:false`）→ **重测 rect** → 完全在视口内走常规 clip / 仍超出视口走**越界路径整块截全**（Windows `captureBeyondViewport:true`；Linux `SnapshotRegion::FullDocument` + cairo 文档坐标裁剪；无尺寸上限）。坐标系实测：**CDP `clip` 恒为文档坐标**（与 `captureBeyondViewport` 取值无关），截图层统一做视口坐标+`scrollX/Y` 换算（顺带修复旧版「滚动页面上元素截图截错区域」隐患，`ui/annotate.rs` 区域截图同受益）。WSLg 实测：Linux `FullDocument` 原点=文档 (0,0)、`Visible` 原点=视口；4 用例（普通/超高 3000px/折下懒加载/错误口径）+ 无 selector 回归两端通过；sticky/fixed 在越界路径只成像一次且两端位置不同（见 `linux-support.md` §4）
 
 ### 关键经验
 - **投递批注取 session id**：`client.session.list()` 是 GET，SDK 会追加 `?directory=<插件客户端目录>`（`@opencode-ai/sdk/dist/client.js` 的 `rewrite`），在真实插件进程里实测可能返回空包络（本项目一次真实 GUI 操作为 `sessions=0`），因此**不可作为唯一来源**；可靠来源是插件钩子：`chat.message`/`tool.execute.before`/`shell.env` 入参 `sessionID`、工具 `context.sessionID`、以及 `Event.properties.sessionID`——注意 `session.created/updated/deleted` 的 id 在 `properties.info.id`（不是 `properties.sessionID`），旧代码读 `event.data.sessionID` 是错的。实现见 `src/session-id.ts`
@@ -39,6 +40,7 @@
 - `eval_with_callback` 自动 JSON 序列化 JS 返回值，表达式直接返回对象（勿双重 stringify）
 - **opencode 宿主对 tool 返回值要求字符串**：命令 `run` 返回对象会让宿主（Bun/JSC）报 `undefined is not an object (evaluating 'c.split')`；结构化结果请 `JSON.stringify` 或自行格式化（截图类返回 image attachment 属例外）
 - **Windows 可访问性树（CDP）**：`Accessibility.getPartialAXTree` 即使 `fetchRelatives=false` 也只返回命中节点自身（其 `parentId` 指向不在结果内的祖先）→ 取"某选择器子树"应改用 `DOM.getDocument`+`DOM.querySelector`+`DOM.describeNode`(取 backendNodeId) 定位命中 AX 节点，再用 `Accessibility.getFullAXTree` 并以该节点为根建树；CDP 会把文本拆成逐字符 `StaticText` + `InlineTextBox`，且 `html`/`body`/无名容器为 ignored → 需丢弃 InlineTextBox、把 StaticText 文本合并进父节点 name、并按"name 值为空"跳过无名 generic（原判据 `name` 字段缺失对 CDP 恒 false）
+- **CDP `Page.captureScreenshot` 的 `clip` 恒为文档坐标**（v1.7.0 实测，`captureBeyondViewport` true/false 均如此）：24px 黄带元素居中于 scrollY≈645 后按视口坐标 (y=302) 传 clip → 截到的是文档 y302..326 的空白区（白图）；按文档坐标 946 传 → 黄带 ✓。因此视口坐标必须 +`scrollX/Y` 再传 CDP；`captureBeyondViewport:false` 只是把截取限制在视口表面（clip 须完全落在可见视口内），`:true` 才能超出视口整块截全（3000px 元素 → 高度=rect.h ✓）
 - release 模式 Tauri GUI 无控制台，HTTP 端口需 `--port` 显式指定 + 轮询就绪
 - 覆盖层 show/hide 控制鼠标拦截（批注模式拦截，普通模式穿透）
 - Windows 必须显式 `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)`，否则窗口被虚拟化缩放与 WebView2 布局错位
