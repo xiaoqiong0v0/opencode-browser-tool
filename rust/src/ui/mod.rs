@@ -319,23 +319,31 @@ fn schedule_after_load(handle: AppHandle, label: String) {
 }
 
 /// 刷新激活标签:处于错误页(errored)时**重新导航原 URL**(而非刷错误页);否则原生 reload。
+/// 返回体带 `url` = 当前激活标签的 TabState.url(最后真实导航 URL,1.6.0 起可信;
+/// 错误页重试路径返回重试的那个原 URL)——供插件刷新输出显示,避免出现 undefined。
 /// 调用方需保证在阻塞线程执行(内部会 eval/navigate)。
 pub fn reload_active_tab(app: &AppHandle) -> Result<serde_json::Value, String> {
     let state = app.state::<UiState>();
     let active = *state.active_tab.lock().unwrap();
     let tab = state.tabs.lock().unwrap().iter().find(|t| t.id == active).cloned();
+    // 最后真实导航 URL(标签不存在或从未导航则为空 → 返回体不带 url,由调用方降级文案)
+    let last_url = tab.as_ref().map(|t| t.url.clone()).unwrap_or_default();
     if let Some(t) = tab {
         if t.errored && !t.url.is_empty() {
             let url = t.url.clone();
             crate::control::navigate(app, &url).map_err(|e| format!("retry navigate failed: {e}"))?;
-            return Ok(serde_json::json!({ "reloaded": true, "retried": url }));
+            return Ok(serde_json::json!({ "reloaded": true, "url": url, "retried": url }));
         }
     }
     active_page_webview(app)
         .ok_or("page webview not ready")?
         .reload()
         .map_err(|e| format!("reload failed: {e}"))?;
-    Ok(serde_json::json!({ "reloaded": true }))
+    let mut out = serde_json::json!({ "reloaded": true });
+    if !last_url.is_empty() {
+        out["url"] = serde_json::Value::String(last_url);
+    }
+    Ok(out)
 }
 
 /// 媒体模拟脚本(注入页面 Webview,覆盖 getUserMedia 实现模拟/真实设备切换)

@@ -101,6 +101,8 @@ const en: LocaleStrings = {
     "cli.out.devtools_open": "Devtools opened",
     "cli.out.devtools_closed": "Devtools closed",
     "cli.out.reload": "Page reloaded: {url}",
+    // Fallback when the backend response carries no url (no last-navigated URL on the tab) — keeps output from showing undefined
+    "cli.out.reload_nourl": "Page reloaded",
     "cli.out.open_window": "Browser window opened",
     "cli.out.close_already": "Browser already closed",
     "cli.out.close_done": "Browser closed",

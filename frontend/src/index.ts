@@ -6,6 +6,10 @@ import { listen } from "@tauri-apps/api/event";
 import type { AnnotationRecord } from "./types";
 import { applyTheme, getTheme, initTheme, saveTheme } from "./theme";
 
+/** 「默认」预设的特殊名(与 Rust `devices::DEFAULT_DEVICE_NAME` 一致;前端写死,
+ *  后端据此恢复默认 UA + 内容区回 1100x628) */
+const DEVICE_DEFAULT_NAME = "__default__";
+
 /** DOM 引用集合 */
 interface PanelDoms {
   btnSend: HTMLButtonElement;
@@ -62,6 +66,7 @@ class Panel {
       });
     });
     // 设备切换(选择后应用预设,并关闭面板显示效果)
+    // 注意:成功/失败都**不重建选项、不重置 value** —— 下拉保持显示当前所选项(含「默认」)
     this.doms.deviceSelect.addEventListener("change", () => {
       const name = this.doms.deviceSelect.value;
       if (!name) return;
@@ -204,22 +209,23 @@ class Panel {
     } catch (e) {
       console.error("[panel] init failed:", e);
     }
-    // 加载设备列表
+    // 加载设备列表(首项「默认」写死,其余项来自 /api/device/list)
     try {
       const r = await this.api("/api/device/list");
       const devices = r.data?.devices || [];
       this.doms.deviceSelect.innerHTML = "";
-      const placeholder = document.createElement("option");
-      placeholder.value = "";
-      placeholder.textContent = "设备预设...";
-      this.doms.deviceSelect.appendChild(placeholder);
+      const def = document.createElement("option");
+      def.value = DEVICE_DEFAULT_NAME;
+      def.textContent = "默认";
+      this.doms.deviceSelect.appendChild(def);
       for (const d of devices) {
         const opt = document.createElement("option");
         opt.value = d.name;
         opt.textContent = `${d.name} (${d.width}x${d.height})`;
         this.doms.deviceSelect.appendChild(opt);
       }
-      // 默认不选中任何设备(placeholder 提示"设备预设...",用户选择后才应用)
+      // 初始选中「默认」(当前无预设 = 默认 UA/默认尺寸);此后 change 只改 value,不重建 → 保持所选
+      this.doms.deviceSelect.value = DEVICE_DEFAULT_NAME;
     } catch (e) {
       console.error("[panel] load devices failed:", e);
     }

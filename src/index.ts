@@ -108,7 +108,7 @@ const COMMANDS: Record<string, CmdDef> = {
     return _t("cli.out.device_applied", { name: r.device, w: r.width, h: r.height, ua: r.ua });
   } },
   devtools: { usage: "[--action]", descKey: "cli.cmd.devtools", args: [{ flag: "action" }], run: async (a) => { const r = await service.devtools({ action: a.action || "toggle" }); return r.open ? _t("cli.out.devtools_open") : _t("cli.out.devtools_closed"); } },
-  reload: { usage: "", descKey: "cli.cmd.reload", run: async () => { const r = await service.reload(); return _t("cli.out.reload", { url: r.url }); } },
+  reload: { usage: "", descKey: "cli.cmd.reload", run: async () => { const r = await service.reload(); return r?.url ? _t("cli.out.reload", { url: r.url }) : _t("cli.out.reload_nourl"); } },
   open_window: { usage: "", descKey: "cli.cmd.open_window", run: async () => { await openWindow(); return _t("cli.out.open_window"); } },
   close: { usage: "", descKey: "cli.cmd.close", run: async () => { if (!isRunning()) return _t("cli.out.close_already"); await service.close(); await stopService(); return _t("cli.out.close_done"); } },
   show_notification: { usage: "--message [--type]", descKey: "cli.cmd.show_notification", args: [{ flag: "message" }, { flag: "type" }], run: async (a) => { await service.notify(a); return _t("cli.out.notify_shown"); } },

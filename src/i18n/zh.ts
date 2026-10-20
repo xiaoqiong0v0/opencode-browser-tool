@@ -101,6 +101,8 @@ const zh: LocaleStrings = {
     "cli.out.devtools_open": "开发者工具已打开",
     "cli.out.devtools_closed": "开发者工具已关闭",
     "cli.out.reload": "页面已刷新: {url}",
+    // 后端返回体无 url(Rust 侧标签无最后导航 URL)时的降级文案,避免输出 undefined
+    "cli.out.reload_nourl": "页面已刷新",
     "cli.out.open_window": "浏览器窗口已打开",
     "cli.out.close_already": "浏览器已关闭",
     "cli.out.close_done": "浏览器已关闭",

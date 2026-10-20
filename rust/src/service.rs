@@ -737,7 +737,8 @@ impl App {
             return Err("userAgent is required".into());
         }
         let handle = self.handle.clone();
-        tokio::task::block_in_place(|| crate::devices::set_user_agent(&handle, &ua))?;
+        // 恢复默认走 /api/device 的特殊名 __default__(此处仅覆盖,保持"非空"校验)
+        tokio::task::block_in_place(|| crate::devices::set_user_agent(&handle, Some(&ua)))?;
         Ok(json!({ "set": true, "ua": ua }))
     }
 
@@ -869,10 +870,12 @@ impl App {
 
     /// 应用设备预设(内容区尺寸 + UA):预设表宽高即内容区(视口)尺寸,
     /// 窗口 = 内容区高 + 工具栏 TOOLBAR_HEIGHT
+    /// 特殊名 `__default__`(devices::DEFAULT_DEVICE_NAME,面板首项「默认」)→ 恢复默认 UA + 内容区回 1100x628
     async fn device(&self, body: &Value) -> Result<Value, String> {
         let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let device = crate::devices::find(&name).ok_or_else(|| format!("unknown device: {name}"))?;
         let handle = self.handle.clone();
+        // apply 内 UA 必被处理(覆盖或恢复),失败直接报错不静默 → ua=(default) 只在真重置后才可能返回
         tokio::task::block_in_place(|| crate::devices::apply(&handle, device))?;
         Ok(json!({
             "device": device.name,
@@ -882,6 +885,8 @@ impl App {
             "content": { "w": device.width, "h": device.height },
             "window": { "w": device.width, "h": device.height + ui::TOOLBAR_HEIGHT },
             "ua": device.ua.unwrap_or("(default)"),
+            // 本次是否把 UA 恢复成默认(桌面预设/「默认」项为 true;覆盖型预设为 false)
+            "uaReset": device.ua.is_none(),
         }))
     }
 

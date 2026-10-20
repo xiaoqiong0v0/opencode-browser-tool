@@ -172,10 +172,13 @@
         <option value="light">浅色</option>
         <option value="dark">深色</option>
       </select>
-      <h3>设备 / 工具</h3>
+      <!-- 分组拆分:设备预设(下拉)与工具(按钮)各占一组,不再挤在一个「设备 / 工具」下 -->
+      <h3>设备预设</h3>
       <select id="device-select">
-        <option value="">加载设备列表...</option>
+        <!-- 首项「默认」(value=特殊名,与 Rust devices::DEFAULT_DEVICE_NAME 一致);设备列表由 JS 追加 -->
+        <option value="__default__">默认</option>
       </select>
+      <h3>工具</h3>
       <div class="row">
         <button id="btn-devtools"><i data-lucide="wrench"></i>开发者工具</button>
       </div>
