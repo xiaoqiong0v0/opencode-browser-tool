@@ -4,6 +4,7 @@ import { existsSync } from "fs";
 import { fileURLToPath } from "url";
 import { log } from "./logger.js";
 import { getNotifyUrl } from "./notify-server.js";
+import { tf } from "./i18n/index.js";
 
 import { cachedBinaryPath, describeBinaryStatus, ensureBinary } from "./binary.js";
 
@@ -117,7 +118,7 @@ export async function ensureService(): Promise<void> {
   } else {
     // 启动模式:懒启动本地 shell
     const cfg = serviceConfig;
-    if (!cfg) throw new Error("Service not configured");
+    if (!cfg) throw new Error(tf("client.not_configured"));
     starting = startService(cfg.nodePath, cfg.browsersPath, cfg.sessionIsolation, cfg.browserType, cfg.userDataDir).finally(() => {
       starting = null;
     });
@@ -159,7 +160,7 @@ async function callApi(path: string, body?: any, sessionId?: string): Promise<an
     body: JSON.stringify(payload),
   });
   const json = await res.json();
-  if (!json.success) throw new Error(json.error || "Service error");
+  if (!json.success) throw new Error(json.error || tf("client.service_error"));
   return json.data;
 }
 
@@ -186,10 +187,7 @@ async function waitForReady(baseUrl: string, timeoutMessage: string): Promise<vo
 async function attachToService(baseUrl: string): Promise<void> {
   attachMode = true;
   log.info(`Attaching to existing bt-shell at ${baseUrl} (no spawn)`);
-  await waitForReady(
-    baseUrl,
-    `External bt-shell not ready at ${baseUrl}. Check BT_SHELL_URL/BT_SHELL_PORT and that the shell is running.`,
-  );
+  await waitForReady(baseUrl, tf("client.attach_timeout", { url: baseUrl }));
   serviceBaseUrl = baseUrl;
   serviceReady = true;
   log.info(`Attached to existing bt-shell at ${baseUrl}`);
@@ -208,7 +206,8 @@ export async function startService(
   // 未就绪:先(有界)等待下载完成;失败/超时给出明确提示
   if (!existsSync(shell)) {
     if (process.env.BT_SHELL_PATH) {
-      throw new Error(`BT_SHELL_PATH 指向的二进制不存在：${shell}`);
+      // 只提示环境变量名,不回流绝对路径(路径已在插件日志)
+      throw new Error(tf("client.bt_shell_path_missing"));
     }
     const st = await ensureBinary(20000);
     if (st.state !== "ready" || !st.path) {
@@ -228,7 +227,14 @@ export async function startService(
   // 推送式投递:把插件本地通知地址传给 shell(亦可用 BT_SHELL_NOTIFY_URL;附着模式用 /api/notify-url 注册)
   const notifyUrl = getNotifyUrl();
   if (notifyUrl) args.push("--notify-url", notifyUrl);
-  serviceProcess = spawn(shell, args, { stdio: ["ignore", "pipe", "pipe"] });
+  let serviceProcess;
+  try {
+    serviceProcess = spawn(shell, args, { stdio: ["ignore", "pipe", "pipe"] });
+  } catch (e) {
+    // spawn 同步失败(如文件被锁):换不含路径的文案,避免绝对路径经错误消息回流模型
+    log.error(`spawn bt-shell failed: ${(e as Error).message}`, e as Error);
+    throw new Error(tf("client.spawn_failed"));
+  }
   // 把 shell 的 stdout/stderr 转发进共享日志:Rust 侧 println!/eprintln! 默认被管道吞掉(无人读取 → 日志永远看不到)
   const forwardShell = (tag: string) => (chunk: Buffer) => {
     for (const line of chunk.toString().split(/\r?\n/)) {
@@ -239,9 +245,9 @@ export async function startService(
   serviceProcess.stdout?.on("data", forwardShell("[shell:out]"));
   serviceProcess.stderr?.on("data", forwardShell("[shell:err]"));
 
-  // 等待服务就绪(轮询端口)
+  // 等待服务就绪(轮询端口);超时文案无构建指令/无路径(旧版含"去构建二进制"的指令,会误导模型自行编译)
   const baseUrl = `http://127.0.0.1:${port}`;
-  await waitForReady(baseUrl, "Service timeout: bt-shell did not start. Build it with: cd rust && cargo build --release");
+  await waitForReady(baseUrl, tf("client.service_timeout"));
   serviceBaseUrl = baseUrl;
   serviceReady = true;
   log.info(`Shell service ready on port ${port} (${shell})`);

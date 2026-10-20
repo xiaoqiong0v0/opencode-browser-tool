@@ -36,6 +36,7 @@ import {
 import { dirname, resolve } from "path";
 import { fileURLToPath, pathToFileURL } from "url";
 import { getPluginDataDir } from "./config/index.js";
+import { tf } from "./i18n/index.js";
 import { log } from "./logger.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -215,21 +216,26 @@ export async function ensureBinary(timeoutMs = 20000): Promise<BinaryStatus> {
   return getBinaryStatus();
 }
 
-/** 就绪状态的可读提示文案(供工具在未就绪时返回) */
+/**
+ * 就绪状态的可读提示文案(供工具在未就绪时返回)
+ * 约定:输出**不含任何本机绝对路径**(路径只进插件日志,不回流模型上下文)
+ */
 export function describeBinaryStatus(s: BinaryStatus): string {
   switch (s.state) {
     case "ready":
-      return s.path ?? "ready";
+      // 只报就绪态;不返回路径(旧版 return s.path 会把绝对 exe 路径回给模型)
+      return tf("bin.ready");
     case "downloading":
-      return `bt-shell 正在下载（${s.progress ?? 0}%）… 稍后重试`;
+      return tf("bin.downloading", { progress: s.progress ?? 0 });
     case "failed":
-      return `bt-shell 下载失败：${s.reason ?? "未知原因"}；可用 BT_SHELL_DOWNLOAD_BASE 换源、或 BT_SHELL_PATH 手动指定二进制`;
+      return tf("bin.failed", { reason: s.reason ?? "unknown" });
     case "disabled":
-      return `bt-shell 自动下载已禁用（BT_SHELL_NO_DOWNLOAD=1）；请用 BT_SHELL_PATH 指定二进制，或把它放到 ${s.path ?? cachedBinaryPath()}`;
+      // 不拼绝对路径(旧版含 s.path ?? cachedBinaryPath());只指环境变量,期望路径见插件日志
+      return tf("bin.disabled");
     case "unsupported":
-      return `bt-shell 暂不支持当前平台：${s.reason ?? `${process.platform}/${process.arch}`}`;
+      return tf("bin.unsupported", { reason: s.reason ?? `${process.platform}/${process.arch}` });
     default:
-      return "bt-shell 尚未就绪，请稍后重试";
+      return tf("bin.not_ready");
   }
 }
 
@@ -524,7 +530,7 @@ async function fetchText(url: string): Promise<string> {
 
 function curlText(url: string): string {
   const r = spawnSync("curl", ["-sL", "--fail", url], { encoding: "utf-8", maxBuffer: 8 * 1024 * 1024 });
-  if (r.status !== 0) throw new Error(`curl exit ${r.status}: ${(r.stderr || "").trim() || "获取失败"}`);
+  if (r.status !== 0) throw new Error(`curl exit ${r.status}: ${(r.stderr || "").trim() || "fetch failed"}`);
   return r.stdout || "";
 }
 
@@ -606,7 +612,7 @@ function notFoundHint(tag: string, e: unknown): string {
   const m = errMsg(e).toLowerCase();
   const notFound = m.includes("404") || m.includes("curl exit 22") || m.includes("not found");
   if (!notFound) return "";
-  return `未找到该版本对应的 Release 资产（tag=${tag}）；若这是纯插件改动请确认二进制产物仍在 x.Y.0 的 Release 中，若动了 Rust 需先升中间版本号并新开/更新对应 Release`;
+  return tf("bin.release_not_found", { tag });
 }
 
 function sleep(ms: number): Promise<void> {
