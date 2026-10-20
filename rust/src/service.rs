@@ -639,19 +639,32 @@ impl App {
         }))
     }
 
+    /// 调整页面内容区尺寸(视口语义):width/height 指内容区(视口),窗口高 = 内容高 + 工具栏 72px
+    /// 内容区下限 360x360,低于下限被钳制并在返回里如实标 clamped(模型可见)
     async fn resize(&self, body: &Value) -> Result<Value, String> {
         let w = body.get("width").and_then(|v| v.as_i64()).unwrap_or(0) as f64;
         let h = body.get("height").and_then(|v| v.as_i64()).unwrap_or(0) as f64;
+        // 内容区尺寸 clamp 到下限(逻辑像素)
+        let cw = w.max(ui::CONTENT_MIN_SIZE);
+        let ch = h.max(ui::CONTENT_MIN_SIZE);
+        let clamped = cw != w || ch != h;
+        let win_h = ch + ui::TOOLBAR_HEIGHT;
         let handle = self.handle.clone();
         tokio::task::block_in_place(|| {
             let win = ui::active_page_webview(&handle)
                 .ok_or("page webview not ready")?
                 .window_ref()
                 .clone();
-            win.set_size(tauri::LogicalSize::new(w, h))
+            // 窗口 = 内容区宽 x (内容区高 + 工具栏高);set_size 触发 Resized → apply_layout 重排
+            win.set_size(tauri::LogicalSize::new(cw, win_h))
                 .map_err(|e| format!("resize failed: {e}"))
         })?;
-        Ok(json!({ "resized": true }))
+        Ok(json!({
+            "resized": true,
+            "content": { "w": cw, "h": ch },
+            "window": { "w": cw, "h": win_h },
+            "clamped": clamped,
+        }))
     }
 
     /// 读取页面控制台日志(由页面桥 __btLogs 捕获,元素形如 {level,msg})
@@ -854,7 +867,8 @@ impl App {
 
     // ---- 批注状态机端点 ----
 
-    /// 应用设备预设(窗口尺寸 + UA)
+    /// 应用设备预设(内容区尺寸 + UA):预设表宽高即内容区(视口)尺寸,
+    /// 窗口 = 内容区高 + 工具栏 TOOLBAR_HEIGHT
     async fn device(&self, body: &Value) -> Result<Value, String> {
         let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let device = crate::devices::find(&name).ok_or_else(|| format!("unknown device: {name}"))?;
@@ -862,8 +876,11 @@ impl App {
         tokio::task::block_in_place(|| crate::devices::apply(&handle, device))?;
         Ok(json!({
             "device": device.name,
+            // width/height 保持字段名不变,语义改为内容区(视口)尺寸(与预设表一致)
             "width": device.width,
             "height": device.height,
+            "content": { "w": device.width, "h": device.height },
+            "window": { "w": device.width, "h": device.height + ui::TOOLBAR_HEIGHT },
             "ua": device.ua.unwrap_or("(default)"),
         }))
     }

@@ -1,11 +1,11 @@
-//! 设备预设:内置常用设备模式(窗口尺寸 + User-Agent)
-//! 应用时:窗口 set_size 触发 Resized → ui::apply_layout 自动重排
+//! 设备预设:内置常用设备模式(**内容区(视口)尺寸** + User-Agent)
+//! 应用时:窗口 set_size(内容区高 + 工具栏) 触发 Resized → ui::apply_layout 自动重排
 //! UA 运行时修改:Windows 用 ICoreWebView2Settings2.SetUserAgent,Linux 用 WebKitSettings.set_user_agent,其他平台返回错误
 use tauri::{AppHandle, LogicalSize};
 
 use crate::ui;
 
-/// 设备预设(名称唯一)
+/// 设备预设(名称唯一);width/height 为**内容区(视口)**尺寸(逻辑像素)
 pub struct Device {
     pub name: &'static str,
     pub width: f64,
@@ -13,7 +13,7 @@ pub struct Device {
     pub ua: Option<&'static str>,
 }
 
-/// 内置设备预设表(首项 desktop-720p 为默认设备)
+/// 内置设备预设表(首项 desktop-720p 为默认设备);宽高即内容区(视口)尺寸
 pub const DEVICES: &[Device] = &[
     Device { name: "desktop-720p", width: 1024.0, height: 720.0, ua: None },
     Device { name: "desktop-1080p", width: 1920.0, height: 1080.0, ua: None },
@@ -36,14 +36,15 @@ pub fn find(name: &str) -> Option<&'static Device> {
     DEVICES.iter().find(|d| d.name == name)
 }
 
-/// 应用设备预设:设置窗口尺寸(逻辑像素) + 运行时修改 UA
+/// 应用设备预设:设置窗口尺寸(**内容区高 + 工具栏**,逻辑像素) + 运行时修改 UA
 pub fn apply(app: &AppHandle, device: &Device) -> Result<(), String> {
-    // 窗口尺寸(逻辑像素,set_size 自动换算物理尺寸并触发 Resized 重排)
+    // 窗口 = 内容区宽 x (内容区高 + 工具栏高);set_size 自动换算物理尺寸并触发 Resized 重排
     let win = ui::active_page_webview(app)
         .ok_or("page webview not ready")?
         .window_ref()
         .clone();
-    win.set_size(LogicalSize::new(device.width, device.height))
+    let win_h = device.height + ui::TOOLBAR_HEIGHT;
+    win.set_size(LogicalSize::new(device.width, win_h))
         .map_err(|e| format!("set window size failed: {e}"))?;
 
     // 运行时修改 UA(仅 Windows)

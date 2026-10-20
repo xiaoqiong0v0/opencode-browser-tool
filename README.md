@@ -139,8 +139,8 @@ opencode（Bun）
 | `bt_console_logs` | `type`(string), `search`(string), `limit`(number), `clear`(boolean) | 读取页面控制台日志 |
 | `bt_go_back` | 无 | 浏览器后退，返回当前 URL |
 | `bt_go_forward` | 无 | 浏览器前进，返回当前 URL |
-| `bt_resize` | `width`, `height`(number) 必填 | 调整窗口尺寸（逻辑像素） |
-| `bt_set_device` | `name`(string) 可选 | 应用设备预设（空参数列出 13 种预设） |
+| `bt_resize` | `width`, `height`(number) 必填 | 调整**页面内容区（视口）**尺寸（非 OS 窗口；下限 360×360，低于下限被钳制并在返回标 `clamped`） |
+| `bt_set_device` | `name`(string) 可选 | 应用设备预设（空参数列出 13 种预设；**预设尺寸为内容区（视口）尺寸**） |
 | `bt_devtools` | `action`(string)：`toggle`/`open`/`close` | 开关开发者工具 |
 | `bt_reload` | 无 | 刷新当前页面；若当前为错误页则**重新导航原 URL**（返回 `retried`） |
 | `bt_close` | 无 | 退出浏览器外壳 |
@@ -193,9 +193,14 @@ opencode（Bun）
 - Linux（含 WSLg）截图路径已实测通过（见 `docs/implementation.md`）；**真实 Linux 桌面（GNOME/KDE）仍待复验**
 - 折下懒加载图（`loading=lazy`）经 cache-bust 实测：滚动前 `complete=false`，自动滚动后加载完成、截图内容非空白
 
-## 设备预设
+## 设备预设 / 尺寸语义
 
-内置 13 种设备预设（窗口尺寸 + User-Agent），可通过 `bt_set_device` 或右侧面板下拉框一键切换：
+> ⚠️ **行为变更（v1.8.0）**：`bt_resize` 与 `bt_set_device` 的宽高一律指**页面内容区（视口）**尺寸，不再是 OS 窗口尺寸。窗口高 = 内容区高 + 工具栏 72px。**旧脚本若按窗口尺寸理解，高度会偏 72px**。API 返回同时给出 `content` 与 `window` 两组尺寸便于核对。
+
+- **内容区下限 360×360**：`bt_resize` 低于下限会被钳制，返回 `clamped:true`（工具输出也标注）；窗口 `min_inner_size` 同步为 360×432（= 360 内容高 + 72 工具栏）
+- **窄模式（窗口逻辑宽 < 480）**：面板改为**填满整个窗口**（覆盖式，x=0；页面 webview 保持全宽在下层，关闭面板即见完整页面）；工具栏的批注/截图/面板三按钮**去文字只留图标**（媒体查询 `@media (max-width: 479px)`，与 Rust `ui::NARROW_MODE_MAX_W=480` 同步维护）。手机类预设（360~412 宽）天然落入窄模式，避免按钮溢出
+
+内置 13 种设备预设（**内容区尺寸** + User-Agent），可通过 `bt_set_device` 或右侧面板下拉框一键切换：
 
 | 分类 | 预设 |
 |------|------|

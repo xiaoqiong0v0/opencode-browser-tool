@@ -7,6 +7,8 @@ dist/
 .pw-browsers/
 .opencode/
 rust/target/
+# 备用构建目录(默认 target 被运行中 shell 锁定时用 CARGO_TARGET_DIR=rust/target-v<版本>)
+rust/target-*/
 
 
 rust/gen/

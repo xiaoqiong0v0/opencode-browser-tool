@@ -29,6 +29,11 @@ pub const TOOLBAR_WEBVIEW: &str = "toolbar";
 pub const PANEL_WIDTH: f64 = 280.0;
 /// 顶部工具栏高度(逻辑像素,两行:标签行 + 地址栏行)
 pub const TOOLBAR_HEIGHT: f64 = 72.0;
+/// 内容区(视口)最小尺寸(逻辑像素):`resize` clamp 下限,与窗口 min_inner_size 的内容区口径一致
+pub const CONTENT_MIN_SIZE: f64 = 360.0;
+/// 窄模式阈值(窗口**逻辑**宽 < 此值):面板填满窗口 + 工具栏批注/截图/面板按钮图标化
+/// (前端 `frontend/src/toolbar.html` 的 `@media (max-width: 479px)` 与此常量同步维护)
+pub const NARROW_MODE_MAX_W: f64 = 480.0;
 
 /// 标签页状态
 #[derive(Debug, Clone, Serialize)]
@@ -712,12 +717,12 @@ pub fn create_ui(app: &AppHandle, service_port: u16) -> tauri::Result<()> {
     // 用户数据目录(多用户配置):所有 webview 共用同一目录 → 共享同一用户配置
     let data_dir = app.state::<UiState>().user_data_dir.lock().unwrap().clone();
     // 主窗口(逻辑 1100x700:150% DPI 下物理 1650x1050,适配常见 1920x1080 屏幕)
-    // 最小尺寸 500x400(逻辑像素),防止窗口拖到过小导致布局崩溃
+    // 最小尺寸 = 内容区下限 CONTENT_MIN_SIZE + 工具栏高(逻辑像素),防止窗口拖到过小导致布局崩溃
     // 背景深色避免启动时白屏闪烁
     let window = WindowBuilder::new(app, "main")
         .title("bt-shell")
         .inner_size(1100.0, 700.0)
-        .min_inner_size(500.0, 400.0)
+        .min_inner_size(CONTENT_MIN_SIZE, CONTENT_MIN_SIZE + TOOLBAR_HEIGHT)
         .background_color(tauri::window::Color(20, 20, 20, 255))
         // 无系统标题栏(窗口控制按钮移到工具栏标签行右侧,布局更紧凑)
         .decorations(false)
@@ -888,7 +893,7 @@ fn set_webview_bounds(app: &AppHandle, label: &str, x: i32, y: i32, w: i32, h: i
 
 /// 重排 webview 的边界
 /// 工具栏占顶部固定高度;所有页面 Webview(每标签一个)占工具栏下方全宽;
-/// 覆盖层叠加在页面区;面板为右侧覆盖式浮层(关闭时尺寸归零)
+/// 覆盖层叠加在页面区;面板为覆盖式浮层(常规模式右侧 280,窄模式填满整个窗口;关闭时尺寸归零)
 /// size 为窗口物理内尺寸,scale 为窗口缩放因子
 /// size/scale 仅在 Windows 与 Linux 回退路径使用;Linux 正常路径改用 GTK 逻辑尺寸(见下)
 pub fn apply_layout(app: &AppHandle, size: tauri::PhysicalSize<u32>, scale: f64) -> tauri::Result<()> {
@@ -905,7 +910,15 @@ pub fn apply_layout(app: &AppHandle, size: tauri::PhysicalSize<u32>, scale: f64)
     let (win_w, win_h, layout_scale) = (size.width as i32, size.height as i32, scale);
 
     let toolbar_h = (TOOLBAR_HEIGHT * layout_scale) as i32;
-    let panel_w = (PANEL_WIDTH * layout_scale) as i32;
+    // 窄模式判定用**逻辑**宽(Windows 的 win_w 是物理像素 = 逻辑宽 x scale;Linux 路径 layout_scale=1,win_w 即逻辑宽)
+    let win_w_logical = win_w as f64 / layout_scale;
+    // 面板宽:窄模式(逻辑宽 < NARROW_MODE_MAX_W)填满整个窗口(面板 x = win_w - panel_w = 0),
+    // 常规模式维持右侧 PANEL_WIDTH;页面 webview 始终保持 win_w 全宽在下层(关闭面板即见页面)
+    let panel_w = if win_w_logical < NARROW_MODE_MAX_W {
+        win_w
+    } else {
+        (PANEL_WIDTH * layout_scale) as i32
+    };
     let page_w = win_w;
     let page_h = win_h - toolbar_h;
 
@@ -930,7 +943,8 @@ pub fn apply_layout(app: &AppHandle, size: tauri::PhysicalSize<u32>, scale: f64)
     // 3. 覆盖层 Webview(透明,叠加在页面区)
     set_webview_bounds(app, OVERLAY_WEBVIEW, 0, toolbar_h.max(0), page_w.max(0), page_h.max(0))?;
 
-    // 4. 面板 Webview(右侧覆盖浮层,panel_open 关闭时尺寸归零隐藏)
+    // 4. 面板 Webview(覆盖浮层:常规模式右侧 280;窄模式 x=0 填满整个窗口;panel_open 关闭时尺寸归零)
+    //    页面 webview 不随之缩窄(page_w 保持全宽),关闭面板直接露出完整页面
     {
         let open = app.state::<UiState>().panel_open.lock().unwrap().clone();
         let (px, pw) = if open {

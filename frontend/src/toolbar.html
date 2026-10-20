@@ -132,6 +132,11 @@
       .tool-btn svg { width: 14px; height: 14px; }
       .tool-btn:hover { background: var(--btn-hover); }
       .tool-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+      /* 窄模式(工具栏 webview 宽=窗口逻辑宽):批注/截图/面板按钮去文字只留图标,避免 nav-row 溢出。
+         阈值与 Rust `ui::NARROW_MODE_MAX_W`(480) 同步维护:Rust 侧 win_w < 480 → 面板填满 + 本媒体查询生效 */
+      @media (max-width: 479px) {
+        .btn-label { display: none; }
+      }
       /* lucide 图标尺寸:对齐各按钮原有符号的视觉大小,颜色随 currentColor 继承 */
       .win-btn svg { width: 12px; height: 12px; }
       .fold-btn svg { width: 14px; height: 14px; }
@@ -160,9 +165,10 @@
       <div id="btn-forward" class="nav-btn" title="前进"><i data-lucide="arrow-right"></i></div>
       <div id="btn-reload" class="nav-btn" title="刷新"><i data-lucide="rotate-cw"></i></div>
       <input id="addr" placeholder="输入地址，回车导航" spellcheck="false" />
-      <button id="btn-annotate" class="tool-btn" title="批注模式(点击元素标注)"><i data-lucide="pen-line"></i>批注</button>
-      <button id="btn-shot" class="tool-btn" title="立即截图"><i data-lucide="camera"></i>截图</button>
-      <button id="btn-panel" title="功能面板"><i data-lucide="settings"></i>面板</button>
+      <!-- 批注/截图/面板:文字包 span.btn-label(窄模式媒体查询隐藏;裸文本节点无法用 CSS 隐藏) -->
+      <button id="btn-annotate" class="tool-btn" title="批注模式(点击元素标注)"><i data-lucide="pen-line"></i><span class="btn-label">批注</span></button>
+      <button id="btn-shot" class="tool-btn" title="立即截图"><i data-lucide="camera"></i><span class="btn-label">截图</span></button>
+      <button id="btn-panel" title="功能面板"><i data-lucide="settings"></i><span class="btn-label">面板</span></button>
     </div>
     <script src="toolbar.js"></script>
   </body>

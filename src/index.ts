@@ -87,14 +87,19 @@ const COMMANDS: Record<string, CmdDef> = {
   console_logs: { usage: "[--type --search --limit --clear]", descKey: "cli.cmd.console_logs", args: [{ flag: "type" }, { flag: "search" }, { flag: "limit" }, { flag: "clear", type: "boolean" }], run: async (a) => { const r = await service.consoleLogs(a); return (r.logs || []).join("\n") || "(no logs)"; } },
   go_back: { usage: "", descKey: "cli.cmd.go_back", run: async () => { const r = await service.goBack(); return `Went back, current URL: ${r.url}` + readyNote(r); } },
   go_forward: { usage: "", descKey: "cli.cmd.go_forward", run: async () => { const r = await service.goForward(); return `Went forward, current URL: ${r.url}` + readyNote(r); } },
-  resize: { usage: "--width --height", descKey: "cli.cmd.resize", args: [{ flag: "width" }, { flag: "height" }], run: async (a) => { await service.resize(a); return "Resized"; } },
+  // resize:宽高=内容区(视口)尺寸;被钳到下限时如实标注(服务端返回 clamped/content/window)
+  resize: { usage: "--width --height", descKey: "cli.cmd.resize", args: [{ flag: "width" }, { flag: "height" }], run: async (a) => {
+    const r = await service.resize(a);
+    const c = r.content || {};
+    return `Resized content to ${c.w}x${c.h}` + (r.clamped ? ` (clamped to 360x360 minimum)` : "");
+  } },
   set_device: { usage: "[--name]", descKey: "cli.cmd.set_device", args: [{ flag: "name" }], run: async (a) => {
     if (!a.name) {
       const list = await service.deviceList();
       return ["Available device presets:", "", ...(list.devices || []).map((d: any) => `  ${d.name}  ${d.width}x${d.height}${d.ua ? `  ${d.ua.slice(0, 60)}...` : "  (default UA)"}`)].join("\n");
     }
     const r = await service.device({ name: a.name });
-    return `Device preset applied: ${r.device} (${r.width}x${r.height})\nUser-Agent: ${r.ua}`;
+    return `Device preset applied: ${r.device} (${r.width}x${r.height} content)\nUser-Agent: ${r.ua}`;
   } },
   devtools: { usage: "[--action]", descKey: "cli.cmd.devtools", args: [{ flag: "action" }], run: async (a) => { const r = await service.devtools({ action: a.action || "toggle" }); return r.open ? "Devtools opened" : "Devtools closed"; } },
   reload: { usage: "", descKey: "cli.cmd.reload", run: async () => { const r = await service.reload(); return `Page reloaded: ${r.url}`; } },
