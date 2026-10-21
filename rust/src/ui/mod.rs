@@ -727,14 +727,15 @@ fn with_data_dir<R: Runtime>(builder: WebviewBuilder<R>, dir: &Option<String>) -
 
 /// 创建主窗口 + 四 Webview(工具栏/页面/覆盖层/面板)
 /// 布局以窗口实际物理尺寸为准(避免 DPI 感知时序导致窗口与子 webview 缩放不一致)
-pub fn create_ui(app: &AppHandle, service_port: u16) -> tauri::Result<()> {
+/// `title`:可选窗口标题覆盖(默认 "bt-shell";多会话实例用它在任务栏分辨)
+pub fn create_ui(app: &AppHandle, service_port: u16, title: Option<&str>) -> tauri::Result<()> {
     // 用户数据目录(多用户配置):所有 webview 共用同一目录 → 共享同一用户配置
     let data_dir = app.state::<UiState>().user_data_dir.lock().unwrap().clone();
     // 主窗口(逻辑 1100x700:150% DPI 下物理 1650x1050,适配常见 1920x1080 屏幕)
     // 最小尺寸 = 内容区下限 CONTENT_MIN_SIZE + 工具栏高(逻辑像素),防止窗口拖到过小导致布局崩溃
     // 背景深色避免启动时白屏闪烁
     let window = WindowBuilder::new(app, "main")
-        .title("bt-shell")
+        .title(title.unwrap_or("bt-shell"))
         .inner_size(1100.0, 700.0)
         .min_inner_size(CONTENT_MIN_SIZE, CONTENT_MIN_SIZE + TOOLBAR_HEIGHT)
         .background_color(tauri::window::Color(20, 20, 20, 255))

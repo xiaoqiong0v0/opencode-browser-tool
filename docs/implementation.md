@@ -55,6 +55,59 @@
 - **二进制分发/下载（`src/binary.ts`）**：首次使用后台从 GitHub Release 下载到 `~/.opencode/plugins-data/opencode-browser-tool/<triple>/bt-shell[.exe]`（**固定路径就地覆盖**，不按插件版本建目录；旁文件 `bt-shell.version.json` 记录来源 `tag/asset/sha256/size/downloadedAt/sourceUrl`，避免按版本累积与"二进制没变却因插件升版重下"）；**幂等**（已存在且 sha256 与当前插件版本对应 release 的 `SHA256SUMS` 一致即跳过，**每次都拉 SHA256SUMS 校验、取不到即失败**）、**原子**（下到 `<target>.part`，校验通过后 `rename` 替换）、**并发**（同进程共享 Promise；跨进程 `<target>.lock` 原子创建、陈旧锁可接管、抢不到则等待复用）、**有界**（`ensureBinary(timeoutMs)` 不无限等待）；下载优先用系统 `curl`（自动遵循 `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY`），无 curl 时回退 Node `fetch`；启动时清理旧布局版本目录（`<pluginDataDir>/<x.y.z>/`，dry-run 列清单，可按 sha 移动合法资产省一次下载）。二进制解析优先级（`src/client.ts` 的 `resolveShellBinary`，选中的路径与来源会记入日志 `Shell binary: <path> (source=env|local-dev|cargo-target-dir|download-cache)`）：`BT_SHELL_PATH` → **opencode 应用目录**（`PluginInput.directory` / 工具 `context.directory`）下的 `rust/target/release`、`target/release`、`../rust/target/release`（含 debug）→ 源码树 `<install>/../rust/...` → `CARGO_TARGET_DIR` → `<install>/bin/...` → 下载缓存。**动机**：用 `.tmp/publish-local.ps1` 覆盖到 `~/.cache/opencode/packages/...` 后，插件 dist 的相对路径不再指向仓库，必须靠 opencode 传入的 directory 才能命中本地 Rust 构建（否则会错误地回落下载缓存）。**版本策略**：二进制产物只挂 `x.Y.0` 的 Release（动 Rust 升 minor 并发新 exe；纯插件改动只升 patch、复用同一二进制），插件由自身版本推导二进制 tag（`binaryReleaseVersion`：patch 归 0、忽略预发布/构建后缀，如 `1.2.1→1.2.0`、`1.3.0-beta.1→1.3.0`）；`BT_SHELL_VERSION` 表示显式二进制发布版本（形如 `1.2.0`）、原样使用不推导；旁文件同时记 `tag`（推导后）与 `pluginVersion`（插件自身版本）
 - **插件持有 exe 文件锁 → 部署新二进制必须先退出 opencode**：opencode 启动时 spawn `rust/target/release/bt-shell.exe`，运行期间该文件被锁，此时 `cargo build --release` 会在最后一步报 `failed to remove file ... (os error 5)`（编译已完成，只是拷贝被拒），**磁盘上的产物不可信任**。部署顺序：退出 opencode（确认 shell 也已退出）→ 在 `rust/` 执行 `cargo build --release` → 重新启动 opencode（插件用它拉起 shell）；构建失败后不要依赖旧产物，退出 opencode 后重跑构建。同理，插件 TS（`dist/`）的改动也需要重启 opencode 才会生效
 
+## 会话隔离架构(1.9.0,用户开发规范)
+
+**规范来源**:用户开发规范「每个 opencode 会话持有自己的 bt-shell 实例」。1.9.0 批次 5 落地;此前(≤1.8.x)是「一 opencode 进程 = 一个共享 shell」,并发会话共用窗口/标签/UA/批注,互相踩(审计见 `.tmp/scratch/isolation-audit.md`)。
+
+### 实例注册表
+
+- **数据结构**:`Map<sid, ShellInstance>`(`src/client.ts:108`);`ShellInstance`(`client.ts:89`)持有 `sid / proc / baseUrl / port / dataDir / title / ready / attach`。启动中的会话另存 `Map<sid, Promise>` 做并发保护(`client.ts:110`),同一 sid 多个工具同时调用只 spawn 一次。
+- **sid 来源**(`resolveSessionId`,`client.ts:157`):工具调用的显式 `_sessionId` → 请求体 `_sessionId` → 钩子缓存兜底(`setSessionIdResolver`,`client.ts:139`;`index.ts:306` 指向 `sessionCache.get()`)→ `"default"` 桶。`index.ts` 的 `sidOf`/`sidArgs`(`index.ts:26,31`)把每条命令的 sid 塞进请求体。
+- **路由**:`callApi`(`client.ts:527`)按 sid `ensureInstance` 后打到该实例的 `baseUrl`;**旧的模块级单例(`serviceProcess/serviceReady/serviceBaseUrl`)已删除**。
+
+### 数据目录
+
+- 每会话独立 WebView2 profile:`getSessionDataDir(sid)` = `<cacheDir>/sessions/<profile>/<sid>`(`config/index.ts:75`)→ 传给该实例的 `--user-data-dir`,cookie/localStorage/缓存全隔离。实测目录内出现 `EBWebView` 即 WebView2 真实在用。
+- 会话临时产物(截图落盘)走 `getSessionTmpDir(sid)` = `<...>/<sid>/tmp`(`config/index.ts:80`,`index.ts:475`),不再共享全局 `tmp/`。
+- **路径取舍**:需求字面为 `sessions/<sid>`;实现多一层 `<profile>` 是为了保住 `profile --set` 的语义(见下)。要严格字面路径,去掉 `getSessionsDir` 里的 profile 段即可。
+
+### 生命周期
+
+- **懒启动**:`ensureInstance(sid)`(`client.ts:365`)在首次工具调用时 spawn;**端口重试**(`client.ts:309-343`,上限 `PORT_START_ATTEMPTS=5`,`client.ts:24`):启动超时(常见于端口被占 → bind 失败)则只杀掉**本次刚 spawn 的**子进程、换随机端口重来,5 次全失败才报错。实测占住 18000-18200 共 201 端口后仍成功落在 18766。
+- **关闭**:`closeSession(sid)`(`client.ts:432`)= `/api/close` 优雅 → `terminateOwnProcess`(`client.ts:255`)等退出(有界 5s)→ 超时才 SIGTERM。**只按注册表里的句柄/PID,绝不按名杀**;实例不存在直接返回(**绝不因 close 而 spawn**)。
+- **会话删除**:`session.deleted` 事件 → 清钩子缓存 + `closeSession(delId)`(`index.ts:326-334`)。语义升级为「回收该会话的浏览器」,但仍是「没有实例就不动进程」。
+- **插件卸载**:`dispose` 钩子 → `closeAllSessions()`(`client.ts:460`,`index.ts:420`)。
+- **未做**(可选后续):idle TTL 回收(会话长时间无操作后自动关浏览器)。
+
+### 投递归属
+
+- 每个 shell 实例注册**自己**的 `--notify-url` = `<插件监听端口>/notify/<sid>`(`notify-server.ts:62`,`client.ts:316`)。
+- 通知到达 → `notify-server` 从 URL 提取 sid(`notify-server.ts:27`)→ 只 drain **该会话**(`index.ts:497` → `drainAnnotate(sid)`,`index.ts:505`)。彻底取代旧的「最后活跃会话」(last-writer-wins)。
+- 实例就绪回调同样带 sid(`setServiceReadyHandler`,`client.ts:144`;`index.ts:493`)。
+
+### 窗口标题
+
+- spawn 时传 `--title "bt-shell · <会话标识>"`;Rust `main.rs:53` 解析、`ui/mod.rs:738` 应用(`title.unwrap_or("bt-shell")`),任务栏可分辨多实例。
+- 标识优先用会话标题(`setTitleResolver`,`client.ts:144`;`index.ts:308` 经 `client.session.get`,**250ms 有界超时**,拿不到回退 sid 后 6 位),不阻塞启动。
+- `/api/title`(`service.rs:157,234`)返回主窗口标题,供自验/诊断。
+
+### 附着模式边界
+
+- `BT_SHELL_URL`/`BT_SHELL_PORT` 存在时(`client.ts` `resolveAttachBaseUrl`)→ 连接外部单例,**所有 sid 共用、不 spawn、不 kill、放弃会话隔离**(`attachInstance`,`client.ts:112`)。假地址时明确报错且列表为空(自验已测)。
+
+### 死参数清理
+
+- 插件不再透传 `--browser` / `--session-isolation`(Rust `main.rs` 本就不解析);`PluginConfig` 移除 `browserType`/`sessionIsolation`(`config/index.ts:10`)。旧配置文件里若仍写着这两项,`applyConfigFile` 自然忽略(`config/index.ts:146`)。
+- **每会话独立实例现在是唯一行为**,不存在「开关」。
+
+### profile 作用域变更
+
+- `profile --set` 现在只写全局 `active-profile` 文件,影响**后续新会话**的数据根(`sessions/<profile>/<sid>`);**不再重启 shell**、运行中的实例不受影响(`index.ts` profile 分支 + i18n `cli.out.profile_switched`)。
+
+### 已知代价
+
+- **内存随会话数增长**:每会话一个 WebView2 进程组(主进程 + GPU + 渲染 + 实用工具进程),约数十 MB~百 MB 量级。并发会话多时需关注任务管理器。缓解手段(未实现):idle TTL 回收、会话数上限。
+
 ## 待办
 
 - macOS：截图（WKWebView snapshot）、可信输入（无 CDP/GDK 通道，现走降级或明确报错）等平台分支

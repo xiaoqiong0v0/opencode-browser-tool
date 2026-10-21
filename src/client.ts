@@ -1,9 +1,15 @@
+// bt-shell 客户端:每会话独立 shell 实例(1.9.0 会话隔离架构)
+//
+// 架构:实例注册表 Map<sid, ShellInstance> —— 同一 opencode 进程内的不同会话各持有
+// 自己的 bt-shell 进程(独立端口 + 独立 --user-data-dir + 独立窗口标题),互不共享
+// 窗口/标签/UA/批注等一切 shell 状态;进程回收只按注册表里的 PID,**绝不按名杀进程**。
+// 附着模式(BT_SHELL_URL/BT_SHELL_PORT)例外:连接外部单例,放弃会话隔离(见 docs/implementation.md)。
 import { spawn } from "child_process";
 import { resolve, dirname } from "path";
 import { existsSync } from "fs";
 import { fileURLToPath } from "url";
 import { log } from "./logger.js";
-import { getNotifyUrl } from "./notify-server.js";
+import { getNotifyUrlForSession } from "./notify-server.js";
 import { tf } from "./i18n/index.js";
 
 import { cachedBinaryPath, describeBinaryStatus, ensureBinary } from "./binary.js";
@@ -14,6 +20,10 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const READY_TIMEOUT_MS = 20000;
 /** 就绪轮询间隔(ms) */
 const READY_POLL_INTERVAL_MS = 300;
+/** 端口撞车/启动失败时的重试次数(每次换一个随机端口) */
+const PORT_START_ATTEMPTS = 5;
+/** 会话标题解析上限(ms):超时就用 sid 后缀,绝不因标题卡住启动 */
+const TITLE_RESOLVE_TIMEOUT_MS = 250;
 
 /** 二进制来源(用于日志一眼判断用的是哪份) */
 type ShellSource = "env" | "local-dev" | "cargo-target-dir" | "download-cache";
@@ -75,93 +85,131 @@ function resolveAttachBaseUrl(): string | null {
   return null;
 }
 
-let serviceProcess: any = null;
-/** 完整基地址(启动模式 http://127.0.0.1:<port>,附着模式 BT_SHELL_URL) */
-let serviceBaseUrl = "";
-let serviceReady = false;
-/** 附着模式:连接外部已运行 shell,不 spawn 也不 kill */
-let attachMode = false;
-/** 服务启动参数(configureService 保存,ensureService 懒启动时使用) */
-let serviceConfig: { nodePath: string; browsersPath?: string; sessionIsolation?: boolean; browserType?: string; userDataDir?: string } | null = null;
-/** 正在启动中的 Promise(并发保护,多个工具同时调用只启动一次) */
-let starting: Promise<void> | null = null;
+/** 一个会话的 shell 实例(进程 + 端点 + 就绪态) */
+interface ShellInstance {
+  /** opencode 会话 id(注册表键;附着模式下为首次请求的 sid) */
+  sid: string;
+  /** 子进程句柄(附着模式恒 null —— 外部进程不归插件管) */
+  proc: any;
+  /** HTTP 端点,如 http://127.0.0.1:18234 */
+  baseUrl: string;
+  /** 端口(诊断用) */
+  port: number;
+  /** 该实例的 --user-data-dir(诊断/取证用;未设置则为 "") */
+  dataDir: string;
+  /** 窗口标题(诊断/取证用) */
+  title: string;
+  ready: boolean;
+  /** 附着模式(外部单例,不 spawn 不 kill) */
+  attach: boolean;
+}
+
+/** 实例注册表:每会话一个 shell;并发启动保护见 startingSid */
+const sessions = new Map<string, ShellInstance>();
+/** 正在启动中的会话 → Promise(并发保护:同一 sid 多个工具同时调用只启动一次) */
+const startingSid = new Map<string, Promise<ShellInstance>>();
+/** 附着模式共享实例(外部 shell;所有 sid 共用,放弃会话隔离) */
+let attachInstance: ShellInstance | null = null;
+
+/** 服务启动参数(configureService 保存,懒启动时使用) */
+let serviceConfig: {
+  nodePath: string;
+  browsersPath?: string;
+  /** 由调用方(插件层)解析某会话的 user-data-dir;不提供则不传 --user-data-dir */
+  resolveDataDir?: (sid: string) => string;
+} | null = null;
+
+/** 会话 id 兜底解析器(钩子缓存):工具调用没带 _sessionId 时用它 */
+let sessionIdResolver: (() => string) | null = null;
+/** 可选会话标题解析器(client.session.get 之类);拿不到/超时回退 sid 后缀,不阻塞启动 */
+let titleResolver: ((sid: string) => Promise<string | null>) | null = null;
+/** 实例就绪回调(插件注册:对该 sid 做一次初始 drain) */
+let serviceReadyHandler: ((sid: string) => void) | null = null;
 
 /** 保存服务启动参数(插件加载时调用,不立即启动窗口) */
-export function configureService(opts: { nodePath: string; browsersPath?: string; sessionIsolation?: boolean; browserType?: string; userDataDir?: string }): void {
+export function configureService(opts: {
+  nodePath: string;
+  browsersPath?: string;
+  resolveDataDir?: (sid: string) => string;
+}): void {
   serviceConfig = opts;
 }
 
-/** 运行时切换用户数据目录(下次 ensureService 重启时生效) */
-export function setUserDataDir(dir: string): void {
-  if (serviceConfig) serviceConfig.userDataDir = dir;
+/** 注册会话 id 兜底解析器(通常指向插件的钩子缓存 sessionCache.get) */
+export function setSessionIdResolver(fn: () => string): void {
+  sessionIdResolver = fn;
 }
 
-/** 服务就绪回调(插件注册:做一次初始 drain) */
-let serviceReadyHandler: (() => void) | null = null;
+/** 注册可选的会话标题解析器(返回 null/抛错则用 sid 后缀;有 250ms 上限,不阻塞启动) */
+export function setTitleResolver(fn: (sid: string) => Promise<string | null>): void {
+  titleResolver = fn;
+}
 
-/** 注册服务就绪回调(spawn/附着成功且注册 notify-url 之后调用一次) */
-export function setServiceReadyHandler(cb: () => void): void {
+/** 注册实例就绪回调(spawn/附着成功且注册 notify-url 之后,按 sid 调用一次) */
+export function setServiceReadyHandler(cb: (sid: string) => void): void {
   serviceReadyHandler = cb;
 }
 
-/** 懒启动服务:未启动则 spawn bt-shell(弹窗);已启动直接返回;并发时复用同一个 Promise */
-export async function ensureService(): Promise<void> {
-  if (serviceReady) return;
-  if (starting) return starting;
-
-  // 附着模式:连接外部已运行的 shell,不 spawn
-  const attachUrl = resolveAttachBaseUrl();
-  if (attachUrl) {
-    starting = attachToService(attachUrl).finally(() => {
-      starting = null;
-    });
-  } else {
-    // 启动模式:懒启动本地 shell
-    const cfg = serviceConfig;
-    if (!cfg) throw new Error(tf("client.not_configured"));
-    starting = startService(cfg.nodePath, cfg.browsersPath, cfg.sessionIsolation, cfg.browserType, cfg.userDataDir).finally(() => {
-      starting = null;
-    });
-  }
-  await starting;
-  // 服务就绪:把插件通知地址注册给 shell(推送式投递;附着模式同样走这里)
-  await registerNotifyUrl();
+/**
+ * 解析本次调用的会话 id:显式参数 > 请求体 _sessionId > 钩子缓存兜底 > "default" 桶
+ * "default" 桶用于拿不到任何 sid 的场景(仍有独立实例,不会与其它会话互踩)
+ */
+export function resolveSessionId(explicit?: string): string {
+  const s = (explicit || "").trim();
+  if (s) return s;
   try {
-    serviceReadyHandler?.();
-  } catch (e) {
-    log.error("[notify] service-ready handler failed", e as Error);
+    const cached = sessionIdResolver?.() || "";
+    if (cached.trim()) return cached.trim();
+  } catch {
+    // 解析器异常不阻断调用
   }
+  return "default";
 }
 
-/** 把插件通知地址注册给 shell(/api/notify-url);直接 fetch,避免 callApi 触发 ensureService 递归 */
-async function registerNotifyUrl(): Promise<void> {
-  const url = getNotifyUrl();
-  if (!url || !serviceBaseUrl) return;
-  try {
-    const res = await fetch(`${serviceBaseUrl}/api/notify-url`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url }),
-    });
-    if (res.ok) log.info(`[notify] notify-url registered: ${url}`);
-    else log.error(`[notify] register failed: HTTP ${res.status}`);
-  } catch (e) {
-    log.error("[notify] register failed", e as Error);
+/** 该会话实例是否就绪(不给 sid 则任一实例就绪即 true) */
+export function isRunning(sid?: string): boolean {
+  if (sid) {
+    const s = resolveSessionId(sid);
+    if (sessions.get(s)?.ready) return true;
+    return !!attachInstance?.ready;
   }
+  for (const inst of sessions.values()) if (inst.ready) return true;
+  return !!attachInstance?.ready;
 }
 
-async function callApi(path: string, body?: any, sessionId?: string): Promise<any> {
-  // 懒启动:首次调用工具时自动打开窗口
-  await ensureService();
-  const payload = { ...(body || {}), _sessionId: sessionId || "" };
-  const res = await fetch(`${serviceBaseUrl}${path}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  const json = await res.json();
-  if (!json.success) throw new Error(json.error || tf("client.service_error"));
-  return json.data;
+/** 诊断/自验用:列出当前注册的实例(只读,不 spawn) */
+export function listSessions(): Array<{ sid: string; baseUrl: string; port: number; ready: boolean; attach: boolean; dataDir: string; title: string; pid: number | null }> {
+  const out: Array<{ sid: string; baseUrl: string; port: number; ready: boolean; attach: boolean; dataDir: string; title: string; pid: number | null }> = [];
+  for (const inst of sessions.values()) {
+    out.push({
+      sid: inst.sid,
+      baseUrl: inst.baseUrl,
+      port: inst.port,
+      ready: inst.ready,
+      attach: inst.attach,
+      dataDir: inst.dataDir,
+      title: inst.title,
+      pid: inst.proc?.pid ?? null,
+    });
+  }
+  return out;
+}
+
+/** 组装窗口标题:优先会话标题(有界等待),拿不到用 sid 后 6 位,保证任务栏可分辨 */
+async function resolveWindowTitle(sid: string): Promise<string> {
+  const suffix = sid.length > 6 ? sid.slice(-6) : sid || "main";
+  const fallback = `bt-shell · ${suffix}`;
+  if (!titleResolver) return fallback;
+  try {
+    const t = await Promise.race([
+      Promise.resolve().then(() => titleResolver!(sid)),
+      new Promise<string | null>((r) => setTimeout(() => r(null), TITLE_RESOLVE_TIMEOUT_MS)),
+    ]);
+    if (t && t.trim()) return `bt-shell · ${t.trim()}`;
+  } catch {
+    // 标题拿不到就用后缀,绝不因此失败
+  }
+  return fallback;
 }
 
 /** 轮询等待服务就绪(READY_TIMEOUT_MS 超时);超时抛出给定提示 */
@@ -183,79 +231,6 @@ async function waitForReady(baseUrl: string, timeoutMessage: string): Promise<vo
   throw new Error(timeoutMessage);
 }
 
-/** 附着到外部已运行的 shell(不 spawn):等待就绪后记录 base URL */
-async function attachToService(baseUrl: string): Promise<void> {
-  attachMode = true;
-  log.info(`Attaching to existing bt-shell at ${baseUrl} (no spawn)`);
-  await waitForReady(baseUrl, tf("client.attach_timeout", { url: baseUrl }));
-  serviceBaseUrl = baseUrl;
-  serviceReady = true;
-  log.info(`Attached to existing bt-shell at ${baseUrl}`);
-}
-
-export async function startService(
-  nodePath: string,
-  browsersPath?: string,
-  sessionIsolation?: boolean,
-  browserType?: string,
-  userDataDir?: string,
-): Promise<void> {
-  attachMode = false;
-  const resolved = resolveShellBinary();
-  let shell = resolved.path;
-  // 未就绪:先(有界)等待下载完成;失败/超时给出明确提示
-  if (!existsSync(shell)) {
-    if (process.env.BT_SHELL_PATH) {
-      // 只提示环境变量名,不回流绝对路径(路径已在插件日志)
-      throw new Error(tf("client.bt_shell_path_missing"));
-    }
-    const st = await ensureBinary(20000);
-    if (st.state !== "ready" || !st.path) {
-      throw new Error(describeBinaryStatus(st));
-    }
-    shell = st.path;
-  }
-  // 记录最终选中的二进制与来源,便于一眼判断用的是哪份(local-dev / env / download-cache …)
-  log.info(`Shell binary: ${shell} (source=${resolved.source})`);
-  // 显式指定端口(release 模式 GUI 程序无控制台,无法解析 stdout)
-  const port = 18000 + Math.floor(Math.random() * 1000);
-  const args = ["--browsers-path", browsersPath || "", "--port", String(port)];
-  if (browserType) args.push("--browser", browserType);
-  if (sessionIsolation) args.push("--session-isolation");
-  // 多用户配置:userDataDir 指向独立 WebView2 用户数据目录
-  if (userDataDir) args.push("--user-data-dir", userDataDir);
-  // 推送式投递:把插件本地通知地址传给 shell(亦可用 BT_SHELL_NOTIFY_URL;附着模式用 /api/notify-url 注册)
-  const notifyUrl = getNotifyUrl();
-  if (notifyUrl) args.push("--notify-url", notifyUrl);
-  // 修(泄漏 bug):原此处写的是 `let serviceProcess;` —— **局部声明遮蔽了模块级同名变量**,
-  // spawn 句柄只落在局部,模块级 serviceProcess 恒为 null → stopService 的 waitForExit/SIGTERM
-  // 兜底是死代码;`profile --set`(不走 /api/close)等异常路径会泄漏 shell 进程。
-  // 现改为直接赋值模块级变量,兜底恢复有效。
-  try {
-    serviceProcess = spawn(shell, args, { stdio: ["ignore", "pipe", "pipe"] });
-  } catch (e) {
-    // spawn 同步失败(如文件被锁):换不含路径的文案,避免绝对路径经错误消息回流模型
-    log.error(`spawn bt-shell failed: ${(e as Error).message}`, e as Error);
-    throw new Error(tf("client.spawn_failed"));
-  }
-  // 把 shell 的 stdout/stderr 转发进共享日志:Rust 侧 println!/eprintln! 默认被管道吞掉(无人读取 → 日志永远看不到)
-  const forwardShell = (tag: string) => (chunk: Buffer) => {
-    for (const line of chunk.toString().split(/\r?\n/)) {
-      const s = line.trim();
-      if (s) log.info(`${tag} ${s}`);
-    }
-  };
-  serviceProcess.stdout?.on("data", forwardShell("[shell:out]"));
-  serviceProcess.stderr?.on("data", forwardShell("[shell:err]"));
-
-  // 等待服务就绪(轮询端口);超时文案无构建指令/无路径(旧版含"去构建二进制"的指令,会误导模型自行编译)
-  const baseUrl = `http://127.0.0.1:${port}`;
-  await waitForReady(baseUrl, tf("client.service_timeout"));
-  serviceBaseUrl = baseUrl;
-  serviceReady = true;
-  log.info(`Shell service ready on port ${port} (${shell})`);
-}
-
 /** 等待子进程退出(有界超时);已退出/出错返回 true,超时返回 false */
 function waitForExit(proc: any, timeoutMs: number): Promise<boolean> {
   return new Promise<boolean>((resolveExit) => {
@@ -273,53 +248,263 @@ function waitForExit(proc: any, timeoutMs: number): Promise<boolean> {
   });
 }
 
-export async function stopService(): Promise<void> {
-  if (attachMode) {
-    // 附着模式:外部 shell 进程不归插件管,**绝不 kill**,只清空本地状态
-    log.info("Detached from external bt-shell (process left running)");
-    serviceReady = false;
-    serviceBaseUrl = "";
-    attachMode = false;
+/**
+ * 终止**本插件自己 spawn 的**子进程(先等优雅退出,超时才 SIGTERM 该句柄/PID)。
+ * 红线:只允许杀自己 spawn 的子进程、按句柄/PID —— 绝不按名/通配匹配。
+ */
+async function terminateOwnProcess(proc: any): Promise<void> {
+  if (!proc) return;
+  const exited = await waitForExit(proc, 5000);
+  if (exited) {
+    log.info(`bt-shell pid=${proc.pid} exited gracefully`);
     return;
   }
-  const proc = serviceProcess;
-  if (proc) {
-    // 先等 shell 自己退出(Rust /api/close 已 app.exit(0) 优雅退出);有界 5s,仍存活才按该 PID 补 SIGTERM
-    const exited = await waitForExit(proc, 5000);
-    if (exited) {
-      log.info("bt-shell exited gracefully");
-    } else {
-      log.info(`bt-shell did not exit within 5s; sending SIGTERM to pid=${proc.pid}`);
-      try { proc.kill("SIGTERM"); } catch {}
+  log.info(`bt-shell pid=${proc.pid} did not exit within 5s; sending SIGTERM to that pid`);
+  try {
+    proc.kill("SIGTERM");
+  } catch {}
+  await waitForExit(proc, 2000);
+}
+
+/** 把 shell 的 stdout/stderr 转发进共享日志(Rust println! 默认会被管道吞掉) */
+function attachStdio(proc: any, sid: string): void {
+  const forwardShell = (tag: string) => (chunk: Buffer) => {
+    for (const line of chunk.toString().split(/\r?\n/)) {
+      const s = line.trim();
+      if (s) log.info(`[${tag}][sid=${sid}] ${s}`);
     }
-    serviceProcess = null;
+  };
+  proc.stdout?.on("data", forwardShell("shell:out"));
+  proc.stderr?.on("data", forwardShell("shell:err"));
+}
+
+/** 二进制就绪性检查(不存在则等下载;失败抛明确错误) */
+async function resolveShellPath(): Promise<string> {
+  const resolved = resolveShellBinary();
+  let shell = resolved.path;
+  if (!existsSync(shell)) {
+    if (process.env.BT_SHELL_PATH) {
+      // 只提示环境变量名,不回流绝对路径(路径已在插件日志)
+      throw new Error(tf("client.bt_shell_path_missing"));
+    }
+    const st = await ensureBinary(20000);
+    if (st.state !== "ready" || !st.path) {
+      throw new Error(describeBinaryStatus(st));
+    }
+    shell = st.path;
   }
-  serviceReady = false;
-  serviceBaseUrl = "";
-  attachMode = false;
-}
-
-/** 打开浏览器窗口(未启动则启动;已启动幂等) */
-export async function openWindow(): Promise<void> {
-  await ensureService();
-}
-
-/** 服务当前是否运行 */
-export function isRunning(): boolean {
-  return serviceReady;
+  log.info(`Shell binary: ${shell} (source=${resolved.source})`);
+  return shell;
 }
 
 /**
- * 纯查询：探测 shell 是否在运行，**绝不 spawn**。
- * 仅在本进程已启动/附着（`serviceBaseUrl` 已知）时做一次短超时 HTTP 探测；否则返回 null。
- * 用于 `get_browser_status` 这类只读命令，避免查询也弹出浏览器窗口。
+ * spawn 一个新 shell 实例(带端口重试):端口撞车/启动超时 → 只杀掉**本次刚 spawn 的**
+ * 子进程(按句柄/PID),换随机端口重来,最多 PORT_START_ATTEMPTS 次。
  */
-export async function probeStatus(timeoutMs = 1500): Promise<any | null> {
-  if (!serviceReady || !serviceBaseUrl) return null;
+async function spawnForSession(sid: string, shell: string): Promise<ShellInstance> {
+  const cfg = serviceConfig;
+  const dataDir = cfg?.resolveDataDir ? cfg.resolveDataDir(sid) : "";
+  const title = await resolveWindowTitle(sid);
+  let lastErr: unknown = null;
+  for (let attempt = 1; attempt <= PORT_START_ATTEMPTS; attempt++) {
+    // 显式指定端口(release 模式 GUI 程序无控制台,无法解析 stdout);随机区间避开常用端口
+    const port = 18000 + Math.floor(Math.random() * 1000);
+    const args = ["--browsers-path", cfg?.browsersPath || "", "--port", String(port), "--title", title];
+    // 每会话独立 user-data-dir(WebView2 profile 隔离);未提供则不传(回落 WebView2 默认目录)
+    if (dataDir) args.push("--user-data-dir", dataDir);
+    // 推送式投递:注册**本会话**的通知地址 → 通知按 sid 归属
+    const notifyUrl = getNotifyUrlForSession(sid);
+    if (notifyUrl) args.push("--notify-url", notifyUrl);
+
+    let proc: any;
+    try {
+      proc = spawn(shell, args, { stdio: ["ignore", "pipe", "pipe"] });
+    } catch (e) {
+      // spawn 同步失败(如文件被锁):换不含路径的文案,避免绝对路径经错误消息回流模型
+      log.error(`spawn bt-shell failed: ${(e as Error).message}`, e as Error);
+      throw new Error(tf("client.spawn_failed"));
+    }
+    attachStdio(proc, sid);
+    const baseUrl = `http://127.0.0.1:${port}`;
+    try {
+      await waitForReady(baseUrl, tf("client.service_timeout"));
+    } catch (e) {
+      // 启动超时(常见:端口被别的进程占住 → bind 失败 → 永远不就绪):杀掉本次子进程换端口重来
+      lastErr = e;
+      log.error(`[session] sid=${sid} port=${port} not ready (attempt ${attempt}/${PORT_START_ATTEMPTS}); killing that pid and retrying`);
+      await terminateOwnProcess(proc);
+      continue;
+    }
+    // 就绪:把本会话的通知地址注册给该实例(推送式投递)
+    await registerNotifyUrl(baseUrl, sid);
+    log.info(`[session] sid=${sid} ready on port ${port} (title="${title}", dataDir=${dataDir || "(default)"}, attempt ${attempt})`);
+    return { sid, proc, baseUrl, port, dataDir, title, ready: true, attach: false };
+  }
+  throw lastErr instanceof Error ? lastErr : new Error(tf("client.service_timeout"));
+}
+
+/** 附着到外部已运行的 shell(所有 sid 共用;不 spawn、不 kill、放弃会话隔离) */
+async function attachToService(baseUrl: string, sid: string): Promise<ShellInstance> {
+  log.info(`Attaching to existing bt-shell at ${baseUrl} (no spawn; session isolation disabled in attach mode)`);
+  await waitForReady(baseUrl, tf("client.attach_timeout", { url: baseUrl }));
+  const inst: ShellInstance = {
+    sid,
+    proc: null,
+    baseUrl,
+    port: Number(new URL(baseUrl).port || 0),
+    dataDir: "",
+    title: "(external)",
+    ready: true,
+    attach: true,
+  };
+  log.info(`Attached to existing bt-shell at ${baseUrl}`);
+  return inst;
+}
+
+/** 确保某会话的实例存在并就绪(懒启动;并发调用复用同一启动 Promise) */
+export async function ensureInstance(explicitSid?: string): Promise<ShellInstance> {
+  const sid = resolveSessionId(explicitSid);
+
+  // 附着模式:外部 shell 单例,所有 sid 共用(连接一次,之后直接返回)
+  const attachUrl = resolveAttachBaseUrl();
+  if (attachUrl) {
+    if (attachInstance?.ready) return attachInstance;
+    const existing = sessions.get(sid);
+    if (existing?.attach) return existing;
+    const inst = await attachToService(attachUrl, sid);
+    attachInstance = inst;
+    sessions.set(sid, inst);
+    await fireReady(sid);
+    return inst;
+  }
+
+  const ready = sessions.get(sid);
+  if (ready?.ready) return ready;
+  const starting = startingSid.get(sid);
+  if (starting) return starting;
+
+  const cfg = serviceConfig;
+  if (!cfg) throw new Error(tf("client.not_configured"));
+
+  const p = (async (): Promise<ShellInstance> => {
+    const shell = await resolveShellPath();
+    const inst = await spawnForSession(sid, shell);
+    sessions.set(sid, inst);
+    await fireReady(sid);
+    return inst;
+  })().finally(() => {
+    startingSid.delete(sid);
+  });
+  startingSid.set(sid, p);
+  return p;
+}
+
+/** 实例就绪后的统一回调(插件侧用于对该 sid 做初始 drain) */
+async function fireReady(sid: string): Promise<void> {
+  try {
+    serviceReadyHandler?.(sid);
+  } catch (e) {
+    log.error("[notify] service-ready handler failed", e as Error);
+  }
+}
+
+/** 把某会话的通知地址注册给该实例(/api/notify-url);直接 fetch,避免 callApi 触发 ensure 递归 */
+async function registerNotifyUrl(baseUrl: string, sid: string): Promise<void> {
+  const url = getNotifyUrlForSession(sid);
+  if (!url) return;
+  try {
+    const res = await fetch(`${baseUrl}/api/notify-url`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url }),
+    });
+    if (res.ok) log.info(`[notify] sid=${sid} notify-url registered: ${url}`);
+    else log.error(`[notify] sid=${sid} register failed: HTTP ${res.status}`);
+  } catch (e) {
+    log.error("[notify] register failed", e as Error);
+  }
+}
+
+/**
+ * 关闭某会话的实例:优雅(/api/close)→ 等退出 → 超时才 SIGTERM(仅该实例自己的句柄/PID)→ 从注册表移除
+ * 语义保证:实例不存在则**直接返回,绝不因此 spawn**;附着模式只解除本地关联,外部进程不动。
+ */
+export async function closeSession(explicitSid?: string): Promise<void> {
+  const sid = resolveSessionId(explicitSid);
+  const inst = sessions.get(sid) || (attachInstance && attachInstance.sid === sid ? attachInstance : null);
+  if (!inst) {
+    log.info(`[session] sid=${sid} has no shell instance; nothing to close (never spawn on close)`);
+    return;
+  }
+  sessions.delete(inst.sid);
+  if (attachInstance === inst) attachInstance = null;
+  if (inst.attach) {
+    // 附着模式:外部 shell 进程不归插件管,**绝不 kill**,只清本地关联
+    log.info(`Detached from external bt-shell at ${inst.baseUrl} (process left running)`);
+    return;
+  }
+  try {
+    await fetch(`${inst.baseUrl}/api/close`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+  } catch {
+    // 进程可能已自行退出;下面的 waitForExit 会兜住
+  }
+  await terminateOwnProcess(inst.proc);
+  log.info(`[session] sid=${sid} closed (port=${inst.port})`);
+}
+
+/** 关闭全部实例(插件 dispose / 退出);只按注册表 PID,绝不按名 */
+export async function closeAllSessions(): Promise<void> {
+  const sids = [...sessions.keys()];
+  for (const sid of sids) {
+    await closeSession(sid);
+  }
+}
+
+/** 兼容旧名:确保默认/当前会话的实例存在(现语义 = 懒启动该 sid 的实例) */
+export async function ensureService(sid?: string): Promise<void> {
+  await ensureInstance(sid);
+}
+
+/** 打开浏览器窗口(未启动则启动该会话实例;已启动幂等) */
+export async function openWindow(sid?: string): Promise<void> {
+  await ensureInstance(sid);
+}
+
+/**
+ * 纯查询:探测某会话的 shell 是否在运行,**绝不 spawn**。
+ * sid 未给 → 先探当前会话,再探任一已就绪实例;都没有则返回 null。
+ * 用于 get_browser_status 这类只读命令,避免查询也弹出浏览器窗口。
+ */
+export async function probeStatus(timeoutMs = 1500, sid?: string): Promise<any | null> {
+  const targets: string[] = [];
+  if (sid) {
+    const inst = sessions.get(resolveSessionId(sid));
+    if (inst?.ready) targets.push(inst.baseUrl);
+  } else {
+    const cur = sessions.get(resolveSessionId());
+    if (cur?.ready) targets.push(cur.baseUrl);
+    for (const inst of sessions.values()) {
+      if (inst.ready && !targets.includes(inst.baseUrl)) targets.push(inst.baseUrl);
+    }
+    if (attachInstance?.ready && !targets.includes(attachInstance.baseUrl)) targets.push(attachInstance.baseUrl);
+  }
+  for (const baseUrl of targets) {
+    const r = await probeOnce(baseUrl, timeoutMs);
+    if (r) return r;
+  }
+  return null;
+}
+
+/** 对单个端点做一次短超时探测 */
+async function probeOnce(baseUrl: string, timeoutMs: number): Promise<any | null> {
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), timeoutMs);
   try {
-    const res = await fetch(`${serviceBaseUrl}/api/status`, {
+    const res = await fetch(`${baseUrl}/api/status`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: "{}",
@@ -333,6 +518,24 @@ export async function probeStatus(timeoutMs = 1500): Promise<any | null> {
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * 统一 API 调用:按 sid 路由到该会话的实例(懒启动)。
+ * sid 来源:显式 sessionId 参数 > body._sessionId > 钩子缓存兜底 > "default" 桶。
+ */
+async function callApi(path: string, body?: any, sessionId?: string): Promise<any> {
+  const sid = resolveSessionId(sessionId || (body && body._sessionId));
+  const inst = await ensureInstance(sid);
+  const payload = { ...(body || {}), _sessionId: sid };
+  const res = await fetch(`${inst.baseUrl}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const json = await res.json();
+  if (!json.success) throw new Error(json.error || tf("client.service_error"));
+  return json.data;
 }
 
 function cmd(name: string) {
@@ -383,10 +586,10 @@ export const service = {
   assertResponse: cmd("assert-response"),
   panelConfig: cmd("panel-config"),
   status: cmd("status"),
+  title: cmd("title"),
   tabs: cmd("tabs"),
   annotateToggle: cmd("annotate/toggle"),
   annotateRecords: cmd("annotate/records"),
   annotateSend: cmd("annotate/send"),
   annotateConsumeSent: cmd("annotate/consume-sent"),
 };
-

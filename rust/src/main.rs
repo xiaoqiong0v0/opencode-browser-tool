@@ -13,13 +13,16 @@ use bt_shell::ui::{self, AnnotationRecord};
 use tauri::{Listener, Manager, State};
 
 /// 解析命令行参数(兼容旧 Node 服务协议)
-fn parse_args() -> (String, u16, Option<String>, Option<String>) {
+/// 返回 (browsers_path, port, user_data_dir, notify_url, title)
+fn parse_args() -> (String, u16, Option<String>, Option<String>, Option<String>) {
     let args: Vec<String> = std::env::args().collect();
     let mut browsers_path = String::new();
     let mut port: u16 = 0;
     let mut user_data_dir: Option<String> = None;
     // 通知地址:环境变量兜底(附着模式下插件通过 /api/notify-url 注册)
     let mut notify_url: Option<String> = std::env::var("BT_SHELL_NOTIFY_URL").ok();
+    // 窗口标题:插件传 --title "bt-shell · <会话标识>" 便于任务栏分辨多个会话实例
+    let mut title: Option<String> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -47,11 +50,17 @@ fn parse_args() -> (String, u16, Option<String>, Option<String>) {
                     notify_url = Some(args[i].clone());
                 }
             }
+            "--title" => {
+                i += 1;
+                if i < args.len() {
+                    title = Some(args[i].clone());
+                }
+            }
             _ => {}
         }
         i += 1;
     }
-    (browsers_path, port, user_data_dir, notify_url)
+    (browsers_path, port, user_data_dir, notify_url, title)
 }
 
 /// 面板拉取批注记录
@@ -331,7 +340,7 @@ fn main() {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
 
-    let (browsers_path, port, user_data_dir, notify_url) = parse_args();
+    let (browsers_path, port, user_data_dir, notify_url, title) = parse_args();
 
     tauri::Builder::default()
         .manage(ui::UiState::new())
@@ -365,8 +374,8 @@ fn main() {
                     *state.notify_url.lock().unwrap() = notify_url.clone();
                 }
             }
-            // 创建 Webview 布局(工具栏/页面/覆盖层/面板)
-            ui::create_ui(app.handle(), port)?;
+            // 创建 Webview 布局(工具栏/页面/覆盖层/面板);title 用于多会话实例在任务栏可分辨
+            ui::create_ui(app.handle(), port, title.as_deref())?;
 
             // 启动 HTTP 服务(端口由 --port 指定,默认 0 随机)
             let http_app = Arc::new(bt_shell::service::App::new(

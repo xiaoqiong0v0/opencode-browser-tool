@@ -144,7 +144,7 @@ const en: LocaleStrings = {
     "cli.out.profile_no_delete_active": "Cannot delete the active profile; switch to another first (profile --set <name>)",
     "cli.out.profile_not_found": "Profile not found: {name}",
     "cli.out.profile_deleted": "Deleted profile: {name}",
-    "cli.out.profile_switched": "Switched to profile: {name} (browser restarted)",
+    "cli.out.profile_switched": "Switched default profile: {name} (affects browsers of NEW sessions only; running sessions are unaffected)",
     "cli.out.profiles_none": "(no profiles yet)",
     "cli.out.profiles_header": "Profiles:\n{list}\n\nActive: {active}\nSwitch: profile --set <name> (restarts browser, current tabs lost)\nDelete: profile --delete <name> (not default/active)",
     "cli.out.exports": "Export directory: {dir}\n\nHow to export from Edge/Chrome:\n  Passwords: Settings → Profiles → Passwords → ⋯ → Export passwords (CSV)\n  Bookmarks: Settings → Profiles → Bookmarks → ⋯ → Export (HTML)\nPlace the exported files in the directory above, then the model can read them.\n\nRead passwords without leaking into context:\n  lookup --csv <file.csv> --url <site>\n  fill --selector <input> --value @file:<path>",

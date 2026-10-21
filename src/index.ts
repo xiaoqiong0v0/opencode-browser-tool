@@ -4,12 +4,15 @@ import stringArgv from "string-argv";
 import { parseArgs } from "node:util";
 import {
   loadConfig, getConfig, getBrowsersDir, getCacheDir, getProfilesDir, getProfileDir,
-  getExportsDir, getTmpDir, getActiveProfile, setActiveProfile,
+  getExportsDir, getTmpDir, getActiveProfile, setActiveProfile, getSessionDataDir, getSessionTmpDir,
 } from "./config/index.js";
 import { registerLocale, tf } from "./i18n/index.js";
 import en from "./i18n/en.js";
 import zh from "./i18n/zh.js";
-import { configureService, setUserDataDir, setAppDirectory, setServiceReadyHandler, ensureService, openWindow, isRunning, stopService, service, probeStatus } from "./client.js";
+import {
+  configureService, setAppDirectory, setServiceReadyHandler, setSessionIdResolver, setTitleResolver,
+  resolveSessionId, openWindow, isRunning, closeSession, closeAllSessions, service, probeStatus,
+} from "./client.js";
 import { startNotifyServer } from "./notify-server.js";
 import { startDownload, getBinaryStatus, describeBinaryStatus } from "./binary.js";
 import { tool, type Plugin } from "@opencode-ai/plugin";
@@ -18,6 +21,16 @@ import { createSessionIDCache, extractSessionIDFromEvent } from "./session-id.js
 
 /** 取 i18n 文案(tf 的快捷别名;vars 可选,替换 {name} 占位符) */
 const _t = (k: string, vars?: Record<string, string | number>) => tf(k, vars);
+
+/** 当前会话 id(工具调用的显式 _sessionId 优先,否则用钩子缓存兜底) */
+function sidOf(a: any): string {
+  return resolveSessionId(typeof a?._sessionId === "string" ? a._sessionId : "");
+}
+
+/** 构造只带会话 id 的请求体(用于无参但需按会话路由的命令,如 list_tabs / reload) */
+function sidArgs(a: any): { _sessionId: string } {
+  return { _sessionId: sidOf(a) };
+}
 
 /** 降级说明:服务端在无可信通道、退回 untrusted DOM/JS 时返回 degraded,统一在此追加标注 */
 function degradedNote(r: any): string {
@@ -126,25 +139,25 @@ const COMMANDS: Record<string, CmdDef> = {
   } },
   set_device: { usage: "[--name]", descKey: "cli.cmd.set_device", args: [{ flag: "name" }], run: async (a) => {
     if (!a.name) {
-      const list = await service.deviceList();
+      const list = await service.deviceList(sidArgs(a));
       return [_t("cli.out.device_list_header"), "", ...(list.devices || []).map((d: any) => `  ${d.name}  ${d.width}x${d.height}${d.ua ? `  ${d.ua.slice(0, 60)}...` : "  (default UA)"}`)].join("\n");
     }
     const r = await service.device({ name: a.name });
     return _t("cli.out.device_applied", { name: r.device, w: r.width, h: r.height, ua: r.ua });
   } },
   devtools: { usage: "[--action]", descKey: "cli.cmd.devtools", args: [{ flag: "action" }], run: async (a) => { const r = await service.devtools({ action: a.action || "toggle" }); return r.open ? _t("cli.out.devtools_open") : _t("cli.out.devtools_closed"); } },
-  reload: { usage: "", descKey: "cli.cmd.reload", run: async () => { const r = await service.reload(); return r?.url ? _t("cli.out.reload", { url: r.url }) : _t("cli.out.reload_nourl"); } },
-  open_window: { usage: "", descKey: "cli.cmd.open_window", run: async () => { await openWindow(); return _t("cli.out.open_window"); } },
-  close: { usage: "", descKey: "cli.cmd.close", run: async () => { if (!isRunning()) return _t("cli.out.close_already"); await service.close(); await stopService(); return _t("cli.out.close_done"); } },
+  reload: { usage: "", descKey: "cli.cmd.reload", run: async (a) => { const r = await service.reload(sidArgs(a)); return r?.url ? _t("cli.out.reload", { url: r.url }) : _t("cli.out.reload_nourl"); } },
+  open_window: { usage: "", descKey: "cli.cmd.open_window", run: async (a) => { await openWindow(sidOf(a)); return _t("cli.out.open_window"); } },
+  close: { usage: "", descKey: "cli.cmd.close", run: async (a) => { const sid = sidOf(a); if (!isRunning(sid)) return _t("cli.out.close_already"); await closeSession(sid); return _t("cli.out.close_done"); } },
   show_notification: { usage: "--message [--type]", descKey: "cli.cmd.show_notification", args: [{ flag: "message" }, { flag: "type" }], run: async (a) => { await service.notify(a); return _t("cli.out.notify_shown"); } },
   scroll: { usage: "[--direction --amount]", descKey: "cli.cmd.scroll", args: [{ flag: "direction" }, { flag: "amount" }], run: async (a) => { const r = await service.scroll(a); return _t("cli.out.scroll", { dir: a.direction || "down", n: a.amount || 300 }) + stableNote(r); } },
   wait_for_selector: { usage: "--selector [--timeout]", descKey: "cli.cmd.wait_for_selector", args: [{ flag: "selector" }, { flag: "timeout" }], run: async (a) => { await service.waitForSelector(a); return _t("cli.out.wait_appeared"); } },
   click_and_switch_tab: { usage: "--selector", descKey: "cli.cmd.click_and_switch_tab", args: [{ flag: "selector" }], run: async (a) => { const r = await service.clickSwitchTab(a); return _t("cli.out.click_switch_tab", { sel: a.selector, url: r.url || "" }) + degradedNote(r); } },
   iframe_click: { usage: "--iframeSelector --selector [--timeout ms]", descKey: "cli.cmd.iframe_click", args: [{ flag: "iframeSelector" }, { flag: "selector" }, { flag: "timeout" }], run: async (a) => { const tn = timeoutNote(a); const r = await service.iframeClick(a); return _t("cli.out.iframe_click") + degradedNote(r) + tn; } },
   iframe_fill: { usage: "--iframeSelector --selector --value [--timeout ms]", descKey: "cli.cmd.iframe_fill", args: [{ flag: "iframeSelector" }, { flag: "selector" }, { flag: "value" }, { flag: "timeout" }], run: async (a) => { const tn = timeoutNote(a); const r = await service.iframeFill(a); return _t("cli.out.iframe_fill") + degradedNote(r) + tn; } },
-  get_browser_status: { usage: "", descKey: "cli.cmd.get_browser_status", run: async () => {
+  get_browser_status: { usage: "", descKey: "cli.cmd.get_browser_status", run: async (a) => {
     // 纯查询:不 spawn、不懒启动(未运行只提示,不弹窗)
-    const s = await probeStatus();
+    const s = await probeStatus(1500, sidOf(a));
     if (!s) {
       const b = getBinaryStatus();
       // bt-shell 状态文案由 describeBinaryStatus 提供(已保证不含本机绝对路径)
@@ -154,7 +167,7 @@ const COMMANDS: Record<string, CmdDef> = {
     if (!s.open) return _t("cli.out.status.not_open");
     return _t("cli.out.status.open", { title: s.title, url: s.url, n: s.tabs });
   } },
-  list_tabs: { usage: "", descKey: "cli.cmd.list_tabs", run: async () => { const res = await service.tabs(); const list = res?.tabs || []; if (!list.length) return _t("cli.out.tabs_none"); return `${_t("cli.out.tabs_header", { n: list.length })}\n${list.map((p: any, i: number) => `[${i}] ${p.url || p.title}`).join("\n")}`; } },
+  list_tabs: { usage: "", descKey: "cli.cmd.list_tabs", run: async (a) => { const res = await service.tabs(sidArgs(a)); const list = res?.tabs || []; if (!list.length) return _t("cli.out.tabs_none"); return `${_t("cli.out.tabs_header", { n: list.length })}\n${list.map((p: any, i: number) => `[${i}] ${p.url || p.title}`).join("\n")}`; } },
   switch_tab: { usage: "--index", descKey: "cli.cmd.switch_tab", args: [{ flag: "index" }], run: async (a) => { const r = await service.switchTab(a); return _t("cli.out.switch_tab", { i: a.index, url: r.url }); } },
   new_tab: { usage: "--url", descKey: "cli.cmd.new_tab", args: [{ flag: "url" }], run: async (a) => { const r = await service.newTab(a); return _t("cli.out.new_tab", { url: r.url }); } },
   close_tab: { usage: "[--index]", descKey: "cli.cmd.close_tab", args: [{ flag: "index" }], run: async (a) => { await service.closeTab(a); return a.index !== undefined ? _t("cli.out.close_tab", { i: a.index }) : _t("cli.out.close_tab_current"); } },
@@ -165,8 +178,8 @@ const COMMANDS: Record<string, CmdDef> = {
   expect_response: { usage: "--url", descKey: "cli.cmd.expect_response", args: [{ flag: "url" }], run: async (a) => { await service.expectResponse({ urlPattern: a.url }); return _t("cli.out.expect_response", { url: a.url }); } },
   assert_response: { usage: "--id", descKey: "cli.cmd.assert_response", args: [{ flag: "id" }], run: async (a) => { const r = await service.assertResponse({ id: a.id }); return r.matched ? _t("cli.out.assert_matched", { url: r.url, status: r.status }) : r.error || _t("cli.out.assert_none"); } },
   get_accessibility_tree: { usage: "[--selector --maxDepth] [--timeout ms]", descKey: "cli.cmd.get_accessibility_tree", args: [{ flag: "selector" }, { flag: "maxDepth" }, { flag: "timeout" }], run: async (a) => { const tn = timeoutNote(a); const s = await service.accessibility(a); return (s ? formatNode(s, 0, a.maxDepth ?? 8) : _t("cli.out.no_ax")) + tn; } },
-  list_records: { usage: "", descKey: "cli.cmd.list_records", run: async () => { try { const records = await service.annotateRecords(); if (!records || !records.length) return _t("cli.out.no_records"); return records.map((r: any) => { const rect = r.rect ? ` rect=(${r.rect[0]},${r.rect[1]},${r.rect[2]},${r.rect[3]})` : ""; const img = r.image ? " +img" : ""; const sent = r.sent ? " [sent]" : ""; return `[${r.index}] ${r.selector}${rect}${img}${sent}${r.note ? ` note="${r.note}"` : ""}`; }).join("\n"); } catch { return _t("cli.out.no_records"); } } },
-  read_record_content: { usage: "--id", descKey: "cli.cmd.read_record_content", args: [{ flag: "id" }], run: async (a) => { try { const records = await service.annotateRecords(); const rec = (records || []).find((r: any) => r.index === a.id); if (!rec) return _t("cli.out.record_not_found", { id: a.id }); let img = ""; if (rec.image) { const p = saveShotImage(log, rec.index, rec.image); const kb = Math.round(rec.image.length / 1024); img = p ? _t("cli.out.record_image_saved", { kb, path: p }) : _t("cli.out.record_image", { kb }); } return `#${rec.index} ${rec.selector}\nrect: ${JSON.stringify(rec.rect)}${img}\nnote: ${rec.note || _t("cli.out.record_note_none")}`; } catch { return _t("cli.out.no_records"); } } },
+  list_records: { usage: "", descKey: "cli.cmd.list_records", run: async (a) => { try { const records = await service.annotateRecords(sidArgs(a)); if (!records || !records.length) return _t("cli.out.no_records"); return records.map((r: any) => { const rect = r.rect ? ` rect=(${r.rect[0]},${r.rect[1]},${r.rect[2]},${r.rect[3]})` : ""; const img = r.image ? " +img" : ""; const sent = r.sent ? " [sent]" : ""; return `[${r.index}] ${r.selector}${rect}${img}${sent}${r.note ? ` note="${r.note}"` : ""}`; }).join("\n"); } catch { return _t("cli.out.no_records"); } } },
+  read_record_content: { usage: "--id", descKey: "cli.cmd.read_record_content", args: [{ flag: "id" }], run: async (a) => { try { const records = await service.annotateRecords(sidArgs(a)); const rec = (records || []).find((r: any) => r.index === a.id); if (!rec) return _t("cli.out.record_not_found", { id: a.id }); let img = ""; if (rec.image) { const p = saveShotImage(log, sidOf(a), rec.index, rec.image); const kb = Math.round(rec.image.length / 1024); img = p ? _t("cli.out.record_image_saved", { kb, path: p }) : _t("cli.out.record_image", { kb }); } return `#${rec.index} ${rec.selector}\nrect: ${JSON.stringify(rec.rect)}${img}\nnote: ${rec.note || _t("cli.out.record_note_none")}`; } catch { return _t("cli.out.no_records"); } } },
   fake_audio: { usage: "--kind [--data --freq --durMs --notes --digits --loop]", descKey: "cli.cmd.fake_audio", args: [{ flag: "kind" }, { flag: "data" }, { flag: "freq" }, { flag: "durMs" }, { flag: "notes" }, { flag: "digits" }, { flag: "loop", type: "boolean" }], run: async (a) => { const r = await service.mediaAudio(a); return _t("cli.out.fake_audio", { injected: r.injected }); } },
   fake_video: { usage: "--kind [--data --url --loop]", descKey: "cli.cmd.fake_video", args: [{ flag: "kind" }, { flag: "data" }, { flag: "url" }, { flag: "loop", type: "boolean" }], run: async (a) => { const r = await service.mediaVideo(a); return _t("cli.out.fake_video", { injected: r.injected }); } },
   profile: { usage: "[--set <name> | --delete <name>]", descKey: "cli.cmd.profile", args: [{ flag: "set" }, { flag: "delete" }], run: async (a) => {
@@ -186,10 +199,8 @@ const COMMANDS: Record<string, CmdDef> = {
       // 目标配置目录不存在则创建(允许 "profile --set <新名>" 直接新建并切换)
       mkdirSync(getProfileDir(name), { recursive: true });
       setActiveProfile(name);
-      setUserDataDir(getProfileDir(name));
-      // 切换配置:重启服务使新 user-data-dir 生效(丢当前标签可接受)
-      await stopService();
-      await ensureService();
+      // 1.9.0 会话隔离:profile 作用域改为「影响**后续新会话**的数据根(sessions/<profile>/<sid>)」。
+      // **不再重启共享 shell** —— 运行中的会话各自持有独立实例,切换互不打扰(旧实现会杀掉全局唯一窗口)。
       return _t("cli.out.profile_switched", { name });
     }
     // 列出 user-data 下的配置目录
@@ -284,13 +295,23 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree, directory,
   try {
     log.loaded();
     // 懒启动:仅保存启动参数,不立即弹窗;open_window 或首次调工具时启动
+    // 1.9.0 会话隔离:每个会话独立实例(独立端口 + 独立 user-data-dir),由 client.ts 的注册表管理
     configureService({
       nodePath: config.nodePath || "",
       browsersPath: getBrowsersDir(),
-      sessionIsolation: config.sessionIsolation,
-      browserType: config.browserType,
-      // 多用户配置:默认用当前激活配置的独立 WebView2 用户数据目录
-      userDataDir: getProfileDir(getActiveProfile()),
+      // 会话数据目录:sessions/<profile>/<sid>(profile 影响后续新会话的数据根)
+      resolveDataDir: (sid: string) => getSessionDataDir(sid),
+    });
+    // 会话 id 兜底解析器:工具调用没带 _sessionId 时用钩子缓存
+    setSessionIdResolver(() => sessionCache.get());
+    // 可选会话标题解析器:client.session.get 之类;拿不到/超时回退 sid 后缀,不阻塞启动
+    setTitleResolver(async (sid: string) => {
+      try {
+        const r = await client.session.get({ path: { id: sid } });
+        return r?.data?.title || null;
+      } catch {
+        return null;
+      }
     });
 
     // 启动即后台下载 bt-shell(fire-and-forget:不阻塞启动,失败不抛出;状态见 getBinaryStatus)
@@ -303,10 +324,14 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree, directory,
       event: async ({ event }) => {
         // 缓存最近会话 id:这是投递批注最可靠的 sessionID 来源
         if (event.type === "session.deleted") {
-          // 删除会话:只清缓存,**绝不触碰 shell** —— 否则会经 service.closeSession → callApi → ensureService
-          // → spawn(bt-shell) 弹出浏览器窗口(而 /api/close-session 是空壳,唯一实际效果就是启动浏览器)
+          // 删除会话(1.9.0 语义升级):清钩子缓存 + **回收该会话自己的浏览器实例**。
+          // 仍是「绝不因删除而 spawn」:closeSession 只在注册表里有该 sid 时才动进程,
+          // 没有实例就直接返回(不会再走 callApi → ensureService 那条会弹窗的老路)。
           const delId = extractSessionIDFromEvent(event);
-          if (delId) sessionCache.clearIf(delId);
+          if (delId) {
+            sessionCache.clearIf(delId);
+            await closeSession(delId);
+          }
           return;
         }
         sessionCache.updateFromEvent(event);
@@ -391,6 +416,10 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree, directory,
         },
         config.disabledTools,
       ),
+      // 插件卸载/进程退出:优雅关闭全部会话实例(按注册表 PID,绝不按名;附着模式不动外部进程)
+      dispose: async () => {
+        await closeAllSessions();
+      },
     };
   } catch (err) {
     log.error("Init failed", err as Error);
@@ -430,8 +459,8 @@ function filterDisabled(tools: Record<string, any>, disabled?: string[]): Record
  * 否则同一进程会累积多个 interval 空转(server 与 TUI 进程各一份,互不共享)
  */
 let annotateClient: any = null;
-/** drain 进行中,避免并发重复投递 */
-let draining = false;
+/** drain 进行中(按 sid 隔离:会话 A 的 drain 不会挡住会话 B 的投递) */
+const drainingSid = new Set<string>();
 /** 最近一次见到的会话 id 缓存(来自 event/chat.message/tool.execute.before 钩子) */
 const sessionCache = createSessionIDCache();
 /** 已记录过的 sid(避免重复刷屏) */
@@ -439,10 +468,11 @@ let lastLoggedSessionID = "";
 /** 插件上下文(诊断用) */
 let pluginCtx: { directory: string; worktree: string; serverUrl: string } = { directory: "", worktree: "", serverUrl: "" };
 
-/** 把截图 base64 落盘为临时 PNG,返回路径(失败返回 null);用于发送时保留图片与给出可读路径 */
-function saveShotImage(log: any, index: number, b64: string): string | null {
+/** 把截图 base64 落盘为临时 PNG,返回路径(失败返回 null);用于发送时保留图片与给出可读路径
+ * 1.9.0:落盘到**该会话**的临时目录 sessions/<profile>/<sid>/tmp(不再与其它会话共享全局 tmp) */
+function saveShotImage(log: any, sid: string, index: number, b64: string): string | null {
   try {
-    const dir = resolve(getTmpDir());
+    const dir = resolve(getSessionTmpDir(sid));
     mkdirSync(dir, { recursive: true });
     const p = resolve(dir, `shot-${Date.now()}-${index}.png`);
     writeFileSync(p, Buffer.from(b64, "base64"));
@@ -458,43 +488,37 @@ function setupAnnotateDelivery(client: any): void {
   // 更新 client 引用(插件重载后使用最新 client)
   annotateClient = client;
   // 服务就绪时做一次 drain(覆盖"通知机制建立前 shell 已发送过"的窗口,幂等;含 shell 重启)
-  setServiceReadyHandler(() => {
-    void drainAnnotate();
+  // 1.9.0:就绪回调带 sid → 只 drain 该会话自己的实例
+  setServiceReadyHandler((sid: string) => {
+    void drainAnnotate(sid);
   });
-  // 启动监听并把地址交给 shell(spawn 时 --notify-url,就绪后 /api/notify-url 注册)
-  startNotifyServer(() => {
-    void drainAnnotate();
+  // 启动监听并把地址交给 shell(spawn 时 --notify-url /notify/<sid>,就绪后 /api/notify-url 注册)
+  // 1.9.0:通知按 URL 里的 sid 归属 → 彻底取代旧的「最后活跃会话」投递
+  startNotifyServer((sid: string) => {
+    void drainAnnotate(sid);
   })
-    .then((p) => log.info(`[notify] listening 127.0.0.1:${p}/notify (event-driven; no polling)`))
+    .then((p) => log.info(`[notify] listening 127.0.0.1:${p}/notify/<sid> (event-driven; per-session routing)`))
     .catch((e) => log.error("[notify] listen failed (only initial/service-ready drain available)", e as Error));
-  // 插件启动时也 drain 一次(此时服务可能未起,isRunning() 会短路)
-  void drainAnnotate();
 }
 
-/** 拉取待发送记录并投递到当前会话(推送触发;空结果不记日志) */
-async function drainAnnotate(): Promise<void> {
-  if (draining) return;
+/** 拉取某会话待发送的记录并投递给**该会话**(推送触发;空结果不记日志) */
+async function drainAnnotate(sid: string): Promise<void> {
+  if (!sid) return;
+  if (drainingSid.has(sid)) return;
   const c = annotateClient;
   if (!c) return;
-  // 服务未启动/已关闭:跳过(服务就绪或通知到达时会再次触发)
-  if (!isRunning()) return;
-  draining = true;
+  // 该会话实例未启动/已关闭:跳过(服务就绪或下次通知到达时会再次触发;**绝不因 drain 而 spawn**)
+  if (!isRunning(sid)) return;
+  drainingSid.add(sid);
   try {
-    // 观测钩子缓存:首次学到 sid 时记一次(证明 sid 来源可用)
-    const learned = sessionCache.get();
-    if (learned && learned !== lastLoggedSessionID) {
-      log.info(`[notify] hook-cache sid=${learned}`);
-      lastLoggedSessionID = learned;
-    }
-      const r = await service.annotateConsumeSent();
+    const r = await service.annotateConsumeSent({ _sessionId: sid });
       const records = r?.records || [];
       if (records.length === 0) return; // 空结果不刷屏
       const imgInfo = records
         .filter((x: any) => x.type === "screenshot" && x.image)
         .map((x: any) => `#${x.index}:${x.image.length}B`);
       log.info(`[drain] consume-sent -> ${records.length} record(s) ids=[${records.map((x: any) => x.index).join(",")}] images=[${imgInfo.join(",")}]`);
-      const lines = ["User annotated via panel:", ""];
-      for (const item of records) {
+      const lines = ["User annotated via panel:", ""];      for (const item of records) {
         const label =
           item.type === "screenshot"
             ? `[#${item.index}] 截图${item.url ? ` @ ${item.url}` : ""}`
@@ -504,44 +528,21 @@ async function drainAnnotate(): Promise<void> {
         // 图片**不经 session.prompt**(服务端对 image/* part 返回 400),而是走
         // 「工具结果附件」(bt_screenshot)或「读记录返回缓存路径」(read_record_content)。
         if (item.type === "screenshot" && item.image) {
-          const savedPath = saveShotImage(log, item.index, item.image);
+          const savedPath = saveShotImage(log, sid, item.index, item.image);
           if (savedPath) lines.push(`  (image saved: ${savedPath})`);
         }
         lines.push("");
       }
       const text = lines.join("\n");
-      // 取当前会话 id:优先用钩子缓存(参考项目 ctx.sessionID 的等价物),session.list() 仅兜底
-      let sid = sessionCache.get();
-      let source = "hook-cache";
-      let listLen: any = "-";
-      if (!sid) {
-        const sessions = await c.session.list();
-        listLen = Array.isArray(sessions?.data) ? sessions.data.length : sessions?.error ? "error" : "none";
-        log.info(`[drain] session.list raw=${JSON.stringify(sessions).slice(0, 400)}`);
-        sid = sessions?.data?.[0]?.id;
-        source = "client.session.list()[0]";
-      }
-      // 关键诊断:sid 来源/缓存值/list 长度/插件目录(定位"静默失败"断点)
-      log.info(`[drain] sid source=${source} cached=${sessionCache.get() || "(EMPTY)"} listLen=${listLen} ctx=${pluginCtx.directory || "(none)"} srv=${pluginCtx.serverUrl || "(none)"} sid=${sid ?? "(EMPTY)"}`);
-      if (!sid) {
-        const msg = "no session id (hook cache empty and session.list returned none)";
-        log.error(`[drain] ${msg}`, new Error(msg));
-        try {
-          await service.notify({ message: `发送失败: ${msg}`, type: "err" });
-        } catch {}
-        return;
-      }
-      const send = (parts: any[]) => c.session.prompt({ path: { id: sid }, body: { noReply: false, parts } });
-
-      // 只发文本(参考实现同为纯文本;图片由工具附件/缓存路径交付,不在 prompt 里塞图片 part)
-      log.info(`[drain] prompt -> sid=${sid} parts=text-only textLen=${text.length}`);
-      const res = await send([{ type: "text", text }]);
+      // 投递目标 = 通知 URL 里的 sid(1.9.0 会话隔离:取代旧的 hook-cache last-writer-wins)
+      log.info(`[drain] sid=${sid} prompt parts=text-only textLen=${text.length}`);
+      const res = await c.session.prompt({ path: { id: sid }, body: { noReply: false, parts: [{ type: "text", text }] } });
       const err = res?.error;
       if (err) {
         // 不再静默:写日志 + 页面通知(SDK 返回 {error} 不抛,必须显式检查)
         log.error(`[drain] prompt FAILED sid=${sid}: ${JSON.stringify(err).slice(0, 300)}`, new Error("prompt error"));
         try {
-          await service.notify({ message: `发送记录失败: ${JSON.stringify(err).slice(0, 180)}`, type: "err" });
+          await service.notify({ message: `发送记录失败: ${JSON.stringify(err).slice(0, 180)}`, type: "err" }, sid);
         } catch {}
       } else {
         log.info(`[drain] prompt OK sid=${sid} delivered ${records.length} record(s)`);
@@ -549,7 +550,7 @@ async function drainAnnotate(): Promise<void> {
     } catch (e) {
       log.error("annotate drain error", e as Error);
     } finally {
-      draining = false;
+      drainingSid.delete(sid);
     }
 }
 

@@ -144,7 +144,7 @@ const zh: LocaleStrings = {
     "cli.out.profile_no_delete_active": "不能删除当前激活配置；请先切换到其它配置（profile --set <name>）",
     "cli.out.profile_not_found": "未找到配置: {name}",
     "cli.out.profile_deleted": "已删除配置: {name}",
-    "cli.out.profile_switched": "已切换配置: {name}（浏览器已重启）",
+    "cli.out.profile_switched": "已切换默认配置: {name}（仅影响后续新会话的浏览器；正在运行的会话不受影响）",
     "cli.out.profiles_none": "（暂无配置）",
     "cli.out.profiles_header": "配置：\n{list}\n\n当前: {active}\n切换: profile --set <name>（重启浏览器，当前标签会丢失）\n删除: profile --delete <name>（非 default、非当前激活）",
     "cli.out.exports": "导出目录: {dir}\n\n如何从 Edge/Chrome 导出：\n  密码: 设置 → 个人资料 → 密码 → ⋯ → 导出密码（CSV）\n  书签: 设置 → 个人资料 → 书签 → ⋯ → 导出（HTML）\n把导出的文件放到上面的目录，然后模型可以直接读取。\n\n不把密码读进上下文的用法：\n  lookup --csv <file.csv> --url <site>\n  fill --selector <input> --value @file:<path>",

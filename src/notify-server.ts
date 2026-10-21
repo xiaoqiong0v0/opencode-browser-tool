@@ -1,23 +1,30 @@
-// 插件侧通知监听:shell 发送记录后主动 POST /notify 到这里(推送式投递,替代轮询)。
+// 插件侧通知监听:shell 发送记录后主动 POST /notify[/<sid>] 到这里(推送式投递,替代轮询)。
 // 仅绑定 127.0.0.1 + 随机空闲端口;端点只接收最小信息(count),大内容仍由插件走
 // /api/annotate/consume-sent 拉取(drain)。
+//
+// 1.9.0 会话隔离:每个 shell 实例注册自己的 `/notify/<sid>`,通知按 URL 里的 sid 路由到
+// 对应会话的 drain —— 彻底取代旧的「最后活跃会话」(last-writer-wins)投递。
 import { createServer, type Server } from "node:http";
 
 let server: Server | null = null;
 let port = 0;
-let onNotify: (() => void) | null = null;
+/** 收到通知时的回调:参数为通知 URL 里的 sid(空串 = 未带 sid 的旧格式 /notify) */
+let onNotify: ((sid: string) => void) | null = null;
 
-/** 启动监听(幂等);返回实际端口。onNotify 在收到 shell 通知时被调用 */
-export async function startNotifyServer(handler: () => void): Promise<number> {
+/** 启动监听(幂等);返回实际端口。onNotify 在收到 shell 通知时被调用(带 sid) */
+export async function startNotifyServer(handler: (sid: string) => void): Promise<number> {
   onNotify = handler;
   if (server && port) return port;
   return new Promise<number>((resolvePort, reject) => {
     const srv = createServer((req, res) => {
-      if (req.method !== "POST" || !req.url || !req.url.startsWith("/notify")) {
+      const url = req.url || "";
+      if (req.method !== "POST" || !url.startsWith("/notify")) {
         res.writeHead(404, { "content-type": "application/json" });
         res.end('{"ok":false}');
         return;
       }
+      // 从路径提取 sid:/notify/<sid>;裸 /notify(旧格式)→ sid = ""
+      const sid = url.startsWith("/notify/") ? decodeURIComponent(url.slice("/notify/".length)) : "";
       // 只读取/丢弃最小 payload,避免大内容经此通道
       let bytes = 0;
       req.on("data", (c: Buffer) => {
@@ -28,7 +35,7 @@ export async function startNotifyServer(handler: () => void): Promise<number> {
         res.writeHead(200, { "content-type": "application/json" });
         res.end('{"ok":true}');
         try {
-          onNotify?.();
+          onNotify?.(sid);
         } catch {
           // 忽略回调异常,不影响响应
         }
@@ -46,7 +53,12 @@ export async function startNotifyServer(handler: () => void): Promise<number> {
   });
 }
 
-/** 当前通知地址(shell 用它 POST);未就绪返回 null */
+/** 未带 sid 的基础通知地址(仅兼容旧用法;新代码请用 getNotifyUrlForSession) */
 export function getNotifyUrl(): string | null {
   return server && port ? `http://127.0.0.1:${port}/notify` : null;
+}
+
+/** 某会话的通知地址:每个 shell 实例注册各自这条 → 通知可按 sid 归属 */
+export function getNotifyUrlForSession(sid: string): string | null {
+  return server && port ? `http://127.0.0.1:${port}/notify/${encodeURIComponent(sid)}` : null;
 }

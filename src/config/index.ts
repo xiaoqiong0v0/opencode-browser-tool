@@ -7,16 +7,16 @@ const CONFIG_FILE = "browser-tool.jsonc";
 
 export type Lang = "en" | "zh";
 
-export type BrowserType = "chromium" | "firefox" | "webkit";
+// 1.9.0:移除 browserType / sessionIsolation —— 二者透传给 bt-shell 的 --browser / --session-isolation
+// 从不被 Rust 解析(main.rs parse_args 静默丢弃),是**死参数**;1.9.0 起每会话独立 shell 实例成为
+// 唯一行为,继续保留会误导用户。旧配置文件里若仍有这两项,applyConfigFile 会忽略(见函数注释)。
 
 export interface PluginConfig {
-  browserType?: BrowserType;
   browsersPath?: string;
   nodePath?: string;
   panelLang: Lang;
   toolLang: Lang;
   disabledTools?: string[];
-  sessionIsolation?: boolean;
   /** 缓存根目录(默认 ~/.opencode/plugins-cache/opencode-browser-tool) */
   cacheDir?: string;
 }
@@ -58,6 +58,27 @@ export function getProfilesDir(): string {
 /** 某个配置的 WebView2 用户数据目录 */
 export function getProfileDir(name: string): string {
   return resolve(getProfilesDir(), name);
+}
+
+// ---- 会话隔离(1.9.0):每会话独立 shell 实例的数据目录 ----
+// 路径: <cacheDir>/sessions/<profile>/<sid>
+// 说明: 需求字面为 sessions/<sid>;此处多一层 <profile>,是为了保住 `profile --set` 的语义 ——
+// 它现在的含义是「影响**后续新会话**的数据根(默认 profile)」,运行中的实例不受影响。
+// 若要严格字面路径,去掉 profile 段即可(会话间隔离不受影响,只是 profile 失去作用)。
+
+/** 会话数据根目录 */
+export function getSessionsDir(): string {
+  return resolve(getCacheDir(), "sessions");
+}
+
+/** 某会话的独立 user-data-dir(WebView2 profile:cookie/localStorage/缓存全隔离) */
+export function getSessionDataDir(sid: string): string {
+  return resolve(getSessionsDir(), getActiveProfile(), sid);
+}
+
+/** 某会话的临时产物目录(截图落盘等;不再与其它会话/全局 tmp 共享) */
+export function getSessionTmpDir(sid: string): string {
+  return resolve(getSessionDataDir(sid), "tmp");
 }
 
 /** 导出目录(用户从 Edge/Chrome 导出的密码 CSV / 书签 HTML) */
@@ -122,15 +143,14 @@ function applyConfigFile(config: PluginConfig, filePath: string): void {
       .replace(/\/\/.*$/gm, "")
       .replace(/\/\*[\s\S]*?\*\//g, "")
       .replace(/,\s*}/g, "}");
+    // 只读取已知键:旧文件里的 browserType / sessionIsolation 等已移除项会被自然忽略(兼容,不报错)
     const fileConfig: Partial<PluginConfig> = JSON.parse(json);
 
-    if (fileConfig.browserType !== undefined) config.browserType = fileConfig.browserType;
     if (fileConfig.browsersPath !== undefined) config.browsersPath = fileConfig.browsersPath;
     if (fileConfig.nodePath !== undefined) config.nodePath = fileConfig.nodePath;
     if (fileConfig.panelLang && isValidLang(fileConfig.panelLang)) config.panelLang = fileConfig.panelLang;
     if (fileConfig.toolLang && isValidLang(fileConfig.toolLang)) config.toolLang = fileConfig.toolLang;
     if (fileConfig.disabledTools) config.disabledTools = fileConfig.disabledTools;
-    if (fileConfig.sessionIsolation !== undefined) config.sessionIsolation = fileConfig.sessionIsolation;
     if (fileConfig.cacheDir !== undefined) config.cacheDir = fileConfig.cacheDir;
   } catch {}
 }
@@ -174,20 +194,18 @@ function generateDefaultConfig(filePath: string): void {
   // "browsersPath": "D:/browsers/chromium",
 
   // 缓存根目录（可选，默认 ~/.opencode/plugins-cache/opencode-browser-tool）
-  // 下设 user-data/<profile> 用户配置、exports 导出、tmp 临时密码文件
+  // 下设 sessions/<profile>/<sid> 每会话独立浏览器数据、user-data/<profile> 旧目录、
+  // exports 导出、tmp 临时密码文件
   // "cacheDir": "D:/browser-cache",
 
   // 禁用的工具列表（可选，工具名不加 bt_ 前缀）
   // "disabledTools": ["close", "custom_user_agent"],
 
-  // 会话隔离：为子会话创建独立 BrowserContext（默认 false，全部共享）
-  // "sessionIsolation": false,
+  // 1.9.0 起「每会话独立浏览器实例」为唯一行为（原 sessionIsolation 开关从未生效，已移除）；
+  // browserType 同理移除（--browser 从不被 bt-shell 解析）。旧配置里若仍写着这两项会被忽略。
 
   // Node.js 路径（可选，不设则从 PATH 查找 node）
   // "nodePath": "C:/Program Files/nodejs/node.exe",
-
-  // 浏览器类型: "chromium" | "firefox" | "webkit"（默认 chromium）
-  // "browserType": "firefox",
 }
 `,
       "utf-8",

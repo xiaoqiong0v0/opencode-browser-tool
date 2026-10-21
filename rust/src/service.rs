@@ -154,6 +154,7 @@ impl App {
         control::validate_selector_fields(&body)?;
         match url {
             "/api/status" => self.status().await,
+            "/api/title" => self.title().await,
             "/api/tabs" => self.tabs().await,
             "/api/navigate" => self.navigate(&body).await,
             "/api/close" => self.close().await,
@@ -227,6 +228,13 @@ impl App {
         })?;
         let tabs_count = self.handle.state::<crate::ui::UiState>().tabs.lock().unwrap().len();
         Ok(json!({ "open": true, "url": st.0, "title": st.1, "tabs": tabs_count, "installing": {} }))
+    }
+
+    /// 返回主窗口标题(多会话实例自验用;标题来自 `--title`,默认 "bt-shell")
+    async fn title(&self) -> Result<Value, String> {
+        use tauri::Manager;
+        let win = self.handle.get_window("main").ok_or("main window not found")?;
+        Ok(json!({ "title": win.title().map_err(|e| e.to_string())? }))
     }
 
     async fn navigate(&self, body: &Value) -> Result<Value, String> {
