@@ -92,6 +92,39 @@ fn num_u64(body: &Value, key: &str) -> Option<u64> {
     })
 }
 
+/// `--timeout` 的合法区间(毫秒,与工具层钳制同口径):过小几乎必然误判,过大拖垮会话
+const TIMEOUT_MIN_MS: u64 = 100;
+const TIMEOUT_MAX_MS: u64 = 60_000;
+
+/// 解析模型传入的 `--timeout`(毫秒),与既有 `wait_for_selector` 同单位
+///
+/// 返回 `(timeout_ms, clamped)`:
+/// - **未传** → `(None, false)`:各原语走自己的默认(与 1.8.x 完全一致)
+/// - 传了 → 必须是正整数,否则 Err(快速明确报错,不静默忽略);钳到 `[100, 60000]` 并标 `clamped`
+fn timeout_arg(body: &Value) -> Result<(Option<u64>, bool), String> {
+    match body.get("timeout") {
+        None | Some(Value::Null) => Ok((None, false)),
+        Some(v) => {
+            let n = num_u64(body, "timeout")
+                .ok_or_else(|| format!("timeout must be a positive integer (ms), got: {v}"))?;
+            if n == 0 {
+                return Err("timeout must be a positive integer (ms), got: 0".into());
+            }
+            let c = n.clamp(TIMEOUT_MIN_MS, TIMEOUT_MAX_MS);
+            Ok((Some(c), c != n))
+        }
+    }
+}
+
+/// 把 `--timeout` 的**生效值**与**是否被钳制**写入响应体(仅模型显式传了才写,便于工具层标注)
+fn with_timeout(mut out: Value, t: Option<u64>, clamped: bool) -> Value {
+    if let Some(ms) = t {
+        out["timeoutMs"] = json!(ms);
+        out["timeoutClamped"] = json!(clamped);
+    }
+    out
+}
+
 /// 把降级标记写入结果 JSON(可信路径不写字段);`degraded`/`degradedReason` 与插件约定一致
 fn mark_degraded(mut v: Value, degraded: &Option<String>) -> Value {
     if let Some(reason) = degraded {
@@ -261,12 +294,17 @@ impl App {
         if s.is_empty() {
             return Err("selector is required".into());
         }
+        let (t, tclamped) = timeout_arg(body)?;
         let handle = self.handle.clone();
         // Windows:CDP 鼠标序列(命中测试 + 真实默认行为);非 Windows:降级 el.click() 并标注
-        let o = tokio::task::block_in_place(|| control::mouse::click(&handle, &s))?;
-        Ok(mark_degraded(
-            json!({ "clicked": true, "x": o.value.x, "y": o.value.y }),
-            &o.degraded,
+        let o = tokio::task::block_in_place(|| control::mouse::click_with(&handle, &s, t))?;
+        Ok(with_timeout(
+            mark_degraded(
+                json!({ "clicked": true, "x": o.value.x, "y": o.value.y }),
+                &o.degraded,
+            ),
+            t,
+            tclamped,
         ))
     }
 
@@ -276,10 +314,15 @@ impl App {
             return Err("selector is required".into());
         }
         let v = body.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let (t, tclamped) = timeout_arg(body)?;
         let handle = self.handle.clone();
         // Windows:focus + 全选 + Input.insertText;非 Windows:降级 DOM setter + input/change 并标注
-        let o = tokio::task::block_in_place(|| control::input::fill(&handle, &s, &v))?;
-        Ok(mark_degraded(json!({ "filled": true }), &o.degraded))
+        let o = tokio::task::block_in_place(|| control::input::fill_with(&handle, &s, &v, t))?;
+        Ok(with_timeout(
+            mark_degraded(json!({ "filled": true }), &o.degraded),
+            t,
+            tclamped,
+        ))
     }
 
     async fn clear(&self, body: &Value) -> Result<Value, String> {
@@ -287,9 +330,14 @@ impl App {
         if s.is_empty() {
             return Err("selector is required".into());
         }
+        let (t, tclamped) = timeout_arg(body)?;
         let handle = self.handle.clone();
-        let o = tokio::task::block_in_place(|| control::input::clear(&handle, &s))?;
-        Ok(mark_degraded(json!({ "cleared": true }), &o.degraded))
+        let o = tokio::task::block_in_place(|| control::input::clear_with(&handle, &s, t))?;
+        Ok(with_timeout(
+            mark_degraded(json!({ "cleared": true }), &o.degraded),
+            t,
+            tclamped,
+        ))
     }
 
     async fn select(&self, body: &Value) -> Result<Value, String> {
@@ -298,12 +346,18 @@ impl App {
             return Err("selector is required".into());
         }
         let v = body.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let (t, tclamped) = timeout_arg(body)?;
         let handle = self.handle.clone();
         // Windows:focus + 方向键可信选择(单值 select);multiple/size>1 或其他平台降级并标注
-        let o = tokio::task::block_in_place(|| control::input::select(&handle, &s, &v))?;
-        Ok(mark_degraded(
-            json!({ "selected": true, "value": o.value }),
-            &o.degraded,
+        let o =
+            tokio::task::block_in_place(|| control::input::select_with(&handle, &s, &v, t))?;
+        Ok(with_timeout(
+            mark_degraded(
+                json!({ "selected": true, "value": o.value }),
+                &o.degraded,
+            ),
+            t,
+            tclamped,
         ))
     }
 
@@ -312,12 +366,17 @@ impl App {
         if s.is_empty() {
             return Err("selector is required".into());
         }
+        let (t, tclamped) = timeout_arg(body)?;
         let handle = self.handle.clone();
         // Windows:CDP mouseMoved(真实 CSS :hover);非 Windows:降级合成 mouseover/mouseenter 并标注
-        let o = tokio::task::block_in_place(|| control::mouse::hover(&handle, &s))?;
-        Ok(mark_degraded(
-            json!({ "hovered": true, "x": o.value.x, "y": o.value.y }),
-            &o.degraded,
+        let o = tokio::task::block_in_place(|| control::mouse::hover_with(&handle, &s, t))?;
+        Ok(with_timeout(
+            mark_degraded(
+                json!({ "hovered": true, "x": o.value.x, "y": o.value.y }),
+                &o.degraded,
+            ),
+            t,
+            tclamped,
         ))
     }
 
@@ -327,10 +386,13 @@ impl App {
             return Err("key is required".into());
         }
         let selector = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let (t, tclamped) = timeout_arg(body)?;
         let handle = self.handle.clone();
         // 可信键盘注入:Windows 走 CDP(先聚焦 selector),非 Windows 未实现则明确报错
-        tokio::task::block_in_place(|| control::keyboard::press_key(&handle, &key, &selector))?;
-        Ok(json!({ "pressed": key }))
+        tokio::task::block_in_place(|| {
+            control::keyboard::press_key_with(&handle, &key, &selector, t)
+        })?;
+        Ok(with_timeout(json!({ "pressed": key }), t, tclamped))
     }
 
     async fn drag(&self, body: &Value) -> Result<Value, String> {
@@ -342,10 +404,11 @@ impl App {
         if to.is_empty() {
             return Err("targetSelector is required".into());
         }
+        let (t, tclamped) = timeout_arg(body)?;
         let handle = self.handle.clone();
         // 原生 DnD:Windows 走 CDP 鼠标序列(真实发起 dragstart/dragover/drop);非 Windows 明确报错
-        tokio::task::block_in_place(|| control::drag::drag(&handle, &from, &to))?;
-        Ok(json!({ "dragged": true }))
+        tokio::task::block_in_place(|| control::drag::drag_with(&handle, &from, &to, t))?;
+        Ok(with_timeout(json!({ "dragged": true }), t, tclamped))
     }
 
     async fn upload_file(&self, body: &Value) -> Result<Value, String> {
@@ -357,10 +420,11 @@ impl App {
         if path.is_empty() {
             return Err("filePath is required".into());
         }
+        let (t, tclamped) = timeout_arg(body)?;
         let handle = self.handle.clone();
         // 可信上传:Windows 走 CDP DOM.setFileInputFiles 并回读校验;非 Windows 明确报错
-        tokio::task::block_in_place(|| control::upload::set_file(&handle, &s, &path))?;
-        Ok(json!({ "uploaded": true }))
+        tokio::task::block_in_place(|| control::upload::set_file_with(&handle, &s, &path, t))?;
+        Ok(with_timeout(json!({ "uploaded": true }), t, tclamped))
     }
 
     /// 截图:无 selector → 整视口(行为不变);有 selector → 统一元素截图流程:
@@ -369,21 +433,26 @@ impl App {
     /// 滚动 reached/stable 不吞错:如实写进返回(beyondViewport/reached/stable/…)
     async fn screenshot(&self, body: &Value) -> Result<Value, String> {
         let selector = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let (t, tclamped) = timeout_arg(body)?;
         let handle = self.handle.clone();
         let (base64, meta) = tokio::task::block_in_place(|| -> Result<(String, Value), String> {
             if selector.is_empty() {
                 // 无 selector:整视口截图,保持现状
-                return Ok((crate::control::screenshot::screenshot(&handle)?, json!({})));
+                let b = match t {
+                    Some(ms) => crate::control::screenshot::screenshot_with_timeout(&handle, ms)?,
+                    None => crate::control::screenshot::screenshot(&handle)?,
+                };
+                return Ok((b, json!({})));
             }
             // ① 元素存在性校验(错误口径与旧版一致)
-            let st = crate::control::element_state(&handle, &selector)?;
+            let st = crate::control::element_state_with(&handle, &selector, t)?;
             if !st.get("exists").and_then(|v| v.as_bool()).unwrap_or(false) {
                 return Err(format!("element not found: {selector}"));
             }
             // ② 先滚动到可见并等滚动稳定(超时如实返回 reached/stable,不吞错)
-            let scroll = crate::control::scroll_to_element(&handle, &selector)?;
+            let scroll = crate::control::scroll_to_element_with(&handle, &selector, t)?;
             // ③ 滚动后重测 rect(视口 CSS 像素,含懒加载/布局变化后的真实位置)
-            let st = crate::control::element_state(&handle, &selector)?;
+            let st = crate::control::element_state_with(&handle, &selector, t)?;
             if !st.get("exists").and_then(|v| v.as_bool()).unwrap_or(false) {
                 return Err(format!("element not found: {selector}"));
             }
@@ -396,19 +465,29 @@ impl App {
                 return Err(format!("element has zero size: {selector}"));
             }
             // ④ 判定 rect 是否完全落在视口内(需视口尺寸;越界与否决定截图路径)
-            let vp = crate::control::eval(
+            let vp = crate::control::eval_with(
                 &handle,
                 "(function(){return {w:window.innerWidth,h:window.innerHeight};})()",
+                t,
             )?;
             let vw = vp.get("w").and_then(|v| v.as_f64()).unwrap_or(0.0).round() as i32;
             let vh = vp.get("h").and_then(|v| v.as_f64()).unwrap_or(0.0).round() as i32;
             // 完全在视口内 → 常规 clip;任一边超出 → 越界路径(元素比视口还大,整块截全)。
             // 两条路径都传**视口**坐标,截图层内部统一换算文档坐标(CDP clip 实测恒为文档坐标)
             let beyond = x < 0 || y < 0 || x + w > vw || y + h > vh;
-            let base64 = if beyond {
-                crate::control::screenshot::screenshot_clip_beyond(&handle, x, y, w, h)?
-            } else {
-                crate::control::screenshot::screenshot_clip(&handle, x, y, w, h)?
+            let base64 = match (beyond, t) {
+                (true, Some(ms)) => crate::control::screenshot::screenshot_clip_beyond_with_timeout(
+                    &handle, x, y, w, h, ms,
+                )?,
+                (true, None) => {
+                    crate::control::screenshot::screenshot_clip_beyond(&handle, x, y, w, h)?
+                }
+                (false, Some(ms)) => crate::control::screenshot::screenshot_clip_with_timeout(
+                    &handle, x, y, w, h, ms,
+                )?,
+                (false, None) => {
+                    crate::control::screenshot::screenshot_clip(&handle, x, y, w, h)?
+                }
             };
             let meta = json!({
                 "beyondViewport": beyond,
@@ -431,13 +510,19 @@ impl App {
                 out[k] = v.clone();
             }
         }
-        Ok(out)
+        Ok(with_timeout(out, t, tclamped))
     }
 
     async fn evaluate(&self, body: &Value) -> Result<Value, String> {
         let script = body.get("script").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let (t, _tclamped) = timeout_arg(body)?;
         let handle = self.handle.clone();
-        let r = tokio::task::block_in_place(|| control::evaluate(&handle, &script))?;
+        // eval 超时是最直接的「快失败」手段:默认仍 5s,传了就用传入值(不写 timeoutMs 到返回体 ——
+        // evaluate 的返回体就是脚本结果本身,不掺元信息)
+        let r = tokio::task::block_in_place(|| match t {
+            Some(ms) => control::evaluate_timeout(&handle, &script, ms),
+            None => control::evaluate(&handle, &script),
+        })?;
         Ok(r)
     }
 
@@ -486,13 +571,15 @@ impl App {
 
     async fn element_state(&self, body: &Value) -> Result<Value, String> {
         let s = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let (t, tclamped) = timeout_arg(body)?;
         let handle = self.handle.clone();
-        let r = tokio::task::block_in_place(|| control::element_state(&handle, &s))?;
-        Ok(r)
+        let r = tokio::task::block_in_place(|| control::element_state_with(&handle, &s, t))?;
+        Ok(with_timeout(r, t, tclamped))
     }
 
     async fn dropdown_options(&self, body: &Value) -> Result<Value, String> {
         let s = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let (t, tclamped) = timeout_arg(body)?;
         let handle = self.handle.clone();
         let js = format!(
             r#"(function(){{
@@ -502,16 +589,19 @@ impl App {
             }})()"#,
             s = s
         );
-        let r = tokio::task::block_in_place(|| control::eval(&handle, &js))?;
-        Ok(r)
+        let r = tokio::task::block_in_place(|| control::eval_with(&handle, &js, t))?;
+        Ok(with_timeout(r, t, tclamped))
     }
 
     async fn wait_for_selector(&self, body: &Value) -> Result<Value, String> {
         let s = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let timeout = body.get("timeout").and_then(|v| v.as_u64()).unwrap_or(10000);
+        // 修:原 `as_u64()` 只认 JSON 数字,而 bt_cli 的 flag 一律是字符串 → `--timeout` 被静默忽略(恒 10s)。
+        // 改走 timeout_arg:兼容字符串、钳到 [100,60000]、未传保持既有默认 10000ms,并如实回显生效值
+        let (t, tclamped) = timeout_arg(body)?;
+        let timeout = t.unwrap_or(10000);
         let handle = self.handle.clone();
         let found = tokio::task::block_in_place(|| control::wait_for_selector(&handle, &s, timeout))?;
-        Ok(json!({ "found": found }))
+        Ok(with_timeout(json!({ "found": found }), t, tclamped))
     }
 
     /// 滚动页面:同时兼容 {dx,dy} 精确偏移与 {direction,amount} 语义滚动
@@ -555,9 +645,11 @@ impl App {
         if s.is_empty() {
             return Err("selector is required".into());
         }
+        let (t, tclamped) = timeout_arg(body)?;
         let handle = self.handle.clone();
         // 等待元素真正进入视口且滚动稳定;超时如实返回 reached:false(+reason)
-        let r = tokio::task::block_in_place(|| control::scroll_to_element(&handle, &s))?;
+        let r =
+            tokio::task::block_in_place(|| control::scroll_to_element_with(&handle, &s, t))?;
         let mut out = json!({
             "scrolled": true,
             "reached": r["reached"],
@@ -569,7 +661,7 @@ impl App {
         if r.get("reason").is_some() {
             out["reason"] = r["reason"].clone();
         }
-        Ok(out)
+        Ok(with_timeout(out, t, tclamped))
     }
 
     async fn reload(&self) -> Result<Value, String> {
@@ -767,11 +859,13 @@ impl App {
     /// 可访问性树:有 selector 返回该元素子树,否则整页(行为不变)
     async fn accessibility(&self, body: &Value) -> Result<Value, String> {
         let selector = body.get("selector").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let (t, tclamped) = timeout_arg(body)?;
         let handle = self.handle.clone();
+        // 带 selector 是 4 步 CDP 链,每步都用传入预算(总最坏 ≈ 4 × 单步)
         let tree = tokio::task::block_in_place(|| {
-            crate::control::accessibility::accessibility_tree(&handle, selector.as_deref())
+            crate::control::accessibility::accessibility_tree_with(&handle, selector.as_deref(), t)
         })?;
-        Ok(tree)
+        Ok(with_timeout(tree, t, tclamped))
     }
 
     /// 标签列表(真实多标签,含 id/url/title)
@@ -838,14 +932,19 @@ impl App {
         if sel.is_empty() {
             return Err("selector is required".into());
         }
+        let (t, tclamped) = timeout_arg(body)?;
         let handle = self.handle.clone();
         // Windows:iframe 内容坐标换算后走可信鼠标序列;非 Windows:降级同源 iframe el.click() 并标注
         let o = tokio::task::block_in_place(|| {
-            control::mouse::click_in_iframe(&handle, &iframe, &sel)
+            control::mouse::click_in_iframe_with(&handle, &iframe, &sel, t)
         })?;
-        Ok(mark_degraded(
-            json!({ "clicked": true, "x": o.value.x, "y": o.value.y }),
-            &o.degraded,
+        Ok(with_timeout(
+            mark_degraded(
+                json!({ "clicked": true, "x": o.value.x, "y": o.value.y }),
+                &o.degraded,
+            ),
+            t,
+            tclamped,
         ))
     }
 
@@ -860,12 +959,17 @@ impl App {
             return Err("selector is required".into());
         }
         let val = body.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let (t, tclamped) = timeout_arg(body)?;
         let handle = self.handle.clone();
         // Windows:iframe 内 focus + insertText;非 Windows:降级 DOM setter + input/change 并标注
         let o = tokio::task::block_in_place(|| {
-            control::input::fill_in_iframe(&handle, &iframe, &sel, &val)
+            control::input::fill_in_iframe_with(&handle, &iframe, &sel, &val, t)
         })?;
-        Ok(mark_degraded(json!({ "filled": true }), &o.degraded))
+        Ok(with_timeout(
+            mark_degraded(json!({ "filled": true }), &o.degraded),
+            t,
+            tclamped,
+        ))
     }
 
     async fn click_switch_tab(&self, body: &Value) -> Result<Value, String> {

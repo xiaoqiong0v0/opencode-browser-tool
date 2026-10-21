@@ -46,6 +46,21 @@ pub fn mouse_event(
     buttons: i64,
     click_count: i64,
 ) -> ControlResult<()> {
+    mouse_event_with(app, event_type, x, y, button, buttons, click_count, None)
+}
+
+/// 同 `mouse_event`,`timeout_ms` 为 Some 时该步 CDP 等待用传入预算(ms)
+#[cfg(windows)]
+pub fn mouse_event_with(
+    app: &AppHandle,
+    event_type: &str,
+    x: f64,
+    y: f64,
+    button: &str,
+    buttons: i64,
+    click_count: i64,
+    timeout_ms: Option<u64>,
+) -> ControlResult<()> {
     let params = serde_json::json!({
         "type": event_type,
         "x": x,
@@ -55,7 +70,7 @@ pub fn mouse_event(
         "clickCount": click_count,
     })
     .to_string();
-    super::cdp::call_json(app, "Input.dispatchMouseEvent", &params)?;
+    super::cdp::call_json_opt(app, "Input.dispatchMouseEvent", &params, timeout_ms)?;
     Ok(())
 }
 
@@ -63,14 +78,24 @@ pub fn mouse_event(
 ///
 /// 返回实际(或估算)的视口坐标;可信路径下中心出视口 / 被遮挡 / 元素不存在返回 Err
 pub fn click(app: &AppHandle, selector: &str) -> ControlResult<Outcome<Point>> {
+    click_with(app, selector, None)
+}
+
+/// 同 `click`,`timeout_ms` 为 Some 时贯穿本条点击链:每步 eval / 每次 CDP dispatch 用该预算
+/// 最坏耗时 ≈ 单步预算 × 步数(解析+稳定采样若干次 eval,再 mouseMoved/Pressed/Released 三次 CDP)
+pub fn click_with(
+    app: &AppHandle,
+    selector: &str,
+    timeout_ms: Option<u64>,
+) -> ControlResult<Outcome<Point>> {
     if trusted_available() {
-        let p = resolve_stable(app, None, selector)?;
+        let p = resolve_stable(app, None, selector, timeout_ms)?;
         ensure_reachable(&p, selector)?;
         ensure_enabled(&p, selector)?;
-        trusted_click_at(app, p.x, p.y)?;
+        trusted_click_at(app, p.x, p.y, timeout_ms)?;
         return Ok(Outcome::trusted(Point { x: p.x, y: p.y }));
     }
-    Ok(Outcome::degraded(click_fallback(app, selector)?))
+    Ok(Outcome::degraded(click_fallback(app, selector, timeout_ms)?))
 }
 
 /// 悬停元素中心:可信 mouseMoved(触发 CSS `:hover`);否则降级到合成 mouseover/mouseenter
@@ -78,12 +103,23 @@ pub fn click(app: &AppHandle, selector: &str) -> ControlResult<Outcome<Point>> {
 /// 注入前等滚动/布局稳定,注入后轮询 `matches(':hover')` 确认;未生效则重发(有界)。
 /// 仍未生效时返回明确错误(不假装成功)。
 pub fn hover(app: &AppHandle, selector: &str) -> ControlResult<Outcome<Point>> {
+    hover_with(app, selector, None)
+}
+
+/// 同 `hover`,`timeout_ms` 为 Some 时贯穿本条链路。
+/// 稳定等待/单次 `:hover` 轮询预算取 `min(传入, 内部默认)`:不会比 1.8.x 更慢,传小值即可快失败
+pub fn hover_with(
+    app: &AppHandle,
+    selector: &str,
+    timeout_ms: Option<u64>,
+) -> ControlResult<Outcome<Point>> {
     if trusted_available() {
-        let p = resolve_stable(app, None, selector)?;
+        let p = resolve_stable(app, None, selector, timeout_ms)?;
         ensure_reachable(&p, selector)?;
+        let poll_ms = timeout_ms.map(|v| v.min(HOVER_POLL_MS)).unwrap_or(HOVER_POLL_MS);
         for _ in 0..HOVER_RETRIES {
-            trusted_move(app, p.x, p.y)?;
-            if wait_hovered(app, selector, HOVER_POLL_MS)? {
+            trusted_move(app, p.x, p.y, timeout_ms)?;
+            if wait_hovered(app, selector, poll_ms, timeout_ms)? {
                 return Ok(Outcome::trusted(Point { x: p.x, y: p.y }));
             }
         }
@@ -91,7 +127,7 @@ pub fn hover(app: &AppHandle, selector: &str) -> ControlResult<Outcome<Point>> {
             "hover verification failed: element did not become :hover after {HOVER_RETRIES} attempts: {selector}"
         ));
     }
-    Ok(Outcome::degraded(hover_fallback(app, selector)?))
+    Ok(Outcome::degraded(hover_fallback(app, selector, timeout_ms)?))
 }
 
 /// 点击 iframe 内元素:可信路径把内容坐标换算到顶层视口后注入;否则降级到 `el.click()`
@@ -100,17 +136,28 @@ pub fn click_in_iframe(
     iframe_selector: &str,
     selector: &str,
 ) -> ControlResult<Outcome<Point>> {
+    click_in_iframe_with(app, iframe_selector, selector, None)
+}
+
+/// 同 `click_in_iframe`,`timeout_ms` 为 Some 时贯穿整条链路(每步 eval / 每次 CDP)
+pub fn click_in_iframe_with(
+    app: &AppHandle,
+    iframe_selector: &str,
+    selector: &str,
+    timeout_ms: Option<u64>,
+) -> ControlResult<Outcome<Point>> {
     if trusted_available() {
-        let p = resolve_stable(app, Some(iframe_selector), selector)?;
+        let p = resolve_stable(app, Some(iframe_selector), selector, timeout_ms)?;
         ensure_reachable(&p, selector)?;
         ensure_enabled(&p, selector)?;
-        trusted_click_at(app, p.x, p.y)?;
+        trusted_click_at(app, p.x, p.y, timeout_ms)?;
         return Ok(Outcome::trusted(Point { x: p.x, y: p.y }));
     }
     Ok(Outcome::degraded(click_in_iframe_fallback(
         app,
         iframe_selector,
         selector,
+        timeout_ms,
     )?))
 }
 
@@ -123,11 +170,16 @@ fn resolve_stable(
     app: &AppHandle,
     iframe_selector: Option<&str>,
     selector: &str,
+    timeout_ms: Option<u64>,
 ) -> ControlResult<Resolved> {
-    let deadline = Instant::now() + Duration::from_millis(SETTLE_TIMEOUT_MS);
-    let mut last = super::scroll_pos(app)?;
+    // 稳定等待预算:传入值与内部默认取小 → 传小 `--timeout` 可快失败,不传则与 1.8.x 完全一致
+    let settle_ms = timeout_ms
+        .map(|v| v.min(SETTLE_TIMEOUT_MS))
+        .unwrap_or(SETTLE_TIMEOUT_MS);
+    let deadline = Instant::now() + Duration::from_millis(settle_ms);
+    let mut last = super::scroll_pos(app, timeout_ms)?;
     let mut stable = 0u32;
-    let mut best = resolve_point(app, iframe_selector, selector)?;
+    let mut best = resolve_point(app, iframe_selector, selector, timeout_ms)?;
     loop {
         if best.in_viewport && best.hit_ok && stable >= 2 {
             return Ok(best);
@@ -136,8 +188,8 @@ fn resolve_stable(
             return Ok(best);
         }
         std::thread::sleep(Duration::from_millis(SETTLE_POLL_MS));
-        best = resolve_point(app, iframe_selector, selector)?;
-        let cur = super::scroll_pos(app)?;
+        best = resolve_point(app, iframe_selector, selector, timeout_ms)?;
+        let cur = super::scroll_pos(app, timeout_ms)?;
         if best.in_viewport && best.hit_ok && cur == last {
             stable += 1;
         } else {
@@ -148,7 +200,7 @@ fn resolve_stable(
 }
 
 /// 元素当前是否处于 `:hover`
-fn is_hovered(app: &AppHandle, selector: &str) -> ControlResult<bool> {
+fn is_hovered(app: &AppHandle, selector: &str, timeout_ms: Option<u64>) -> ControlResult<bool> {
     let js = format!(
         r#"(function(){{
           var el = document.querySelector({sel:?});
@@ -157,18 +209,23 @@ fn is_hovered(app: &AppHandle, selector: &str) -> ControlResult<bool> {
         }})()"#,
         sel = selector
     );
-    let v = super::eval(app, &js)?;
+    let v = super::eval_with(app, &js, timeout_ms)?;
     if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
         return Err(err.to_string());
     }
     Ok(v.get("hovered").and_then(|b| b.as_bool()).unwrap_or(false))
 }
 
-/// 在 `timeout_ms` 内轮询元素是否 `:hover`
-fn wait_hovered(app: &AppHandle, selector: &str, timeout_ms: u64) -> ControlResult<bool> {
+/// 在 `timeout_ms` 内轮询元素是否 `:hover`(`eval_timeout_ms` = 每步 eval 预算)
+fn wait_hovered(
+    app: &AppHandle,
+    selector: &str,
+    timeout_ms: u64,
+    eval_timeout_ms: Option<u64>,
+) -> ControlResult<bool> {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     loop {
-        if is_hovered(app, selector)? {
+        if is_hovered(app, selector, eval_timeout_ms)? {
             return Ok(true);
         }
         if Instant::now() >= deadline {
@@ -180,15 +237,15 @@ fn wait_hovered(app: &AppHandle, selector: &str, timeout_ms: u64) -> ControlResu
 
 /// 可信点击(平台实现):Windows CDP 鼠标序列;Linux GDK 事件注入
 #[cfg(windows)]
-fn trusted_click_at(app: &AppHandle, x: f64, y: f64) -> ControlResult<()> {
-    mouse_event(app, "mouseMoved", x, y, "none", 0, 0)?;
-    mouse_event(app, "mousePressed", x, y, "left", 1, 1)?;
-    mouse_event(app, "mouseReleased", x, y, "left", 0, 1)?;
+fn trusted_click_at(app: &AppHandle, x: f64, y: f64, timeout_ms: Option<u64>) -> ControlResult<()> {
+    mouse_event_with(app, "mouseMoved", x, y, "none", 0, 0, timeout_ms)?;
+    mouse_event_with(app, "mousePressed", x, y, "left", 1, 1, timeout_ms)?;
+    mouse_event_with(app, "mouseReleased", x, y, "left", 0, 1, timeout_ms)?;
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
-fn trusted_click_at(app: &AppHandle, x: f64, y: f64) -> ControlResult<()> {
+fn trusted_click_at(app: &AppHandle, x: f64, y: f64, _timeout_ms: Option<u64>) -> ControlResult<()> {
     super::gdk::inject(
         app,
         vec![
@@ -201,19 +258,23 @@ fn trusted_click_at(app: &AppHandle, x: f64, y: f64) -> ControlResult<()> {
 
 /// 可信悬停移动(平台实现)
 #[cfg(windows)]
-fn trusted_move(app: &AppHandle, x: f64, y: f64) -> ControlResult<()> {
-    mouse_event(app, "mouseMoved", x, y, "none", 0, 0)
+fn trusted_move(app: &AppHandle, x: f64, y: f64, timeout_ms: Option<u64>) -> ControlResult<()> {
+    mouse_event_with(app, "mouseMoved", x, y, "none", 0, 0, timeout_ms)
 }
 
 #[cfg(target_os = "linux")]
-fn trusted_move(app: &AppHandle, x: f64, y: f64) -> ControlResult<()> {
+fn trusted_move(app: &AppHandle, x: f64, y: f64, _timeout_ms: Option<u64>) -> ControlResult<()> {
     super::gdk::inject(app, vec![super::gdk::Inj::Move(x, y)])
 }
 
 // ---- 降级实现(所有平台编译,Windows 强制降级时可实测) ----
 
 /// 降级点击:旧 `el.click()`(untrusted),并返回元素中心坐标
-fn click_fallback(app: &AppHandle, selector: &str) -> ControlResult<Point> {
+fn click_fallback(
+    app: &AppHandle,
+    selector: &str,
+    timeout_ms: Option<u64>,
+) -> ControlResult<Point> {
     let js = format!(
         r#"(function(){{
           var el = document.querySelector({sel:?});
@@ -225,13 +286,17 @@ fn click_fallback(app: &AppHandle, selector: &str) -> ControlResult<Point> {
         }})()"#,
         sel = selector
     );
-    let v = super::eval(app, &js)?;
+    let v = super::eval_with(app, &js, timeout_ms)?;
     error_to_err(&v)?;
     Ok(point_from(&v))
 }
 
 /// 降级悬停:合成 mouseover/mouseenter(untrusted)
-fn hover_fallback(app: &AppHandle, selector: &str) -> ControlResult<Point> {
+fn hover_fallback(
+    app: &AppHandle,
+    selector: &str,
+    timeout_ms: Option<u64>,
+) -> ControlResult<Point> {
     let js = format!(
         r#"(function(){{
           var el = document.querySelector({sel:?});
@@ -243,7 +308,7 @@ fn hover_fallback(app: &AppHandle, selector: &str) -> ControlResult<Point> {
         }})()"#,
         sel = selector
     );
-    let v = super::eval(app, &js)?;
+    let v = super::eval_with(app, &js, timeout_ms)?;
     error_to_err(&v)?;
     Ok(point_from(&v))
 }
@@ -253,6 +318,7 @@ fn click_in_iframe_fallback(
     app: &AppHandle,
     iframe_selector: &str,
     selector: &str,
+    timeout_ms: Option<u64>,
 ) -> ControlResult<Point> {
     let js = format!(
         r#"(function(){{
@@ -274,7 +340,7 @@ fn click_in_iframe_fallback(
         iframe = iframe_selector,
         sel = selector
     );
-    let v = super::eval(app, &js)?;
+    let v = super::eval_with(app, &js, timeout_ms)?;
     error_to_err(&v)?;
     Ok(point_from(&v))
 }
@@ -340,6 +406,7 @@ fn resolve_point(
     app: &AppHandle,
     iframe_selector: Option<&str>,
     selector: &str,
+    timeout_ms: Option<u64>,
 ) -> ControlResult<Resolved> {
     // iframe 分支:定位 iframe → 取内容文档 → 在内容文档内查询元素
     let lookup = match iframe_selector {
@@ -384,7 +451,7 @@ fn resolve_point(
         lookup = lookup,
         sel = selector
     );
-    let v = super::eval(app, &js)?;
+    let v = super::eval_with(app, &js, timeout_ms)?;
     if let Some(err) = v.get("error").and_then(Value::as_str) {
         return Err(err.to_string());
     }

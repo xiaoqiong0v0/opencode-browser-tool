@@ -118,10 +118,25 @@ pub fn trusted_available() -> bool {
     (cfg!(windows) || cfg!(target_os = "linux")) && !force_degraded()
 }
 
-/// 执行页面内 JS,返回解析后的值(对象/null/字符串等)
+/// 执行页面内 JS,返回解析后的值(对象/null/字符串等);默认超时 `ui::EVAL_TIMEOUT_MS`(5s)
 pub fn eval(app: &AppHandle, js: &str) -> ControlResult<Value> {
     let raw = ui::eval_page(app, js)?;
     serde_json::from_str(&raw).map_err(|e| format!("parse eval result: {e}"))
+}
+
+/// 同 `eval`,但由调用方指定超时(ms)
+pub fn eval_timeout(app: &AppHandle, js: &str, timeout_ms: u64) -> ControlResult<Value> {
+    let raw = ui::eval_page_timeout(app, js, timeout_ms)?;
+    serde_json::from_str(&raw).map_err(|e| format!("parse eval result: {e}"))
+}
+
+/// 内部统一入口:`timeout_ms = None` 走默认(与 1.8.x 完全一致),`Some(ms)` 用传入预算
+/// 编排多步的链路每一步 eval 都经此,保证「每步原语等待用传入值」
+pub(crate) fn eval_with(app: &AppHandle, js: &str, timeout_ms: Option<u64>) -> ControlResult<Value> {
+    match timeout_ms {
+        Some(ms) => eval_timeout(app, js, ms),
+        None => eval(app, js),
+    }
 }
 
 /// 收选择器的请求字段名(统一入口校验覆盖范围)
@@ -192,9 +207,14 @@ pub fn navigate(app: &AppHandle, url: &str) -> ControlResult<()> {
         .map_err(|e| format!("navigate failed: {e}"))
 }
 
-/// 执行任意 JS,返回结果(自动 JSON 序列化)
+/// 执行任意 JS,返回结果(自动 JSON 序列化);默认超时 5s
 pub fn evaluate(app: &AppHandle, script: &str) -> ControlResult<Value> {
     eval(app, &format!("(function(){{ return {script}; }})()"))
+}
+
+/// 同 `evaluate`,但由调用方指定超时(ms)——`evaluate` 工具的 `--timeout` 直达点
+pub fn evaluate_timeout(app: &AppHandle, script: &str, timeout_ms: u64) -> ControlResult<Value> {
+    eval_timeout(app, &format!("(function(){{ return {script}; }})()"), timeout_ms)
 }
 
 /// 获取可见文本
@@ -218,9 +238,18 @@ pub fn visible_text(app: &AppHandle, selector: Option<&str>) -> ControlResult<St
     Ok(v.as_str().unwrap_or("").to_string())
 }
 
-/// 元素状态(可见性/是否禁用/尺寸)
+/// 元素状态(可见性/是否禁用/尺寸);默认超时 5s
 pub fn element_state(app: &AppHandle, selector: &str) -> ControlResult<Value> {
-    eval(
+    element_state_with(app, selector, None)
+}
+
+/// 同 `element_state`,`timeout_ms` 为 Some 时该步 eval 用传入预算(ms)
+pub fn element_state_with(
+    app: &AppHandle,
+    selector: &str,
+    timeout_ms: Option<u64>,
+) -> ControlResult<Value> {
+    eval_with(
         app,
         &format!(
             r#"(function(){{
@@ -235,6 +264,7 @@ pub fn element_state(app: &AppHandle, selector: &str) -> ControlResult<Value> {
             }})()"#,
             sel = selector
         ),
+        timeout_ms,
     )
 }
 
@@ -296,10 +326,12 @@ pub fn wait_ready(
 }
 
 /// 读取窗口滚动位置四舍五入值 (x, y)
-fn scroll_pos(app: &AppHandle) -> ControlResult<(i64, i64)> {
-    let v = eval(
+/// `eval_timeout_ms` = Some 时该步 eval 用传入预算(ms),None 走默认 5s
+fn scroll_pos(app: &AppHandle, eval_timeout_ms: Option<u64>) -> ControlResult<(i64, i64)> {
+    let v = eval_with(
         app,
         "(function(){return {x: Math.round(window.scrollX), y: Math.round(window.scrollY)};})()",
+        eval_timeout_ms,
     )?;
     Ok((
         v.get("x").and_then(Value::as_i64).unwrap_or(0),
@@ -320,11 +352,11 @@ pub fn scroll(app: &AppHandle, dx: i32, dy: i32) -> ControlResult<Value> {
     let timeout = scroll_timeout_ms();
     let start = std::time::Instant::now();
     let deadline = start + std::time::Duration::from_millis(timeout);
-    let mut last = scroll_pos(app)?;
+    let mut last = scroll_pos(app, None)?;
     let mut stable = 0u32;
     loop {
         std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
-        let cur = scroll_pos(app)?;
+        let cur = scroll_pos(app, None)?;
         if cur == last {
             stable += 1;
         } else {
@@ -349,7 +381,11 @@ pub fn scroll(app: &AppHandle, dx: i32, dy: i32) -> ControlResult<Value> {
 }
 
 /// 元素是否在视口内(有尺寸且与视口矩形相交)
-fn element_in_viewport(app: &AppHandle, selector: &str) -> ControlResult<bool> {
+fn element_in_viewport(
+    app: &AppHandle,
+    selector: &str,
+    eval_timeout_ms: Option<u64>,
+) -> ControlResult<bool> {
     let js = format!(
         r#"(function(){{
           var el = document.querySelector({sel:?});
@@ -361,7 +397,7 @@ fn element_in_viewport(app: &AppHandle, selector: &str) -> ControlResult<bool> {
         }})()"#,
         sel = selector
     );
-    let v = eval(app, &js)?;
+    let v = eval_with(app, &js, eval_timeout_ms)?;
     if let Some(err) = v.get("error").and_then(Value::as_str) {
         return Err(err.to_string());
     }
@@ -372,16 +408,18 @@ fn element_in_viewport(app: &AppHandle, selector: &str) -> ControlResult<bool> {
 const FALLBACK_SCROLL_TIMEOUT_MS: u64 = 800;
 
 /// 轮询等待元素进入视口且窗口滚动稳定;返回 `(reached, stable)`
+/// `timeout_ms` = 本轮等待预算;`eval_timeout_ms` = 轮询内每步 eval 的预算(与 `--timeout` 同口径)
 fn wait_element_in_view(
     app: &AppHandle,
     selector: &str,
     timeout_ms: u64,
+    eval_timeout_ms: Option<u64>,
 ) -> ControlResult<(bool, bool)> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
-    let mut last = scroll_pos(app)?;
+    let mut last = scroll_pos(app, eval_timeout_ms)?;
     let mut stable = 0u32;
     loop {
-        let in_view = element_in_viewport(app, selector)?;
+        let in_view = element_in_viewport(app, selector, eval_timeout_ms)?;
         if in_view && stable >= SCROLL_STABLE_SAMPLES {
             return Ok((true, true));
         }
@@ -389,7 +427,7 @@ fn wait_element_in_view(
             return Ok((false, stable >= SCROLL_STABLE_SAMPLES));
         }
         std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
-        let cur = scroll_pos(app)?;
+        let cur = scroll_pos(app, eval_timeout_ms)?;
         if cur == last {
             stable += 1;
         } else {
@@ -431,6 +469,17 @@ fn bring_ancestors_into_view_js(selector: &str) -> String {
 /// 若仍未进入视口,再显式逐级滚动可滚动祖先 + 窗口。全程有界超时,超时如实返回 `reached:false`
 /// 并给 `reason`。
 pub fn scroll_to_element(app: &AppHandle, selector: &str) -> ControlResult<Value> {
+    scroll_to_element_with(app, selector, None)
+}
+
+/// 同 `scroll_to_element`,`timeout_ms` 为 Some 时贯穿整条链路:每步 eval 用该预算,
+/// 两轮等待预算取 `timeout_ms`(未传则沿用各自默认 `scroll_timeout_ms()` / `FALLBACK_SCROLL_TIMEOUT_MS`)
+/// 最坏总耗时 ≈ 每步预算 × 步数(2 轮等待 + 若干 eval)
+pub fn scroll_to_element_with(
+    app: &AppHandle,
+    selector: &str,
+    timeout_ms: Option<u64>,
+) -> ControlResult<Value> {
     let start = std::time::Instant::now();
     let js = format!(
         r#"(function(){{
@@ -441,11 +490,12 @@ pub fn scroll_to_element(app: &AppHandle, selector: &str) -> ControlResult<Value
         }})()"#,
         sel = selector
     );
-    let v = eval(app, &js)?;
+    let v = eval_with(app, &js, timeout_ms)?;
     if let Some(err) = v.get("error").and_then(Value::as_str) {
         return Err(err.to_string());
     }
-    let (reached, stable) = wait_element_in_view(app, selector, scroll_timeout_ms())?;
+    let wait_ms = timeout_ms.unwrap_or_else(scroll_timeout_ms);
+    let (reached, stable) = wait_element_in_view(app, selector, wait_ms, timeout_ms)?;
     if reached {
         return Ok(json!({
             "reached": true, "inViewport": true, "stable": stable, "timedOut": false,
@@ -453,9 +503,10 @@ pub fn scroll_to_element(app: &AppHandle, selector: &str) -> ControlResult<Value
         }));
     }
     // 兜底:显式滚动可滚动祖先链 + 窗口,再做一次有界等待
-    let _ = eval(app, &bring_ancestors_into_view_js(selector));
-    let (reached2, stable2) = wait_element_in_view(app, selector, FALLBACK_SCROLL_TIMEOUT_MS)?;
-    let in_view = element_in_viewport(app, selector)?;
+    let _ = eval_with(app, &bring_ancestors_into_view_js(selector), timeout_ms);
+    let fallback_ms = timeout_ms.unwrap_or(FALLBACK_SCROLL_TIMEOUT_MS);
+    let (reached2, stable2) = wait_element_in_view(app, selector, fallback_ms, timeout_ms)?;
+    let in_view = element_in_viewport(app, selector, timeout_ms)?;
     let mut out = json!({
         "reached": reached2, "inViewport": in_view, "stable": stable2, "timedOut": !reached2,
         "waitedMs": start.elapsed().as_millis() as u64,
@@ -469,19 +520,33 @@ pub fn scroll_to_element(app: &AppHandle, selector: &str) -> ControlResult<Value
 }
 
 /// 等待元素出现(轮询,最多 timeout_ms)
+/// 轮询内每步 eval 的预算取 `min(timeout_ms, EVAL_TIMEOUT_MS)`:默认(10s)时仍是 5s(与既有行为一致),
+/// 模型传小 `--timeout` 时随之变小(快失败),不会被 eval 默认 5s 拖住
 pub fn wait_for_selector(
     app: &AppHandle,
     selector: &str,
     timeout_ms: u64,
 ) -> ControlResult<bool> {
+    let eval_ms = timeout_ms.min(crate::ui::EVAL_TIMEOUT_MS);
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     loop {
-        let v = eval(
+        // 单次轮询的 eval 预算不得超过**剩余**等待时间:否则最小预算(100ms)下,
+        // 第一次 poll 的 eval 就吃满整份预算 → 直接 eval timeout,而不是如实返回 found=false。
+        // 且 eval 失败不算致命:继续轮询直到耗尽 deadline(元素可能在下次 poll 才出现)。
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now()).as_millis() as u64;
+        if remaining == 0 {
+            return Ok(false);
+        }
+        let eval_ms = eval_ms.min(remaining);
+        let v = eval_with(
             app,
             &format!("!!document.querySelector({sel:?})", sel = selector),
-        )?;
-        if v.as_bool().unwrap_or(false) {
-            return Ok(true);
+            Some(eval_ms),
+        );
+        match v {
+            Ok(val) if val.as_bool().unwrap_or(false) => return Ok(true),
+            // eval 失败(超时/解析)不立刻放弃:预算未尽就继续 poll
+            Ok(_) | Err(_) => {}
         }
         if std::time::Instant::now() >= deadline {
             return Ok(false);

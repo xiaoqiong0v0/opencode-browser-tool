@@ -22,12 +22,19 @@ const CDP_TIMEOUT_MS: u64 = 10_000;
 /// 轮询间隔(ms):外层线程每隔多久检查一次结果/超时(短轮询保证即使踢消息失败也能按时返回)
 const CDP_POLL_MS: u64 = 15;
 
-/// 调用任意 CDP 方法并同步等待其结果 JSON
-///
-/// 参数:`app` Tauri 应用句柄;`method_name` CDP 方法名(如 `"Input.dispatchKeyEvent"`);
-/// `params_json` CDP 参数对象的 JSON 字符串
-/// 返回:CDP result 对象的 JSON 字符串(通常是 `"{}"`);Webview 未就绪/调用失败/超时返回 Err
+/// 调用任意 CDP 方法并同步等待其结果 JSON(默认超时 `CDP_TIMEOUT_MS`)
 pub fn call_json(app: &AppHandle, method_name: &str, params_json: &str) -> Result<String, String> {
+    call_json_timeout(app, method_name, params_json, CDP_TIMEOUT_MS)
+}
+
+/// 同 `call_json`,但由调用方指定超时(ms)——模型 `--timeout` 的 CDP 侧入口
+/// 编排多步的链路(上传/可访问性/键盘等)**每一步**都用自己的预算等待,总最坏 ≈ 步数 × 单步超时
+pub fn call_json_timeout(
+    app: &AppHandle,
+    method_name: &str,
+    params_json: &str,
+    timeout_ms: u64,
+) -> Result<String, String> {
     let page = ui::active_page_webview(app).ok_or("page webview not ready")?;
     let (tx, rx) = mpsc::channel::<Result<String, String>>();
     let tx2 = tx.clone();
@@ -70,7 +77,20 @@ pub fn call_json(app: &AppHandle, method_name: &str, params_json: &str) -> Resul
     .map_err(|e| format!("with_webview failed: {e}"))?;
 
     // 有界等待:结果/超时都明确返回,不无限阻塞(对齐项目 ready:false 式诚实口径)
-    wait_bounded(rx, CDP_TIMEOUT_MS)
+    wait_bounded(rx, timeout_ms)
+}
+
+/// 内部统一入口:`timeout_ms = None` 走默认(与 1.8.x 完全一致),`Some(ms)` 用传入预算
+pub(crate) fn call_json_opt(
+    app: &AppHandle,
+    method_name: &str,
+    params_json: &str,
+    timeout_ms: Option<u64>,
+) -> Result<String, String> {
+    match timeout_ms {
+        Some(ms) => call_json_timeout(app, method_name, params_json, ms),
+        None => call_json(app, method_name, params_json),
+    }
 }
 
 /// 有界等待 CDP 结果:短间隔 `recv_timeout` 轮询,直到拿到结果或总超时

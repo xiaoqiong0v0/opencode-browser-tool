@@ -15,24 +15,40 @@ use super::ControlResult;
 #[cfg(windows)]
 use serde_json::Value;
 #[cfg(windows)]
-use super::mouse::mouse_event;
+use super::mouse::mouse_event_with;
 
 /// 把 source 元素拖到 target 元素
 ///
 /// 参数:`app` 应用句柄;`source_selector` / `target_selector` 源与目标选择器
 /// 返回:成功 Ok(());元素不存在 / 平台未实现返回 Err
 pub fn drag(app: &AppHandle, source_selector: &str, target_selector: &str) -> ControlResult<()> {
-    #[cfg(windows)]
-    {
-        drag_windows(app, source_selector, target_selector)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = (app, source_selector, target_selector);
-        Err("drag: not implemented on this platform yet \
-             (Windows via CDP Input.dispatchMouseEvent; Linux/WebKitGTK unverified)"
-            .into())
-    }
+    drag_with(app, source_selector, target_selector, None)
+}
+
+/// 同 `drag`,`timeout_ms` 为 Some 时贯穿:取中心的 eval + 每次 CDP 鼠标事件都用该预算
+/// 最坏耗时 ≈ 单步预算 × 步数(1 次 eval + 2 + DRAG_STEPS + 1 次 CDP)
+#[cfg(windows)]
+pub fn drag_with(
+    app: &AppHandle,
+    source_selector: &str,
+    target_selector: &str,
+    timeout_ms: Option<u64>,
+) -> ControlResult<()> {
+    drag_windows(app, source_selector, target_selector, timeout_ms)
+}
+
+/// 非 Windows:未实现(保留签名以便统一调用)
+#[cfg(not(windows))]
+pub fn drag_with(
+    app: &AppHandle,
+    source_selector: &str,
+    target_selector: &str,
+    timeout_ms: Option<u64>,
+) -> ControlResult<()> {
+    let _ = (app, source_selector, target_selector, timeout_ms);
+    Err("drag: not implemented on this platform yet \
+         (Windows via CDP Input.dispatchMouseEvent; Linux/WebKitGTK unverified)"
+        .into())
 }
 
 /// 鼠标序列的中间插值步数(足以越过拖拽阈值并触发 dragover)
@@ -41,26 +57,31 @@ const DRAG_STEPS: i32 = 8;
 
 /// Windows:先取源/目标中心坐标,再注入鼠标按下→移动→抬起序列
 #[cfg(windows)]
-fn drag_windows(app: &AppHandle, source_selector: &str, target_selector: &str) -> ControlResult<()> {
-    let pt = element_centers(app, source_selector, target_selector)?;
+fn drag_windows(
+    app: &AppHandle,
+    source_selector: &str,
+    target_selector: &str,
+    timeout_ms: Option<u64>,
+) -> ControlResult<()> {
+    let pt = element_centers(app, source_selector, target_selector, timeout_ms)?;
     let sx = pt.0;
     let sy = pt.1;
     let tx = pt.2;
     let ty = pt.3;
 
     // 移到起点(未按下)
-    mouse_event(app, "mouseMoved", sx, sy, "none", 0, 0)?;
+    mouse_event_with(app, "mouseMoved", sx, sy, "none", 0, 0, timeout_ms)?;
     // 按下左键
-    mouse_event(app, "mousePressed", sx, sy, "left", 1, 1)?;
+    mouse_event_with(app, "mousePressed", sx, sy, "left", 1, 1, timeout_ms)?;
     // 分步移动到目标(按住左键),越过拖拽阈值并产生 dragover
     for i in 1..=DRAG_STEPS {
         let t = f64::from(i) / f64::from(DRAG_STEPS);
         let x = sx + (tx - sx) * t;
         let y = sy + (ty - sy) * t;
-        mouse_event(app, "mouseMoved", x, y, "left", 1, 0)?;
+        mouse_event_with(app, "mouseMoved", x, y, "left", 1, 0, timeout_ms)?;
     }
     // 在目标处释放
-    mouse_event(app, "mouseReleased", tx, ty, "left", 0, 1)?;
+    mouse_event_with(app, "mouseReleased", tx, ty, "left", 0, 1, timeout_ms)?;
     Ok(())
 }
 
@@ -70,6 +91,7 @@ fn element_centers(
     app: &AppHandle,
     source_selector: &str,
     target_selector: &str,
+    timeout_ms: Option<u64>,
 ) -> ControlResult<(f64, f64, f64, f64)> {
     let js = format!(
         r#"(function(){{
@@ -89,7 +111,7 @@ fn element_centers(
         src = source_selector,
         dst = target_selector
     );
-    let v = super::eval(app, &js)?;
+    let v = super::eval_with(app, &js, timeout_ms)?;
     if let Some(err) = v.get("error").and_then(Value::as_str) {
         return Err(err.to_string());
     }

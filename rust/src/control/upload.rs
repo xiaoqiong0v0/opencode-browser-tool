@@ -20,6 +20,17 @@ use super::cdp;
 /// 参数:`app` 应用句柄;`selector` file input 选择器;`file_path` 本机文件路径(相对按进程 cwd 解析)
 /// 返回:成功 Ok(());文件不存在 / 元素不存在 / 非 file input / 校验失败 / 平台未实现均返回 Err
 pub fn set_file(app: &AppHandle, selector: &str, file_path: &str) -> ControlResult<()> {
+    set_file_with(app, selector, file_path, None)
+}
+
+/// 同 `set_file`,`timeout_ms` 为 Some 时贯穿整条链:3 步 CDP(各用该预算)+ 回读校验 eval
+/// 最坏耗时 ≈ 单步预算 × 4
+pub fn set_file_with(
+    app: &AppHandle,
+    selector: &str,
+    file_path: &str,
+    timeout_ms: Option<u64>,
+) -> ControlResult<()> {
     // 存在性校验(平台无关,先于任何注入)
     let path = std::path::Path::new(file_path);
     if !path.is_file() {
@@ -28,11 +39,11 @@ pub fn set_file(app: &AppHandle, selector: &str, file_path: &str) -> ControlResu
 
     #[cfg(windows)]
     {
-        set_file_windows(app, selector, file_path)
+        set_file_windows(app, selector, file_path, timeout_ms)
     }
     #[cfg(not(windows))]
     {
-        let _ = (app, selector);
+        let _ = (app, selector, timeout_ms);
         Err("upload_file: not implemented on this platform yet \
              (Windows via CDP DOM.setFileInputFiles; Linux/WebKitGTK unverified)"
             .into())
@@ -41,7 +52,12 @@ pub fn set_file(app: &AppHandle, selector: &str, file_path: &str) -> ControlResu
 
 /// Windows:CDP `DOM.getDocument` → `DOM.querySelector` → `DOM.setFileInputFiles` → 回读校验
 #[cfg(windows)]
-fn set_file_windows(app: &AppHandle, selector: &str, file_path: &str) -> ControlResult<()> {
+fn set_file_windows(
+    app: &AppHandle,
+    selector: &str,
+    file_path: &str,
+    timeout_ms: Option<u64>,
+) -> ControlResult<()> {
     // CDP 需要绝对路径(相对路径按进程 cwd 解析)
     let abs = std::path::absolute(file_path)
         .map_err(|e| format!("resolve absolute path failed: {e}"))?
@@ -49,7 +65,7 @@ fn set_file_windows(app: &AppHandle, selector: &str, file_path: &str) -> Control
         .to_string();
 
     // 1. 文档根节点
-    let doc_raw = cdp::call_json(app, "DOM.getDocument", r#"{"depth":0}"#)?;
+    let doc_raw = cdp::call_json_opt(app, "DOM.getDocument", r#"{"depth":0}"#, timeout_ms)?;
     let doc: Value =
         serde_json::from_str(&doc_raw).map_err(|e| format!("parse DOM.getDocument: {e}"))?;
     let root_id = doc
@@ -60,7 +76,7 @@ fn set_file_windows(app: &AppHandle, selector: &str, file_path: &str) -> Control
 
     // 2. 定位 file input
     let q_params = json!({ "nodeId": root_id, "selector": selector }).to_string();
-    let q_raw = cdp::call_json(app, "DOM.querySelector", &q_params)?;
+    let q_raw = cdp::call_json_opt(app, "DOM.querySelector", &q_params, timeout_ms)?;
     let q: Value =
         serde_json::from_str(&q_raw).map_err(|e| format!("parse DOM.querySelector: {e}"))?;
     let node_id = q.get("nodeId").and_then(Value::as_i64).unwrap_or(0);
@@ -70,15 +86,20 @@ fn set_file_windows(app: &AppHandle, selector: &str, file_path: &str) -> Control
 
     // 3. 挂载文件
     let set_params = json!({ "files": [abs], "nodeId": node_id }).to_string();
-    cdp::call_json(app, "DOM.setFileInputFiles", &set_params)?;
+    cdp::call_json_opt(app, "DOM.setFileInputFiles", &set_params, timeout_ms)?;
 
     // 4. 回读校验:files.length 与文件名必须真的挂上
-    verify_files(app, selector, file_path)
+    verify_files(app, selector, file_path, timeout_ms)
 }
 
 /// 回读 `el.files` 校验上传结果;数量为 0 或文件名不含期望值时返回 Err
 #[cfg(windows)]
-fn verify_files(app: &AppHandle, selector: &str, file_path: &str) -> ControlResult<()> {
+fn verify_files(
+    app: &AppHandle,
+    selector: &str,
+    file_path: &str,
+    timeout_ms: Option<u64>,
+) -> ControlResult<()> {
     let js = format!(
         r#"(function(){{
           var el = document.querySelector({sel:?});
@@ -90,7 +111,7 @@ fn verify_files(app: &AppHandle, selector: &str, file_path: &str) -> ControlResu
         }})()"#,
         sel = selector
     );
-    let v = super::eval(app, &js)?;
+    let v = super::eval_with(app, &js, timeout_ms)?;
     if let Some(err) = v.get("error").and_then(Value::as_str) {
         return Err(err.to_string());
     }

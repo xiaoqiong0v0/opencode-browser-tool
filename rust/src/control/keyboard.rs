@@ -23,24 +23,46 @@ use super::cdp;
 /// 返回:成功 Ok(()),否则 Err(键不支持 / 元素不存在或不可聚焦 / 平台无可信通道 / 注入失败)
 #[cfg(windows)]
 pub fn press_key(app: &AppHandle, key: &str, selector: &str) -> ControlResult<()> {
+    press_key_with(app, key, selector, None)
+}
+
+/// 同 `press_key`,`timeout_ms` 为 Some 时贯穿:聚焦 eval + 两次 CDP(keyDown/keyUp)每步用该预算
+#[cfg(windows)]
+pub fn press_key_with(
+    app: &AppHandle,
+    key: &str,
+    selector: &str,
+    timeout_ms: Option<u64>,
+) -> ControlResult<()> {
     if selector.is_empty() {
         // 无 selector:交给当前活动元素(与旧行为一致)
     } else {
-        focus_element(app, selector)?;
+        focus_element_with(app, selector, timeout_ms)?;
     }
     let def = resolve_key(key).ok_or_else(|| format!("unsupported key: {key}"))?;
     // 有 text:keyDown 会生成 char 并触发默认行为;无 text:rawKeyDown
     let down_type = if def.text.is_some() { "keyDown" } else { "rawKeyDown" };
-    dispatch(app, down_type, &def, true)?;
-    dispatch(app, "keyUp", &def, false)?;
+    dispatch(app, down_type, &def, true, timeout_ms)?;
+    dispatch(app, "keyUp", &def, false, timeout_ms)?;
     Ok(())
 }
 
 /// Linux:先聚焦目标元素,再用 GDK 注入原生键盘事件
 #[cfg(target_os = "linux")]
 pub fn press_key(app: &AppHandle, key: &str, selector: &str) -> ControlResult<()> {
+    press_key_with(app, key, selector, None)
+}
+
+/// 同 `press_key`(Linux):GDK 注入无异步等待,`timeout_ms` 仅用于聚焦 eval
+#[cfg(target_os = "linux")]
+pub fn press_key_with(
+    app: &AppHandle,
+    key: &str,
+    selector: &str,
+    timeout_ms: Option<u64>,
+) -> ControlResult<()> {
     if !selector.is_empty() {
-        focus_element(app, selector)?;
+        focus_element_with(app, selector, timeout_ms)?;
     }
     let keyval = keyval_for(key).ok_or_else(|| format!("unsupported key: {key}"))?;
     super::gdk::inject(app, vec![super::gdk::Inj::Key(keyval)])
@@ -59,14 +81,34 @@ pub fn press_key(_app: &AppHandle, _key: &str, _selector: &str) -> ControlResult
 /// Windows:CDP `Input.insertText`(替换选区);Linux:GDK 逐字符注入按键(已实测可输入大小写/数字/符号)
 #[cfg(windows)]
 pub fn insert_text(app: &AppHandle, text: &str) -> ControlResult<()> {
+    insert_text_with(app, text, None)
+}
+
+/// 同 `insert_text`,`timeout_ms` 为 Some 时该步 CDP 等待用传入预算
+#[cfg(windows)]
+pub fn insert_text_with(
+    app: &AppHandle,
+    text: &str,
+    timeout_ms: Option<u64>,
+) -> ControlResult<()> {
     let params = serde_json::json!({ "text": text }).to_string();
-    cdp::call_json(app, "Input.insertText", &params)?;
+    cdp::call_json_opt(app, "Input.insertText", &params, timeout_ms)?;
     Ok(())
 }
 
 /// Linux:逐字符 GDK 注入
 #[cfg(target_os = "linux")]
 pub fn insert_text(app: &AppHandle, text: &str) -> ControlResult<()> {
+    insert_text_with(app, text, None)
+}
+
+/// 同 `insert_text`(Linux):GDK 注入无异步等待,`timeout_ms` 不参与
+#[cfg(target_os = "linux")]
+pub fn insert_text_with(
+    app: &AppHandle,
+    text: &str,
+    _timeout_ms: Option<u64>,
+) -> ControlResult<()> {
     if text.is_empty() {
         return Ok(());
     }
@@ -83,10 +125,29 @@ pub fn insert_text(_app: &AppHandle, _text: &str) -> ControlResult<()> {
     Err("insert_text: no trusted text channel on this platform".into())
 }
 
+/// 同 `insert_text`(其余平台):恒报错,`_timeout_ms` 不参与
+#[cfg(not(any(windows, target_os = "linux")))]
+pub fn insert_text_with(
+    _app: &AppHandle,
+    _text: &str,
+    _timeout_ms: Option<u64>,
+) -> ControlResult<()> {
+    Err("insert_text: no trusted text channel on this platform".into())
+}
+
 /// 聚焦目标元素,确保后续注入落到该元素而非 body(供键盘/文本输入复用)
 ///
 /// 元素不存在或 `focus()` 未生效(不可聚焦)时返回错误,避免静默落到错误目标
 pub fn focus_element(app: &AppHandle, selector: &str) -> ControlResult<()> {
+    focus_element_with(app, selector, None)
+}
+
+/// 同 `focus_element`,`timeout_ms` 为 Some 时该步 eval 用传入预算
+pub fn focus_element_with(
+    app: &AppHandle,
+    selector: &str,
+    timeout_ms: Option<u64>,
+) -> ControlResult<()> {
     let js = format!(
         r#"(function(){{
           var el = document.querySelector({sel:?});
@@ -97,7 +158,7 @@ pub fn focus_element(app: &AppHandle, selector: &str) -> ControlResult<()> {
         }})()"#,
         sel = selector
     );
-    let v = super::eval(app, &js)?;
+    let v = super::eval_with(app, &js, timeout_ms)?;
     if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
         return Err(err.to_string());
     }
@@ -280,7 +341,13 @@ fn char_code_vk(c: char) -> (String, i64) {
 
 /// 发送一次 CDP `Input.dispatchKeyEvent`
 #[cfg(windows)]
-fn dispatch(app: &AppHandle, event_type: &str, def: &KeyDef, with_text: bool) -> ControlResult<()> {
+fn dispatch(
+    app: &AppHandle,
+    event_type: &str,
+    def: &KeyDef,
+    with_text: bool,
+    timeout_ms: Option<u64>,
+) -> ControlResult<()> {
     let mut params = serde_json::json!({
         "type": event_type,
         "key": def.key,
@@ -297,7 +364,7 @@ fn dispatch(app: &AppHandle, event_type: &str, def: &KeyDef, with_text: bool) ->
     }
     let params =
         serde_json::to_string(&params).map_err(|e| format!("serialize key params: {e}"))?;
-    cdp::call_json(app, "Input.dispatchKeyEvent", &params)?;
+    cdp::call_json_opt(app, "Input.dispatchKeyEvent", &params, timeout_ms)?;
     Ok(())
 }
 

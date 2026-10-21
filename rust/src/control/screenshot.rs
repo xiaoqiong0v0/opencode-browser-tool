@@ -17,13 +17,18 @@ use tauri::AppHandle;
 
 use crate::ui;
 
-/// Windows CDP 截图等待总超时(ms):发起 `Page.captureScreenshot` 到回调送达的全过程有界
-#[cfg(windows)]
+/// 截图等待总超时(ms,默认):发起截图到结果送达的全过程有界;模型 `--timeout` 可覆盖
+#[cfg(any(windows, target_os = "linux"))]
 const SCREENSHOT_TIMEOUT_MS: u64 = 10_000;
 
 /// 截图页面 Webview,返回 PNG base64
 pub fn screenshot(app: &AppHandle) -> Result<String, String> {
-    screenshot_impl(app, None, false)
+    screenshot_impl(app, None, false, None)
+}
+
+/// 同 `screenshot`,`timeout_ms` 为 Some 时用传入预算(整条截图链:滚动偏移 eval + CDP/快照等待)
+pub fn screenshot_with_timeout(app: &AppHandle, timeout_ms: u64) -> Result<String, String> {
+    screenshot_impl(app, None, false, Some(timeout_ms))
 }
 
 /// 截取页面指定区域(**视口** CSS 像素坐标),返回 PNG base64
@@ -36,7 +41,19 @@ pub fn screenshot_clip(
     w: i32,
     h: i32,
 ) -> Result<String, String> {
-    screenshot_impl(app, Some((x, y, w, h)), false)
+    screenshot_impl(app, Some((x, y, w, h)), false, None)
+}
+
+/// 同 `screenshot_clip`,`timeout_ms` 为 Some 时用传入预算
+pub fn screenshot_clip_with_timeout(
+    app: &AppHandle,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    timeout_ms: u64,
+) -> Result<String, String> {
+    screenshot_impl(app, Some((x, y, w, h)), false, Some(timeout_ms))
 }
 
 /// 越界截取页面指定区域(**视口** CSS 像素坐标),返回 PNG base64
@@ -51,7 +68,19 @@ pub fn screenshot_clip_beyond(
     w: i32,
     h: i32,
 ) -> Result<String, String> {
-    screenshot_impl(app, Some((x, y, w, h)), true)
+    screenshot_impl(app, Some((x, y, w, h)), true, None)
+}
+
+/// 同 `screenshot_clip_beyond`,`timeout_ms` 为 Some 时用传入预算
+pub fn screenshot_clip_beyond_with_timeout(
+    app: &AppHandle,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    timeout_ms: u64,
+) -> Result<String, String> {
+    screenshot_impl(app, Some((x, y, w, h)), true, Some(timeout_ms))
 }
 
 /// 读取窗口滚动偏移(整像素),用于视口坐标 → 文档坐标换算
@@ -59,8 +88,12 @@ pub fn screenshot_clip_beyond(
 /// 实测依据(v1.7.0):CDP `Page.captureScreenshot` 的 `clip` **恒为文档坐标**
 /// (`captureBeyondViewport` true/false 均如此),视口坐标传入会截到文档靠顶部的错误区域
 #[cfg(any(windows, target_os = "linux"))]
-fn scroll_offset(app: &AppHandle) -> Result<(i32, i32), String> {
-    let v = super::eval(app, "(function(){return {x:window.scrollX,y:window.scrollY};})()")?;
+fn scroll_offset(app: &AppHandle, timeout_ms: Option<u64>) -> Result<(i32, i32), String> {
+    let v = super::eval_with(
+        app,
+        "(function(){return {x:window.scrollX,y:window.scrollY};})()",
+        timeout_ms,
+    )?;
     Ok((
         v.get("x").and_then(|n| n.as_f64()).unwrap_or(0.0).round() as i32,
         v.get("y").and_then(|n| n.as_f64()).unwrap_or(0.0).round() as i32,
@@ -70,18 +103,21 @@ fn scroll_offset(app: &AppHandle) -> Result<(i32, i32), String> {
 /// 平台分支实现入口
 ///
 /// 参数:`clip` 截图选区 (x, y, w, h),**视口 CSS 像素**坐标(平台实现内换算为文档坐标),
-/// `None` 表示整幅视口;`beyond` 为 true 时走越界路径(元素比视口还大,整块截全)
+/// `None` 表示整幅视口;`beyond` 为 true 时走越界路径(元素比视口还大,整块截全);
+/// `timeout_ms` = Some 时用模型传入预算,否则沿用默认 `SCREENSHOT_TIMEOUT_MS`
 #[cfg(windows)]
 fn screenshot_impl(
     app: &AppHandle,
     clip: Option<(i32, i32, i32, i32)>,
     beyond: bool,
+    timeout_ms: Option<u64>,
 ) -> Result<String, String> {
+    let wait_ms = timeout_ms.unwrap_or(SCREENSHOT_TIMEOUT_MS);
     let page = ui::active_page_webview(app).ok_or("page webview not ready")?;
     // CDP clip 恒为**文档坐标**(实测,与 captureBeyondViewport 取值无关) → 视口坐标先换算
     let clip = match clip {
         Some((x, y, w, h)) => {
-            let (sx, sy) = scroll_offset(app)?;
+            let (sx, sy) = scroll_offset(app, timeout_ms)?;
             Some((x + sx, y + sy, w, h))
         }
         None => None,
@@ -136,7 +172,7 @@ fn screenshot_impl(
     .map_err(|e| format!("with_webview failed: {e}"))?;
 
     // 等待回调结果(有界:超时返回明确错误,不无限阻塞)再解析 CDP 的 { "data": "<base64>" }
-    super::cdp::wait_bounded(rx, SCREENSHOT_TIMEOUT_MS).and_then(|json| {
+    super::cdp::wait_bounded(rx, wait_ms).and_then(|json| {
         let v: serde_json::Value =
             serde_json::from_str(&json).map_err(|e| format!("parse cdp result: {e}"))?;
         v.get("data")
@@ -166,12 +202,14 @@ fn screenshot_impl(
     app: &AppHandle,
     clip: Option<(i32, i32, i32, i32)>,
     beyond: bool,
+    timeout_ms: Option<u64>,
 ) -> Result<String, String> {
+    let wait_ms = timeout_ms.unwrap_or(SCREENSHOT_TIMEOUT_MS);
     let page = ui::active_page_webview(app).ok_or("page webview not ready")?;
     // 越界路径裁剪用文档坐标(FullDocument 原点=文档 0,0);常规路径保持视口坐标(Visible 原点=视口)
     let clip = match clip {
         Some((x, y, w, h)) if beyond => {
-            let (sx, sy) = scroll_offset(app)?;
+            let (sx, sy) = scroll_offset(app, timeout_ms)?;
             Some((x + sx, y + sy, w, h))
         }
         other => other,
@@ -202,9 +240,9 @@ fn screenshot_impl(
     })
     .map_err(|e| format!("with_webview failed: {e}"))?;
 
-    // 等待快照回调结果(10s 超时,与 Windows 分支一致)
-    rx.recv_timeout(std::time::Duration::from_secs(10))
-        .map_err(|_| "screenshot timeout".to_string())?
+    // 等待快照回调结果(有界:默认 10s,可被模型 `--timeout` 覆盖;与 Windows 分支一致)
+    rx.recv_timeout(std::time::Duration::from_millis(wait_ms))
+        .map_err(|_| format!("screenshot timeout (budget {wait_ms}ms)"))?
 }
 
 /// 把 cairo 快照面编码为 PNG 并做标准 base64(可先按 CSS 像素坐标裁剪)
@@ -269,6 +307,7 @@ fn screenshot_impl(
     _app: &AppHandle,
     _clip: Option<(i32, i32, i32, i32)>,
     _beyond: bool,
+    _timeout_ms: Option<u64>,
 ) -> Result<String, String> {
     Err("screenshot not implemented on this platform yet".into())
 }

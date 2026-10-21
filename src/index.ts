@@ -59,28 +59,53 @@ type CmdDef = {
 };
 
 /** 命令表:bt_cli 按 command 分发;命令描述全部走 i18n 键,帮助按 toolLang 本地化 */
+
+/** `--timeout` 合法区间(ms):与 Rust `service.rs` 的 `TIMEOUT_MIN_MS`/`TIMEOUT_MAX_MS` 同口径 */
+const TIMEOUT_MIN_MS = 100;
+const TIMEOUT_MAX_MS = 60000;
+
+/** 解析并规范化模型传入的 `--timeout`(毫秒,与 `wait_for_selector` 既有单位一致)
+ * - 未传/空:返回空串,各命令默认行为不变(不改现状默认:eval 5s / CDP 10s / 截图 10s)
+ * - 非正整数:抛错 —— 快速明确拒绝,不带着坏值进浏览器
+ * - 超出 [100, 60000]:钳制并把 `a.timeout` 改写为钳后值(实际生效值),返回如实标注文案
+ * 服务端 Rust 侧同口径二次钳制兜底(直连 HTTP 也安全);响应体的 timeoutClamped 与这里一致
+ */
+function timeoutNote(a: any): string {
+  const raw = a?.timeout;
+  if (raw === undefined || raw === null || raw === "") return "";
+  const n = typeof raw === "number" ? raw : Number(String(raw).trim());
+  if (!Number.isInteger(n) || n <= 0) {
+    throw new Error(_t("cli.err.timeout_invalid", { v: String(raw) }));
+  }
+  const c = Math.min(Math.max(n, TIMEOUT_MIN_MS), TIMEOUT_MAX_MS);
+  a.timeout = c;
+  return c === n ? "" : _t("cli.note.timeout_clamped", { ms: c });
+}
+
 const COMMANDS: Record<string, CmdDef> = {
   navigate: { usage: "--url", descKey: "cli.cmd.navigate", args: [{ flag: "url" }], run: async (a) => {
     const r = await service.navigate(a);
     if (r.installError) return _t("cli.out.navigate.install_failed", { error: r.error });
     return r.installing ? _t("cli.out.navigate.installing", { name: r.installing, progress: r.progress }) : _t("cli.out.navigate.ok", { url: r.url }) + readyNote(r);
   } },
-  click: { usage: "--selector", descKey: "cli.cmd.click", args: [{ flag: "selector" }], run: async (a) => { const r = await service.click(a); return _t("cli.out.click") + degradedNote(r); } },
-  fill: { usage: "--selector --value", descKey: "cli.cmd.fill", args: [{ flag: "selector" }, { flag: "value" }], run: async (a) => { const r = await service.fill(a); return _t("cli.out.fill") + degradedNote(r); } },
-  clear: { usage: "--selector", descKey: "cli.cmd.clear", args: [{ flag: "selector" }], run: async (a) => { const r = await service.clear(a); return _t("cli.out.clear") + degradedNote(r); } },
-  select: { usage: "--selector --value", descKey: "cli.cmd.select", args: [{ flag: "selector" }, { flag: "value" }], run: async (a) => { const r = await service.select(a); return _t("cli.out.select") + degradedNote(r); } },
-  hover: { usage: "--selector", descKey: "cli.cmd.hover", args: [{ flag: "selector" }], run: async (a) => { const r = await service.hover(a); return _t("cli.out.hover") + degradedNote(r); } },
-  drag: { usage: "--sourceSelector --targetSelector", descKey: "cli.cmd.drag", args: [{ flag: "sourceSelector" }, { flag: "targetSelector" }], run: async (a) => { await service.drag(a); return _t("cli.out.drag"); } },
-  press_key: { usage: "--key [--selector]", descKey: "cli.cmd.press_key", args: [{ flag: "key" }, { flag: "selector" }], run: async (a) => { await service.pressKey(a); return _t("cli.out.press_key", { key: a.key }); } },
-  upload_file: { usage: "--selector --filePath", descKey: "cli.cmd.upload_file", args: [{ flag: "selector" }, { flag: "filePath" }], run: async (a) => { await service.uploadFile(a); return _t("cli.out.upload_file"); } },
-  screenshot: { usage: "[--selector]", descKey: "cli.cmd.screenshot", args: [{ flag: "selector" }], run: async (a) => {
+  click: { usage: "--selector [--timeout ms]", descKey: "cli.cmd.click", args: [{ flag: "selector" }, { flag: "timeout" }], run: async (a) => { const tn = timeoutNote(a); const r = await service.click(a); return _t("cli.out.click") + degradedNote(r) + tn; } },
+  fill: { usage: "--selector --value [--timeout ms]", descKey: "cli.cmd.fill", args: [{ flag: "selector" }, { flag: "value" }, { flag: "timeout" }], run: async (a) => { const tn = timeoutNote(a); const r = await service.fill(a); return _t("cli.out.fill") + degradedNote(r) + tn; } },
+  clear: { usage: "--selector [--timeout ms]", descKey: "cli.cmd.clear", args: [{ flag: "selector" }, { flag: "timeout" }], run: async (a) => { const tn = timeoutNote(a); const r = await service.clear(a); return _t("cli.out.clear") + degradedNote(r) + tn; } },
+  select: { usage: "--selector --value [--timeout ms]", descKey: "cli.cmd.select", args: [{ flag: "selector" }, { flag: "value" }, { flag: "timeout" }], run: async (a) => { const tn = timeoutNote(a); const r = await service.select(a); return _t("cli.out.select") + degradedNote(r) + tn; } },
+  hover: { usage: "--selector [--timeout ms]", descKey: "cli.cmd.hover", args: [{ flag: "selector" }, { flag: "timeout" }], run: async (a) => { const tn = timeoutNote(a); const r = await service.hover(a); return _t("cli.out.hover") + degradedNote(r) + tn; } },
+  drag: { usage: "--sourceSelector --targetSelector [--timeout ms]", descKey: "cli.cmd.drag", args: [{ flag: "sourceSelector" }, { flag: "targetSelector" }, { flag: "timeout" }], run: async (a) => { const tn = timeoutNote(a); await service.drag(a); return _t("cli.out.drag") + tn; } },
+  press_key: { usage: "--key [--selector] [--timeout ms]", descKey: "cli.cmd.press_key", args: [{ flag: "key" }, { flag: "selector" }, { flag: "timeout" }], run: async (a) => { const tn = timeoutNote(a); await service.pressKey(a); return _t("cli.out.press_key", { key: a.key }) + tn; } },
+  upload_file: { usage: "--selector --filePath [--timeout ms]", descKey: "cli.cmd.upload_file", args: [{ flag: "selector" }, { flag: "filePath" }, { flag: "timeout" }], run: async (a) => { const tn = timeoutNote(a); await service.uploadFile(a); return _t("cli.out.upload_file") + tn; } },
+  screenshot: { usage: "[--selector] [--timeout ms]", descKey: "cli.cmd.screenshot", args: [{ flag: "selector" }, { flag: "timeout" }], run: async (a) => {
+    const tn = timeoutNote(a);
     const r = await service.screenshot(a);
     // 元素截图:先滚动到可见再截;rect 超出视口时走越界路径(截全),滚动未稳定/未到达如实标注
     const where = a.selector ? _t("cli.out.screenshot.element", { sel: a.selector }) : _t("cli.out.screenshot.fullpage");
     const note = (r as any)?.beyondViewport ? _t("cli.note.beyond") : "";
-    return { output: _t("cli.out.screenshot", { where }) + note + reachedNote(r) + stableNote(r), attachments: [{ type: "file", mime: r.mime || "image/png", url: `data:${r.mime || "image/png"};base64,${r.base64}` }] };
+    return { output: _t("cli.out.screenshot", { where }) + note + reachedNote(r) + stableNote(r) + tn, attachments: [{ type: "file", mime: r.mime || "image/png", url: `data:${r.mime || "image/png"};base64,${r.base64}` }] };
   } },
-  evaluate: { usage: "--script", descKey: "cli.cmd.evaluate", args: [{ flag: "script" }], run: async (a) => JSON.stringify(await service.evaluate(a), null, 2) },
+  // evaluate:超时最常用(脚本 await 慢操作);超时返回明确 eval timeout 错误,不再恒 5s
+  evaluate: { usage: "--script [--timeout ms]", descKey: "cli.cmd.evaluate", args: [{ flag: "script" }, { flag: "timeout" }], run: async (a) => { const tn = timeoutNote(a); return JSON.stringify(await service.evaluate(a), null, 2) + tn; } },
   get_visible_text: { usage: "[--selector]", descKey: "cli.cmd.get_visible_text", args: [{ flag: "selector" }], run: async (a) => (await service.visibleText(a))?.text || _t("cli.out.no_visible_text") },
   get_visible_html: { usage: "[--selector --removeScripts --removeComments --maxLength]", descKey: "cli.cmd.get_visible_html", args: [{ flag: "selector" }, { flag: "removeScripts", type: "boolean" }, { flag: "removeComments", type: "boolean" }, { flag: "maxLength" }], run: async (a) => {
     // 宿主要求 tool 返回字符串;服务端返回对象 {html,truncated},这里取出 html 文本本体
@@ -115,8 +140,8 @@ const COMMANDS: Record<string, CmdDef> = {
   scroll: { usage: "[--direction --amount]", descKey: "cli.cmd.scroll", args: [{ flag: "direction" }, { flag: "amount" }], run: async (a) => { const r = await service.scroll(a); return _t("cli.out.scroll", { dir: a.direction || "down", n: a.amount || 300 }) + stableNote(r); } },
   wait_for_selector: { usage: "--selector [--timeout]", descKey: "cli.cmd.wait_for_selector", args: [{ flag: "selector" }, { flag: "timeout" }], run: async (a) => { await service.waitForSelector(a); return _t("cli.out.wait_appeared"); } },
   click_and_switch_tab: { usage: "--selector", descKey: "cli.cmd.click_and_switch_tab", args: [{ flag: "selector" }], run: async (a) => { const r = await service.clickSwitchTab(a); return _t("cli.out.click_switch_tab", { sel: a.selector, url: r.url || "" }) + degradedNote(r); } },
-  iframe_click: { usage: "--iframeSelector --selector", descKey: "cli.cmd.iframe_click", args: [{ flag: "iframeSelector" }, { flag: "selector" }], run: async (a) => { const r = await service.iframeClick(a); return _t("cli.out.iframe_click") + degradedNote(r); } },
-  iframe_fill: { usage: "--iframeSelector --selector --value", descKey: "cli.cmd.iframe_fill", args: [{ flag: "iframeSelector" }, { flag: "selector" }, { flag: "value" }], run: async (a) => { const r = await service.iframeFill(a); return _t("cli.out.iframe_fill") + degradedNote(r); } },
+  iframe_click: { usage: "--iframeSelector --selector [--timeout ms]", descKey: "cli.cmd.iframe_click", args: [{ flag: "iframeSelector" }, { flag: "selector" }, { flag: "timeout" }], run: async (a) => { const tn = timeoutNote(a); const r = await service.iframeClick(a); return _t("cli.out.iframe_click") + degradedNote(r) + tn; } },
+  iframe_fill: { usage: "--iframeSelector --selector --value [--timeout ms]", descKey: "cli.cmd.iframe_fill", args: [{ flag: "iframeSelector" }, { flag: "selector" }, { flag: "value" }, { flag: "timeout" }], run: async (a) => { const tn = timeoutNote(a); const r = await service.iframeFill(a); return _t("cli.out.iframe_fill") + degradedNote(r) + tn; } },
   get_browser_status: { usage: "", descKey: "cli.cmd.get_browser_status", run: async () => {
     // 纯查询:不 spawn、不懒启动(未运行只提示,不弹窗)
     const s = await probeStatus();
@@ -133,13 +158,13 @@ const COMMANDS: Record<string, CmdDef> = {
   switch_tab: { usage: "--index", descKey: "cli.cmd.switch_tab", args: [{ flag: "index" }], run: async (a) => { const r = await service.switchTab(a); return _t("cli.out.switch_tab", { i: a.index, url: r.url }); } },
   new_tab: { usage: "--url", descKey: "cli.cmd.new_tab", args: [{ flag: "url" }], run: async (a) => { const r = await service.newTab(a); return _t("cli.out.new_tab", { url: r.url }); } },
   close_tab: { usage: "[--index]", descKey: "cli.cmd.close_tab", args: [{ flag: "index" }], run: async (a) => { await service.closeTab(a); return a.index !== undefined ? _t("cli.out.close_tab", { i: a.index }) : _t("cli.out.close_tab_current"); } },
-  get_element_state: { usage: "--selector", descKey: "cli.cmd.get_element_state", args: [{ flag: "selector" }], run: async (a) => { const r: any = await service.elementState(a); if (!r || !r.exists) return _t("cli.out.element_not_found", { sel: a.selector }); const text = r.text ? `\nText: ${r.text}` : ""; return _t("cli.out.element_state", { tag: r.tag, sel: a.selector, visible: r.visible, text, rect: `${r.rect.x},${r.rect.y} ${r.rect.w}x${r.rect.h}` }); } },
-  scroll_to_element: { usage: "--selector", descKey: "cli.cmd.scroll_to_element", args: [{ flag: "selector" }], run: async (a) => { const r = await service.scrollToElement(a); return _t("cli.out.scroll_to_element") + reachedNote(r); } },
-  get_dropdown_options: { usage: "--selector", descKey: "cli.cmd.get_dropdown_options", args: [{ flag: "selector" }], run: async (a) => { const r: any = await service.dropdownOptions(a); const opts: any[] = r?.options ?? []; if (!opts.length) return _t("cli.out.dropdown_none", { sel: a.selector }); return opts.map((o: any) => `${o.selected ? "* " : "  "}${o.value}: ${o.text}`).join("\n"); } },
+  get_element_state: { usage: "--selector [--timeout ms]", descKey: "cli.cmd.get_element_state", args: [{ flag: "selector" }, { flag: "timeout" }], run: async (a) => { const tn = timeoutNote(a); const r: any = await service.elementState(a); if (!r || !r.exists) return _t("cli.out.element_not_found", { sel: a.selector }); const text = r.text ? `\nText: ${r.text}` : ""; return _t("cli.out.element_state", { tag: r.tag, sel: a.selector, visible: r.visible, text, rect: `${r.rect.x},${r.rect.y} ${r.rect.w}x${r.rect.h}` }) + tn; } },
+  scroll_to_element: { usage: "--selector [--timeout ms]", descKey: "cli.cmd.scroll_to_element", args: [{ flag: "selector" }, { flag: "timeout" }], run: async (a) => { const tn = timeoutNote(a); const r = await service.scrollToElement(a); return _t("cli.out.scroll_to_element") + reachedNote(r) + tn; } },
+  get_dropdown_options: { usage: "--selector [--timeout ms]", descKey: "cli.cmd.get_dropdown_options", args: [{ flag: "selector" }, { flag: "timeout" }], run: async (a) => { const tn = timeoutNote(a); const r: any = await service.dropdownOptions(a); const opts: any[] = r?.options ?? []; if (!opts.length) return _t("cli.out.dropdown_none", { sel: a.selector }); return opts.map((o: any) => `${o.selected ? "* " : "  "}${o.value}: ${o.text}`).join("\n") + tn; } },
   custom_user_agent: { usage: "--userAgent", descKey: "cli.cmd.custom_user_agent", args: [{ flag: "userAgent" }], run: async (a) => { await service.userAgent(a); return _t("cli.out.ua_set"); } },
   expect_response: { usage: "--url", descKey: "cli.cmd.expect_response", args: [{ flag: "url" }], run: async (a) => { await service.expectResponse({ urlPattern: a.url }); return _t("cli.out.expect_response", { url: a.url }); } },
   assert_response: { usage: "--id", descKey: "cli.cmd.assert_response", args: [{ flag: "id" }], run: async (a) => { const r = await service.assertResponse({ id: a.id }); return r.matched ? _t("cli.out.assert_matched", { url: r.url, status: r.status }) : r.error || _t("cli.out.assert_none"); } },
-  get_accessibility_tree: { usage: "[--selector --maxDepth]", descKey: "cli.cmd.get_accessibility_tree", args: [{ flag: "selector" }, { flag: "maxDepth" }], run: async (a) => { const s = await service.accessibility(a); return s ? formatNode(s, 0, a.maxDepth ?? 8) : _t("cli.out.no_ax"); } },
+  get_accessibility_tree: { usage: "[--selector --maxDepth] [--timeout ms]", descKey: "cli.cmd.get_accessibility_tree", args: [{ flag: "selector" }, { flag: "maxDepth" }, { flag: "timeout" }], run: async (a) => { const tn = timeoutNote(a); const s = await service.accessibility(a); return (s ? formatNode(s, 0, a.maxDepth ?? 8) : _t("cli.out.no_ax")) + tn; } },
   list_records: { usage: "", descKey: "cli.cmd.list_records", run: async () => { try { const records = await service.annotateRecords(); if (!records || !records.length) return _t("cli.out.no_records"); return records.map((r: any) => { const rect = r.rect ? ` rect=(${r.rect[0]},${r.rect[1]},${r.rect[2]},${r.rect[3]})` : ""; const img = r.image ? " +img" : ""; const sent = r.sent ? " [sent]" : ""; return `[${r.index}] ${r.selector}${rect}${img}${sent}${r.note ? ` note="${r.note}"` : ""}`; }).join("\n"); } catch { return _t("cli.out.no_records"); } } },
   read_record_content: { usage: "--id", descKey: "cli.cmd.read_record_content", args: [{ flag: "id" }], run: async (a) => { try { const records = await service.annotateRecords(); const rec = (records || []).find((r: any) => r.index === a.id); if (!rec) return _t("cli.out.record_not_found", { id: a.id }); let img = ""; if (rec.image) { const p = saveShotImage(log, rec.index, rec.image); const kb = Math.round(rec.image.length / 1024); img = p ? _t("cli.out.record_image_saved", { kb, path: p }) : _t("cli.out.record_image", { kb }); } return `#${rec.index} ${rec.selector}\nrect: ${JSON.stringify(rec.rect)}${img}\nnote: ${rec.note || _t("cli.out.record_note_none")}`; } catch { return _t("cli.out.no_records"); } } },
   fake_audio: { usage: "--kind [--data --freq --durMs --notes --digits --loop]", descKey: "cli.cmd.fake_audio", args: [{ flag: "kind" }, { flag: "data" }, { flag: "freq" }, { flag: "durMs" }, { flag: "notes" }, { flag: "digits" }, { flag: "loop", type: "boolean" }], run: async (a) => { const r = await service.mediaAudio(a); return _t("cli.out.fake_audio", { injected: r.injected }); } },

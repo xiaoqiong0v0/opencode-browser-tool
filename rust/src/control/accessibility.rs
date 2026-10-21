@@ -17,14 +17,25 @@ pub fn accessibility_tree(
     app: &AppHandle,
     selector: Option<&str>,
 ) -> Result<serde_json::Value, String> {
+    accessibility_tree_with(app, selector, None)
+}
+
+/// 同 `accessibility_tree`,`timeout_ms` 为 Some 时贯穿整条链
+/// Windows 带 selector 时是 4 步 CDP(各用该预算),无 selector 是 1 步;Linux 是 1 次 eval
+pub fn accessibility_tree_with(
+    app: &AppHandle,
+    selector: Option<&str>,
+    timeout_ms: Option<u64>,
+) -> Result<serde_json::Value, String> {
     #[cfg(windows)]
     {
         match selector {
             // 有 selector:走 DOM 节点定位 + 部分 AX 树
-            Some(s) if !s.is_empty() => cdp_subtree(app, s),
+            Some(s) if !s.is_empty() => cdp_subtree(app, s, timeout_ms),
             // 无 selector:整页(原行为)
             _ => {
-                let raw = cdp::call_json(app, "Accessibility.getFullAXTree", "{}")?;
+                let raw =
+                    cdp::call_json_opt(app, "Accessibility.getFullAXTree", "{}", timeout_ms)?;
                 // CDP 返回 { "nodes": [...] }
                 let v: serde_json::Value =
                     serde_json::from_str(&raw).map_err(|e| format!("parse cdp result: {e}"))?;
@@ -35,11 +46,11 @@ pub fn accessibility_tree(
     }
     #[cfg(target_os = "linux")]
     {
-        dom_accessibility_tree(app, selector)
+        dom_accessibility_tree(app, selector, timeout_ms)
     }
     #[cfg(not(any(windows, target_os = "linux")))]
     {
-        let _ = (app, selector);
+        let _ = (app, selector, timeout_ms);
         Err("accessibility not implemented on this platform yet".into())
     }
 }
@@ -55,9 +66,13 @@ pub fn accessibility_tree(
 /// Chromium 会把 html/body、无 accessible name 的 generic 容器标为 ignored;
 /// ignored 节点交由 build_tree 过滤并提升其子树,与整页语义一致。
 #[cfg(windows)]
-fn cdp_subtree(app: &AppHandle, selector: &str) -> Result<serde_json::Value, String> {
+fn cdp_subtree(
+    app: &AppHandle,
+    selector: &str,
+    timeout_ms: Option<u64>,
+) -> Result<serde_json::Value, String> {
     // 1. 取文档根节点(depth:0 只需 root)
-    let doc_raw = cdp::call_json(app, "DOM.getDocument", r#"{"depth":0}"#)?;
+    let doc_raw = cdp::call_json_opt(app, "DOM.getDocument", r#"{"depth":0}"#, timeout_ms)?;
     let doc: serde_json::Value =
         serde_json::from_str(&doc_raw).map_err(|e| format!("parse DOM.getDocument: {e}"))?;
     let root_id = doc
@@ -67,7 +82,7 @@ fn cdp_subtree(app: &AppHandle, selector: &str) -> Result<serde_json::Value, Str
         .ok_or("DOM.getDocument: no root nodeId")?;
     // 2. 查询选择器命中的 DOM 节点(nodeId=0 表示未命中)
     let q_params = json!({ "nodeId": root_id, "selector": selector }).to_string();
-    let q_raw = cdp::call_json(app, "DOM.querySelector", &q_params)?;
+    let q_raw = cdp::call_json_opt(app, "DOM.querySelector", &q_params, timeout_ms)?;
     let q: serde_json::Value =
         serde_json::from_str(&q_raw).map_err(|e| format!("parse DOM.querySelector: {e}"))?;
     let node_id = q.get("nodeId").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -76,7 +91,7 @@ fn cdp_subtree(app: &AppHandle, selector: &str) -> Result<serde_json::Value, Str
     }
     // 3. 该节点的 backendNodeId(AX 节点用它定位命中的 DOM 节点)
     let d_params = json!({ "nodeId": node_id }).to_string();
-    let d_raw = cdp::call_json(app, "DOM.describeNode", &d_params)?;
+    let d_raw = cdp::call_json_opt(app, "DOM.describeNode", &d_params, timeout_ms)?;
     let d: serde_json::Value =
         serde_json::from_str(&d_raw).map_err(|e| format!("parse DOM.describeNode: {e}"))?;
     let backend_id = d
@@ -87,7 +102,7 @@ fn cdp_subtree(app: &AppHandle, selector: &str) -> Result<serde_json::Value, Str
     // 4. 全量 AX 树快照(含 ignored 节点,父子关系完整)
     //    不用 getPartialAXTree:实测它只返回命中节点 + 直接子节点 + 祖先,
     //    拿不到完整后代子树(且 fetchRelatives=false 时连后代都没有)
-    let full_raw = cdp::call_json(app, "Accessibility.getFullAXTree", "{}")?;
+    let full_raw = cdp::call_json_opt(app, "Accessibility.getFullAXTree", "{}", timeout_ms)?;
     let full: serde_json::Value =
         serde_json::from_str(&full_raw).map_err(|e| format!("parse getFullAXTree: {e}"))?;
     let nodes = full.get("nodes").and_then(|n| n.as_array()).cloned().unwrap_or_default();
@@ -132,6 +147,7 @@ fn pick_target_ax_node(nodes: &[serde_json::Value], backend_id: i64) -> Option<S
 fn dom_accessibility_tree(
     app: &AppHandle,
     selector: Option<&str>,
+    timeout_ms: Option<u64>,
 ) -> Result<serde_json::Value, String> {
     // selector 以 JSON 字面量注入 JS(避免手工转义),未指定时为 null
     let sel_lit = match selector {
@@ -139,7 +155,11 @@ fn dom_accessibility_tree(
         _ => "null".to_string(),
     };
     let js = DOM_AX_JS.replace("__BT_AX_SELECTOR__", &sel_lit);
-    let raw = ui::eval_page(app, &js)?;
+    // timeout_ms: Some 时该步 eval 用传入预算(与 Windows 侧 CDP 步骤同口径)
+    let raw = match timeout_ms {
+        Some(ms) => ui::eval_page_timeout(app, &js, ms)?,
+        None => ui::eval_page(app, &js)?,
+    };
     let v: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| format!("parse dom ax result: {e}"))?;
     // 选择器未命中:JS 返回 {error},直接透传为业务错误

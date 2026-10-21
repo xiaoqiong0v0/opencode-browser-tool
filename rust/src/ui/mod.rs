@@ -29,6 +29,8 @@ pub const TOOLBAR_WEBVIEW: &str = "toolbar";
 pub const PANEL_WIDTH: f64 = 280.0;
 /// 顶部工具栏高度(逻辑像素,两行:标签行 + 地址栏行)
 pub const TOOLBAR_HEIGHT: f64 = 72.0;
+/// 页面 eval 默认超时(ms):模型未传 `--timeout` 时保持 1.8.x 的 5s 行为不变
+pub const EVAL_TIMEOUT_MS: u64 = 5000;
 /// 内容区(视口)最小尺寸(逻辑像素):`resize` clamp 下限,与窗口 min_inner_size 的内容区口径一致
 pub const CONTENT_MIN_SIZE: f64 = 360.0;
 /// 窄模式阈值(窗口**逻辑**宽 < 此值):面板填满窗口 + 工具栏批注/截图/面板按钮图标化
@@ -1645,7 +1647,15 @@ pub fn normalize_url(raw: &str) -> String {
 }
 
 /// 在激活页面 Webview 执行 JS,返回 JSON 结果(控制协议核心)
+///
+/// 超时口径:模型未传 `--timeout` 时用默认 `EVAL_TIMEOUT_MS`(5s,与 1.8.x 行为一致);
+/// 传了则用调用方给的值(`eval_page_timeout`)。超时统一报 `"eval timeout"`(模型可据此识别)。
 pub fn eval_page(app: &AppHandle, js: &str) -> Result<String, String> {
+    eval_page_timeout(app, js, EVAL_TIMEOUT_MS)
+}
+
+/// 同 `eval_page`,但由调用方指定超时(ms)
+pub fn eval_page_timeout(app: &AppHandle, js: &str, timeout_ms: u64) -> Result<String, String> {
     let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
     let page = active_page_webview(app).ok_or("page webview not ready")?;
     page.eval_with_callback(
@@ -1655,8 +1665,8 @@ pub fn eval_page(app: &AppHandle, js: &str) -> Result<String, String> {
         },
     )
     .map_err(|e| format!("eval failed: {e}"))?;
-    rx.recv_timeout(std::time::Duration::from_secs(5))
-        .map_err(|_| "eval timeout".to_string())?
+    rx.recv_timeout(std::time::Duration::from_millis(timeout_ms))
+        .map_err(|_| format!("eval timeout (budget {timeout_ms}ms)"))?
 }
 
 /// 在覆盖层 Webview 执行 JS

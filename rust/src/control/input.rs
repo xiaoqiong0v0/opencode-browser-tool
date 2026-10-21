@@ -17,47 +17,77 @@ use super::keyboard;
 
 /// 填写输入框:可信通道失败时报错,降级路径标注 degraded
 pub fn fill(app: &AppHandle, selector: &str, value: &str) -> ControlResult<Outcome<()>> {
+    fill_with(app, selector, value, None)
+}
+
+/// 同 `fill`,`timeout_ms` 为 Some 时贯穿整条链:聚焦/全选 eval、insertText CDP、读回校验轮询
+/// 读回校验预算取 `min(传入, VERIFY_TIMEOUT_MS)` —— 不传则与 1.8.x 完全一致
+pub fn fill_with(
+    app: &AppHandle,
+    selector: &str,
+    value: &str,
+    timeout_ms: Option<u64>,
+) -> ControlResult<Outcome<()>> {
     if selector.is_empty() {
         return Err("selector is required".into());
     }
     if trusted_available() {
-        fill_trusted(app, selector, value)?;
+        fill_trusted(app, selector, value, timeout_ms)?;
         return Ok(Outcome::trusted(()));
     }
-    fill_fallback(app, selector, value)?;
+    fill_fallback(app, selector, value, timeout_ms)?;
     Ok(Outcome::degraded(()))
 }
 
 /// 清空输入框(等价 fill 空值;Windows 用全选 + Delete,确保产生 input 事件)
 pub fn clear(app: &AppHandle, selector: &str) -> ControlResult<Outcome<()>> {
+    clear_with(app, selector, None)
+}
+
+/// 同 `clear`,`timeout_ms` 口径与 `fill_with` 一致
+pub fn clear_with(
+    app: &AppHandle,
+    selector: &str,
+    timeout_ms: Option<u64>,
+) -> ControlResult<Outcome<()>> {
     if selector.is_empty() {
         return Err("selector is required".into());
     }
     if trusted_available() {
-        clear_trusted(app, selector)?;
+        clear_trusted(app, selector, timeout_ms)?;
         return Ok(Outcome::trusted(()));
     }
-    fill_fallback(app, selector, "")?;
+    fill_fallback(app, selector, "", timeout_ms)?;
     Ok(Outcome::degraded(()))
 }
 
 /// 选择下拉项:返回读回的实际选中值(便于调用方校验)
 pub fn select(app: &AppHandle, selector: &str, value: &str) -> ControlResult<Outcome<String>> {
+    select_with(app, selector, value, None)
+}
+
+/// 同 `select`,`timeout_ms` 口径与 `fill_with` 一致(方向键次数 × 单次 CDP 预算 + 读回轮询)
+pub fn select_with(
+    app: &AppHandle,
+    selector: &str,
+    value: &str,
+    timeout_ms: Option<u64>,
+) -> ControlResult<Outcome<String>> {
     if selector.is_empty() {
         return Err("selector is required".into());
     }
     if trusted_available() {
-        if let Some(actual) = select_trusted_if_supported(app, selector, value)? {
+        if let Some(actual) = select_trusted_if_supported(app, selector, value, timeout_ms)? {
             return Ok(Outcome::trusted(actual));
         }
         // multiple / size>1:可信键盘路径不适用,降级为 DOM 赋值并明确标注
-        let actual = select_fallback(app, selector, value)?;
+        let actual = select_fallback(app, selector, value, timeout_ms)?;
         return Ok(Outcome::degraded_with(
             actual,
             "untrusted JS fallback (multi-select / size>1 has no trusted keyboard path)",
         ));
     }
-    let actual = select_fallback(app, selector, value)?;
+    let actual = select_fallback(app, selector, value, timeout_ms)?;
     Ok(Outcome::degraded(actual))
 }
 
@@ -68,6 +98,17 @@ pub fn fill_in_iframe(
     selector: &str,
     value: &str,
 ) -> ControlResult<Outcome<()>> {
+    fill_in_iframe_with(app, iframe_selector, selector, value, None)
+}
+
+/// 同 `fill_in_iframe`,`timeout_ms` 口径与 `fill_with` 一致
+pub fn fill_in_iframe_with(
+    app: &AppHandle,
+    iframe_selector: &str,
+    selector: &str,
+    value: &str,
+    timeout_ms: Option<u64>,
+) -> ControlResult<Outcome<()>> {
     if iframe_selector.is_empty() {
         return Err("iframeSelector is required".into());
     }
@@ -75,17 +116,22 @@ pub fn fill_in_iframe(
         return Err("selector is required".into());
     }
     if trusted_available() {
-        fill_in_iframe_trusted(app, iframe_selector, selector, value)?;
+        fill_in_iframe_trusted(app, iframe_selector, selector, value, timeout_ms)?;
         return Ok(Outcome::trusted(()));
     }
-    fill_in_iframe_fallback(app, iframe_selector, selector, value)?;
+    fill_in_iframe_fallback(app, iframe_selector, selector, value, timeout_ms)?;
     Ok(Outcome::degraded(()))
 }
 
 // ---- 降级实现(所有平台编译,Windows 强制降级时可实测) ----
 
 /// 原生原型 setter 赋值 + 派发 input/change(untrusted)
-fn fill_fallback(app: &AppHandle, selector: &str, value: &str) -> ControlResult<()> {
+fn fill_fallback(
+    app: &AppHandle,
+    selector: &str,
+    value: &str,
+    timeout_ms: Option<u64>,
+) -> ControlResult<()> {
     let js = format!(
         r#"(function(){{
           var el = document.querySelector({sel:?});
@@ -101,12 +147,17 @@ fn fill_fallback(app: &AppHandle, selector: &str, value: &str) -> ControlResult<
         sel = selector,
         val = value
     );
-    super::eval(app, &js)?;
+    super::eval_with(app, &js, timeout_ms)?;
     Ok(())
 }
 
 /// DOM 赋值 select + 派发 input/change(untrusted),返回读回值
-fn select_fallback(app: &AppHandle, selector: &str, value: &str) -> ControlResult<String> {
+fn select_fallback(
+    app: &AppHandle,
+    selector: &str,
+    value: &str,
+    timeout_ms: Option<u64>,
+) -> ControlResult<String> {
     let js = format!(
         r#"(function(){{
           var el = document.querySelector({sel:?});
@@ -120,7 +171,7 @@ fn select_fallback(app: &AppHandle, selector: &str, value: &str) -> ControlResul
         sel = selector,
         val = value
     );
-    let v = super::eval(app, &js)?;
+    let v = super::eval_with(app, &js, timeout_ms)?;
     check_error(&v)?;
     Ok(v.get("value").and_then(Value::as_str).unwrap_or("").to_string())
 }
@@ -131,6 +182,7 @@ fn fill_in_iframe_fallback(
     iframe_selector: &str,
     selector: &str,
     value: &str,
+    timeout_ms: Option<u64>,
 ) -> ControlResult<()> {
     let js = format!(
         r#"(function(){{
@@ -151,31 +203,36 @@ fn fill_in_iframe_fallback(
         sel = selector,
         val = value
     );
-    super::eval(app, &js)?;
+    super::eval_with(app, &js, timeout_ms)?;
     Ok(())
 }
 
 // ---- Windows 可信实现 ----
 
 /// 可信 fill:focus → 全选 → insertText → 读回校验
-fn fill_trusted(app: &AppHandle, selector: &str, value: &str) -> ControlResult<()> {
-    keyboard::focus_element(app, selector)?;
-    select_all(app, selector)?;
+fn fill_trusted(
+    app: &AppHandle,
+    selector: &str,
+    value: &str,
+    timeout_ms: Option<u64>,
+) -> ControlResult<()> {
+    keyboard::focus_element_with(app, selector, timeout_ms)?;
+    select_all(app, selector, timeout_ms)?;
     if value.is_empty() {
         // 空值:用 Delete 清掉选中内容(insertText("") 可能为空操作)
-        keyboard::press_key(app, "Delete", "")?;
+        keyboard::press_key_with(app, "Delete", "", timeout_ms)?;
     } else {
-        keyboard::insert_text(app, value)?;
+        keyboard::insert_text_with(app, value, timeout_ms)?;
     }
-    verify_value(app, selector, value)
+    verify_value(app, selector, value, timeout_ms)
 }
 
 /// 可信 clear:focus → 全选 → Delete → 读回校验
-fn clear_trusted(app: &AppHandle, selector: &str) -> ControlResult<()> {
-    keyboard::focus_element(app, selector)?;
-    select_all(app, selector)?;
-    keyboard::press_key(app, "Delete", "")?;
-    verify_value(app, selector, "")
+fn clear_trusted(app: &AppHandle, selector: &str, timeout_ms: Option<u64>) -> ControlResult<()> {
+    keyboard::focus_element_with(app, selector, timeout_ms)?;
+    select_all(app, selector, timeout_ms)?;
+    keyboard::press_key_with(app, "Delete", "", timeout_ms)?;
+    verify_value(app, selector, "", timeout_ms)
 }
 
 /// 可信 select:仅单值 select 适用;返回 Some(实际值);`multiple`/`size>1` 返回 None 交给降级
@@ -183,21 +240,23 @@ fn select_trusted_if_supported(
     app: &AppHandle,
     selector: &str,
     value: &str,
+    timeout_ms: Option<u64>,
 ) -> ControlResult<Option<String>> {
-    let info = select_info(app, selector, value)?;
+    let info = select_info(app, selector, value, timeout_ms)?;
     if info.multiple || info.size > 1 {
         return Ok(None);
     }
     if info.target_index < 0 {
         return Err(format!("option not found: {value}"));
     }
-    keyboard::focus_element(app, selector)?;
+    keyboard::focus_element_with(app, selector, timeout_ms)?;
     let delta = info.target_index - info.selected_index;
     let key = if delta >= 0 { "ArrowDown" } else { "ArrowUp" };
     for _ in 0..delta.abs() {
-        keyboard::press_key(app, key, "")?;
+        keyboard::press_key_with(app, key, "", timeout_ms)?;
     }
-    let actual = wait_value(app, selector, value, VERIFY_TIMEOUT_MS)?;
+    // 读回校验预算:传入值与 VERIFY_TIMEOUT_MS 取小 → 不传维持既有 2500ms,传小值可快失败
+    let actual = wait_value(app, selector, value, verify_budget(timeout_ms))?;
     if actual != value {
         return Err(format!(
             "select verification failed: expected {value:?}, got {actual:?} \
@@ -213,15 +272,17 @@ fn fill_in_iframe_trusted(
     iframe_selector: &str,
     selector: &str,
     value: &str,
+    timeout_ms: Option<u64>,
 ) -> ControlResult<()> {
-    focus_in_iframe(app, iframe_selector, selector)?;
-    select_all_in_iframe(app, iframe_selector, selector)?;
+    focus_in_iframe(app, iframe_selector, selector, timeout_ms)?;
+    select_all_in_iframe(app, iframe_selector, selector, timeout_ms)?;
     if value.is_empty() {
-        keyboard::press_key(app, "Delete", "")?;
+        keyboard::press_key_with(app, "Delete", "", timeout_ms)?;
     } else {
-        keyboard::insert_text(app, value)?;
+        keyboard::insert_text_with(app, value, timeout_ms)?;
     }
-    let actual = wait_value_in_iframe(app, iframe_selector, selector, value, VERIFY_TIMEOUT_MS)?;
+    let actual =
+        wait_value_in_iframe(app, iframe_selector, selector, value, verify_budget(timeout_ms))?;
     if actual != value {
         return Err(format!(
             "iframe fill verification failed: expected {value:?}, got {actual:?}"
@@ -231,7 +292,7 @@ fn fill_in_iframe_trusted(
 }
 
 /// 选中目标元素全部内容(input/textarea 用 select()/setSelectionRange,contenteditable 用 Range)
-fn select_all(app: &AppHandle, selector: &str) -> ControlResult<()> {
+fn select_all(app: &AppHandle, selector: &str, timeout_ms: Option<u64>) -> ControlResult<()> {
     let js = format!(
         r#"(function(){{
           var el = document.querySelector({sel:?});
@@ -250,12 +311,12 @@ fn select_all(app: &AppHandle, selector: &str) -> ControlResult<()> {
         }})()"#,
         sel = selector
     );
-    super::eval(app, &js)?;
+    super::eval_with(app, &js, timeout_ms)?;
     Ok(())
 }
 
 /// 读取元素当前值(input/textarea 取 value,contenteditable 取 textContent)
-fn read_value(app: &AppHandle, selector: &str) -> ControlResult<String> {
+fn read_value(app: &AppHandle, selector: &str, timeout_ms: Option<u64>) -> ControlResult<String> {
     let js = format!(
         r#"(function(){{
           var el = document.querySelector({sel:?});
@@ -264,13 +325,20 @@ fn read_value(app: &AppHandle, selector: &str) -> ControlResult<String> {
         }})()"#,
         sel = selector
     );
-    let v = super::eval(app, &js)?;
+    let v = super::eval_with(app, &js, timeout_ms)?;
     check_error(&v)?;
     Ok(v.get("value").and_then(Value::as_str).unwrap_or("").to_string())
 }
 
 /// 输入事件异步处理(WebKitGTK 跨进程)时,读回校验的最长等待时间
 const VERIFY_TIMEOUT_MS: u64 = 2500;
+
+/// 读回校验预算:模型传入值与 `VERIFY_TIMEOUT_MS` 取小 —— 不传维持既有 2500ms,传小值即可快失败
+fn verify_budget(timeout_ms: Option<u64>) -> u64 {
+    timeout_ms
+        .map(|v| v.min(VERIFY_TIMEOUT_MS))
+        .unwrap_or(VERIFY_TIMEOUT_MS)
+}
 
 /// 轮询读取元素值直到等于期望或超时(超时返回当前值,由调用方判错)
 ///
@@ -284,7 +352,8 @@ fn wait_value(
 ) -> ControlResult<String> {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     loop {
-        let actual = read_value(app, selector)?;
+        // 轮询内每步读回 eval 的预算 = 本轮等待预算(两者同量级,避免单步 eval 拖垮整轮)
+        let actual = read_value(app, selector, Some(timeout_ms))?;
         if actual == expected || Instant::now() >= deadline {
             return Ok(actual);
         }
@@ -302,7 +371,7 @@ fn wait_value_in_iframe(
 ) -> ControlResult<String> {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     loop {
-        let actual = read_value_in_iframe(app, iframe_selector, selector)?;
+        let actual = read_value_in_iframe(app, iframe_selector, selector, Some(timeout_ms))?;
         if actual == expected || Instant::now() >= deadline {
             return Ok(actual);
         }
@@ -311,8 +380,13 @@ fn wait_value_in_iframe(
 }
 
 /// 读回校验:实际值必须等于期望值,否则报错(不静默成功)
-fn verify_value(app: &AppHandle, selector: &str, expected: &str) -> ControlResult<()> {
-    let actual = wait_value(app, selector, expected, VERIFY_TIMEOUT_MS)?;
+fn verify_value(
+    app: &AppHandle,
+    selector: &str,
+    expected: &str,
+    timeout_ms: Option<u64>,
+) -> ControlResult<()> {
+    let actual = wait_value(app, selector, expected, verify_budget(timeout_ms))?;
     if actual != expected {
         return Err(format!(
             "fill verification failed: expected {expected:?}, got {actual:?}"
@@ -330,7 +404,12 @@ struct SelectInfo {
 }
 
 /// 查询 select 的 multiple/size/当前索引/目标值所在索引;未找到目标值 target_index = -1
-fn select_info(app: &AppHandle, selector: &str, value: &str) -> ControlResult<SelectInfo> {
+fn select_info(
+    app: &AppHandle,
+    selector: &str,
+    value: &str,
+    timeout_ms: Option<u64>,
+) -> ControlResult<SelectInfo> {
     let js = format!(
         r#"(function(){{
           var el = document.querySelector({sel:?});
@@ -345,7 +424,7 @@ fn select_info(app: &AppHandle, selector: &str, value: &str) -> ControlResult<Se
         sel = selector,
         val = value
     );
-    let v = super::eval(app, &js)?;
+    let v = super::eval_with(app, &js, timeout_ms)?;
     check_error(&v)?;
     Ok(SelectInfo {
         multiple: v.get("multiple").and_then(Value::as_bool).unwrap_or(false),
@@ -356,7 +435,12 @@ fn select_info(app: &AppHandle, selector: &str, value: &str) -> ControlResult<Se
 }
 
 /// iframe 内容文档内聚焦元素
-fn focus_in_iframe(app: &AppHandle, iframe_selector: &str, selector: &str) -> ControlResult<()> {
+fn focus_in_iframe(
+    app: &AppHandle,
+    iframe_selector: &str,
+    selector: &str,
+    timeout_ms: Option<u64>,
+) -> ControlResult<()> {
     let js = format!(
         r#"(function(){{
           var f = document.querySelector({iframe:?});
@@ -373,7 +457,7 @@ fn focus_in_iframe(app: &AppHandle, iframe_selector: &str, selector: &str) -> Co
         iframe = iframe_selector,
         sel = selector
     );
-    let v = super::eval(app, &js)?;
+    let v = super::eval_with(app, &js, timeout_ms)?;
     check_error(&v)?;
     if !v.get("ok").and_then(Value::as_bool).unwrap_or(false) {
         return Err(format!("element is not focusable in iframe: {selector}"));
@@ -386,6 +470,7 @@ fn select_all_in_iframe(
     app: &AppHandle,
     iframe_selector: &str,
     selector: &str,
+    timeout_ms: Option<u64>,
 ) -> ControlResult<()> {
     let js = format!(
         r#"(function(){{
@@ -406,7 +491,7 @@ fn select_all_in_iframe(
         iframe = iframe_selector,
         sel = selector
     );
-    super::eval(app, &js)?;
+    super::eval_with(app, &js, timeout_ms)?;
     Ok(())
 }
 
@@ -415,6 +500,7 @@ fn read_value_in_iframe(
     app: &AppHandle,
     iframe_selector: &str,
     selector: &str,
+    timeout_ms: Option<u64>,
 ) -> ControlResult<String> {
     let js = format!(
         r#"(function(){{
@@ -429,7 +515,7 @@ fn read_value_in_iframe(
         iframe = iframe_selector,
         sel = selector
     );
-    let v = super::eval(app, &js)?;
+    let v = super::eval_with(app, &js, timeout_ms)?;
     check_error(&v)?;
     Ok(v.get("value").and_then(Value::as_str).unwrap_or("").to_string())
 }
