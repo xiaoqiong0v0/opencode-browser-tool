@@ -118,7 +118,7 @@ pub fn trusted_available() -> bool {
     (cfg!(windows) || cfg!(target_os = "linux")) && !force_degraded()
 }
 
-/// 执行页面内 JS,返回解析后的值(对象/null/字符串等);默认超时 `ui::EVAL_TIMEOUT_MS`(5s)
+/// 执行页面内 JS,返回解析后的值(对象/null/字符串等);默认超时 `ui::EVAL_TIMEOUT_MS`(15s)
 pub fn eval(app: &AppHandle, js: &str) -> ControlResult<Value> {
     let raw = ui::eval_page(app, js)?;
     serde_json::from_str(&raw).map_err(|e| format!("parse eval result: {e}"))
@@ -207,7 +207,7 @@ pub fn navigate(app: &AppHandle, url: &str) -> ControlResult<()> {
         .map_err(|e| format!("navigate failed: {e}"))
 }
 
-/// 执行任意 JS,返回结果(自动 JSON 序列化);默认超时 5s
+/// 执行任意 JS,返回结果(自动 JSON 序列化);默认超时 15s
 pub fn evaluate(app: &AppHandle, script: &str) -> ControlResult<Value> {
     eval(app, &format!("(function(){{ return {script}; }})()"))
 }
@@ -238,7 +238,7 @@ pub fn visible_text(app: &AppHandle, selector: Option<&str>) -> ControlResult<St
     Ok(v.as_str().unwrap_or("").to_string())
 }
 
-/// 元素状态(可见性/是否禁用/尺寸);默认超时 5s
+/// 元素状态(可见性/是否禁用/尺寸);默认超时 15s
 pub fn element_state(app: &AppHandle, selector: &str) -> ControlResult<Value> {
     element_state_with(app, selector, None)
 }
@@ -326,7 +326,7 @@ pub fn wait_ready(
 }
 
 /// 读取窗口滚动位置四舍五入值 (x, y)
-/// `eval_timeout_ms` = Some 时该步 eval 用传入预算(ms),None 走默认 5s
+/// `eval_timeout_ms` = Some 时该步 eval 用传入预算(ms),None 走默认 15s
 fn scroll_pos(app: &AppHandle, eval_timeout_ms: Option<u64>) -> ControlResult<(i64, i64)> {
     let v = eval_with(
         app,
@@ -520,8 +520,8 @@ pub fn scroll_to_element_with(
 }
 
 /// 等待元素出现(轮询,最多 timeout_ms)
-/// 轮询内每步 eval 的预算取 `min(timeout_ms, EVAL_TIMEOUT_MS)`:默认(10s)时仍是 5s(与既有行为一致),
-/// 模型传小 `--timeout` 时随之变小(快失败),不会被 eval 默认 5s 拖住
+/// 轮询内每步 eval 的预算取 `min(timeout_ms, EVAL_TIMEOUT_MS)`:默认(均 15s)时仍是 15s(与既有行为一致),
+/// 模型传小 `--timeout` 时随之变小(快失败),不会被 eval 默认 15s 拖住
 pub fn wait_for_selector(
     app: &AppHandle,
     selector: &str,

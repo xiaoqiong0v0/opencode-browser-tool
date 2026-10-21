@@ -9,6 +9,11 @@
 //! - 消息流被污染(嵌套派发/外部 WM_QUIT)时,`GetMessage` 也永不返回 → 主线程永久卡住。
 //! 故此处**不使用** `wait_for_async_operation`:只在 `with_webview` 内发起调用,结果等待放回**外部阻塞线程**,
 //! 用**有界** `recv_timeout` 轮询(回调仍由 WebView2 派到 UI 线程,tauri 主循环正常泵消息即可送达)。
+//!
+//! **UI 线程不变式(1.9.0 批次4 全量审计结论,改动本文件前先读)**:
+//! UI 线程内禁止任何等待 —— `recv`/`recv_timeout`/`sleep`/`锁等待`/`GetMessage` 一律不允许(0 容忍);
+//! `with_webview` 闭包只允许「发起异步调用 + 轻量 COM/GTK 调用 + 无界 mpsc send」,
+//! 一切有界等待都在**工作线程**(本文件 `wait_bounded`、screenshot/devices/gdk 的 `recv_timeout`)。
 
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -18,7 +23,8 @@ use tauri::AppHandle;
 use crate::ui;
 
 /// CDP 调用总超时(ms):覆盖 `CallDevToolsProtocolMethod` 发起到回调送达的全过程
-const CDP_TIMEOUT_MS: u64 = 10_000;
+/// 默认 15s(1.9.0 批次4:不卡 UI 的前提下放宽默认,长任务请显式传 `--timeout`)
+const CDP_TIMEOUT_MS: u64 = 15_000;
 /// 轮询间隔(ms):外层线程每隔多久检查一次结果/超时(短轮询保证即使踢消息失败也能按时返回)
 const CDP_POLL_MS: u64 = 15;
 

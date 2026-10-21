@@ -18,8 +18,9 @@ use tauri::AppHandle;
 use crate::ui;
 
 /// 截图等待总超时(ms,默认):发起截图到结果送达的全过程有界;模型 `--timeout` 可覆盖
+/// 1.9.0 批次4:10_000 → 15_000(与 CDP/eval/wait_for_selector 统一为 15s)
 #[cfg(any(windows, target_os = "linux"))]
-const SCREENSHOT_TIMEOUT_MS: u64 = 10_000;
+const SCREENSHOT_TIMEOUT_MS: u64 = 15_000;
 
 /// 截图页面 Webview,返回 PNG base64
 pub fn screenshot(app: &AppHandle) -> Result<String, String> {
@@ -240,7 +241,7 @@ fn screenshot_impl(
     })
     .map_err(|e| format!("with_webview failed: {e}"))?;
 
-    // 等待快照回调结果(有界:默认 10s,可被模型 `--timeout` 覆盖;与 Windows 分支一致)
+    // 等待快照回调结果(有界:默认 15s,可被模型 `--timeout` 覆盖;与 Windows 分支一致)
     rx.recv_timeout(std::time::Duration::from_millis(wait_ms))
         .map_err(|_| format!("screenshot timeout (budget {wait_ms}ms)"))?
 }

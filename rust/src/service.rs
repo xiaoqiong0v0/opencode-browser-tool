@@ -517,7 +517,7 @@ impl App {
         let script = body.get("script").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let (t, _tclamped) = timeout_arg(body)?;
         let handle = self.handle.clone();
-        // eval 超时是最直接的「快失败」手段:默认仍 5s,传了就用传入值(不写 timeoutMs 到返回体 ——
+        // eval 超时是最直接的「快失败」手段:默认仍 15s(批次4 统一),传了就用传入值(不写 timeoutMs 到返回体 ——
         // evaluate 的返回体就是脚本结果本身,不掺元信息)
         let r = tokio::task::block_in_place(|| match t {
             Some(ms) => control::evaluate_timeout(&handle, &script, ms),
@@ -595,10 +595,10 @@ impl App {
 
     async fn wait_for_selector(&self, body: &Value) -> Result<Value, String> {
         let s = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        // 修:原 `as_u64()` 只认 JSON 数字,而 bt_cli 的 flag 一律是字符串 → `--timeout` 被静默忽略(恒 10s)。
-        // 改走 timeout_arg:兼容字符串、钳到 [100,60000]、未传保持既有默认 10000ms,并如实回显生效值
+        // 修:原 `as_u64()` 只认 JSON 数字,而 bt_cli 的 flag 一律是字符串 → `--timeout` 被静默忽略。
+        // 改走 timeout_arg:兼容字符串、钳到 [100,60000]、未传保持默认 15000ms(批次4 与其它超时统一),并如实回显生效值
         let (t, tclamped) = timeout_arg(body)?;
-        let timeout = t.unwrap_or(10000);
+        let timeout = t.unwrap_or(15_000);
         let handle = self.handle.clone();
         let found = tokio::task::block_in_place(|| control::wait_for_selector(&handle, &s, timeout))?;
         Ok(with_timeout(json!({ "found": found }), t, tclamped))
