@@ -34,6 +34,8 @@ pub const CONTENT_MIN_SIZE: f64 = 360.0;
 /// 窄模式阈值(窗口**逻辑**宽 < 此值):面板填满窗口 + 工具栏批注/截图/面板按钮图标化
 /// (前端 `frontend/src/toolbar.html` 的 `@media (max-width: 479px)` 与此常量同步维护)
 pub const NARROW_MODE_MAX_W: f64 = 480.0;
+/// 屏幕工作区边距(逻辑像素):窗口钳进工作区时四边各留的余量,保证边框/标题栏仍可见可拖
+pub const WORK_AREA_MARGIN: f64 = 16.0;
 
 /// 标签页状态
 #[derive(Debug, Clone, Serialize)]
@@ -861,18 +863,36 @@ pub fn create_ui(app: &AppHandle, service_port: u16) -> tauri::Result<()> {
     let _ = show_webview(app, "page-1");
 
     // 监听窗口 resize/DPI 变化 → 重排 webview
+    // 失败不再静默:写 stderr(被插件转发为 [shell:err])并立即重试一次,仍失败则放弃并留日志
     let handle = app.clone();
     window.on_window_event(move |event| match event {
         tauri::WindowEvent::Resized(size) | tauri::WindowEvent::ScaleFactorChanged { new_inner_size: size, .. } => {
             if let Some(win) = handle.get_window("main") {
                 let scale = win.scale_factor().unwrap_or(1.0);
-                let _ = apply_layout(&handle, *size, scale);
+                apply_layout_or_log(&handle, *size, scale);
             }
         }
         _ => {}
     });
 
     Ok(())
+}
+
+/// 应用布局并在失败时留痕 + 立即重试一次(仍失败则放弃并留日志,不无限重试)
+///
+/// 参数:`app` 应用句柄;`size` 窗口物理内尺寸;`scale` 窗口缩放因子
+/// 说明:此前失败被 `let _ =` 吞掉 —— resize 后不重排即「内容全黑」(最大化才靠 Resized 事件恢复),
+/// 且无任何日志可定位;现改经本函数,失败走 stderr(`[shell:err]`)可见。
+pub(crate) fn apply_layout_or_log(app: &AppHandle, size: tauri::PhysicalSize<u32>, scale: f64) {
+    match apply_layout(app, size, scale) {
+        Ok(()) => {}
+        Err(first) => {
+            eprintln!("[layout] apply_layout failed: {first} (size {}x{}, scale {scale}) — retrying once", size.width, size.height);
+            if let Err(second) = apply_layout(app, size, scale) {
+                eprintln!("[layout] apply_layout retry failed: {second} (size {}x{}, scale {scale}) — giving up", size.width, size.height);
+            }
+        }
+    }
 }
 
 /// 设置子 webview 边界(Windows: tauri 原生 set_position/set_size;Linux: gtk::Fixed 绝对定位)
@@ -897,6 +917,82 @@ fn set_webview_bounds(app: &AppHandle, label: &str, x: i32, y: i32, w: i32, h: i
         let _ = (app, label, x, y, w, h);
     }
     Ok(())
+}
+
+/// 把目标窗口尺寸钳进当前显示器**工作区**(全部按**逻辑像素**计算),并保证窗口整体可见
+///
+/// 参数:`win` 目标窗口;`want_w`/`want_h` 期望窗口宽高(**逻辑**像素 —— 与 `set_size(LogicalSize)` 同口径)
+/// 返回:`(x, y, w, h, clamped)` 钳制后的逻辑位置/尺寸;`clamped` 为是否发生过钳制
+///
+/// 规则:尺寸超过工作区(扣四边边距)→ 钳到工作区可用尺寸;当前左上角+新尺寸出屏 → 把窗口拉回工作区内。
+/// 口径说明:`Monitor::work_area()` 返回**物理像素 + 屏幕绝对坐标**,这里按目标显示器缩放换算成逻辑后再比较
+/// (工作区换算用 `mon.scale_factor()`,窗口位置换算用 `win.scale_factor()`;二者在「窗口位于该显示器」时相同,
+/// 因为 `current_monitor()` 返回的就是包含窗口的那块屏 —— 混合 DPI 且窗口跨屏时是近似口径)。
+/// 降级口径:取不到显示器/工作区无效时原样返回且不标 clamped(不因防护逻辑让 resize 失败)。
+pub fn clamp_window_to_work_area(win: &tauri::Window, want_w: f64, want_h: f64) -> (f64, f64, f64, f64, bool) {
+    let scale = win.scale_factor().unwrap_or(1.0);
+    // 当前窗口左上角:outer_position 是物理像素 → 换算逻辑(set_position 同样吃逻辑)
+    let (px, py) = win
+        .outer_position()
+        .map(|p| (p.x as f64, p.y as f64))
+        .unwrap_or((0.0, 0.0));
+    let (mut x, mut y) = (px / scale, py / scale);
+
+    // 取当前显示器(拿不到则不做钳制)
+    let mon = match win.current_monitor() {
+        Ok(Some(m)) => m,
+        _ => return (x, y, want_w, want_h, false),
+    };
+    // tauri 2.11 的 Monitor::work_area() 提供工作区(物理像素 + 屏幕绝对坐标);按该屏缩放换算为逻辑
+    let mscale = mon.scale_factor().max(0.001);
+    let wa = mon.work_area();
+    let wa_x = wa.position.x as f64 / mscale;
+    let wa_y = wa.position.y as f64 / mscale;
+    let wa_w = wa.size.width as f64 / mscale;
+    let wa_h = wa.size.height as f64 / mscale;
+    if wa_w <= 0.0 || wa_h <= 0.0 {
+        return (x, y, want_w, want_h, false);
+    }
+
+    let mut w = want_w;
+    let mut h = want_h;
+    let mut clamped = false;
+
+    // 1) 尺寸钳到工作区可用范围(扣四边边距,留出可见边框/可拖位置)
+    let avail_w = (wa_w - WORK_AREA_MARGIN * 2.0).max(1.0);
+    let avail_h = (wa_h - WORK_AREA_MARGIN * 2.0).max(1.0);
+    if w > avail_w {
+        w = avail_w;
+        clamped = true;
+    }
+    if h > avail_h {
+        h = avail_h;
+        clamped = true;
+    }
+
+    // 2) 位置回位:左上角与右下角都夹进工作区,保证窗口整体可见。
+    // 右/下再留一个边距:Windows 的 DWM 会在客户区外多算约 8px **不可见**边框(GetWindowRect 口径),
+    // 不留边距时客户区一贴边,整个窗口矩形就会越出工作区
+    let max_x = wa_x + wa_w - w - WORK_AREA_MARGIN;
+    let max_y = wa_y + wa_h - h - WORK_AREA_MARGIN;
+    if x < wa_x {
+        x = wa_x;
+        clamped = true;
+    }
+    if y < wa_y {
+        y = wa_y;
+        clamped = true;
+    }
+    if x > max_x {
+        x = max_x.max(wa_x);
+        clamped = true;
+    }
+    if y > max_y {
+        y = max_y.max(wa_y);
+        clamped = true;
+    }
+
+    (x, y, w, h, clamped)
 }
 
 /// 重排 webview 的边界
@@ -1125,7 +1221,7 @@ pub fn create_tab_webview(app: &AppHandle, id: u32) -> Result<tauri::webview::We
     if let Some(win) = app.get_window("main") {
         if let Ok(size) = win.inner_size() {
             let scale = win.scale_factor().unwrap_or(1.0);
-            let _ = apply_layout(app, size, scale);
+            apply_layout_or_log(app, size, scale);
         }
     }
     Ok(w)
@@ -1205,7 +1301,7 @@ pub fn open_panel(app: &AppHandle) {
     }
     if let Some(win) = app.get_window("main") {
         if let (Ok(size), Ok(scale)) = (win.inner_size(), win.scale_factor()) {
-            let _ = apply_layout(app, size, scale);
+            apply_layout_or_log(app, size, scale);
         }
     }
     // 面板置顶:新建标签会把页面 webview 追加到 Fixed 末尾,可能盖住面板
@@ -1224,7 +1320,7 @@ pub fn collapse_panel(app: &AppHandle) {
     let _ = eval_overlay(app, "window.__btOverlay.hideMask()");
     if let Some(win) = app.get_window("main") {
         if let (Ok(size), Ok(scale)) = (win.inner_size(), win.scale_factor()) {
-            let _ = apply_layout(app, size, scale);
+            apply_layout_or_log(app, size, scale);
         }
     }
     emit_tabs_changed(app);
@@ -1258,7 +1354,7 @@ pub fn close_panel(app: &AppHandle) {
     }
     if let Some(win) = app.get_window("main") {
         if let (Ok(size), Ok(scale)) = (win.inner_size(), win.scale_factor()) {
-            let _ = apply_layout(app, size, scale);
+            apply_layout_or_log(app, size, scale);
         }
     }
     emit_tabs_changed(app);

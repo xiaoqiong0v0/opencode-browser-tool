@@ -116,6 +116,9 @@ impl App {
 
     /// 分发端点
     pub async fn handle(&self, url: &str, body: Value) -> Result<Value, String> {
+        // 选择器统一入口校验:Playwright 风格(text= / xpath= / 以 / 开头等)在此快速明确报错,
+        // 覆盖 click/fill/iframe_click 等**所有**收选择器字段的端点,不进点击/解析链路
+        control::validate_selector_fields(&body)?;
         match url {
             "/api/status" => self.status().await,
             "/api/tabs" => self.tabs().await,
@@ -641,6 +644,8 @@ impl App {
 
     /// 调整页面内容区尺寸(视口语义):width/height 指内容区(视口),窗口高 = 内容高 + 工具栏 72px
     /// 内容区下限 360x360,低于下限被钳制并在返回里如实标 clamped(模型可见)
+    /// 屏幕工作区防护:目标窗口超出工作区 → 钳到工作区(标 screenClamped);set_size 后立即主动重排,
+    /// 不单独依赖系统 Resized 事件(避免极端时序下不重排 → 内容全黑)
     async fn resize(&self, body: &Value) -> Result<Value, String> {
         let w = body.get("width").and_then(|v| v.as_i64()).unwrap_or(0) as f64;
         let h = body.get("height").and_then(|v| v.as_i64()).unwrap_or(0) as f64;
@@ -648,23 +653,40 @@ impl App {
         let cw = w.max(ui::CONTENT_MIN_SIZE);
         let ch = h.max(ui::CONTENT_MIN_SIZE);
         let clamped = cw != w || ch != h;
-        let win_h = ch + ui::TOOLBAR_HEIGHT;
         let handle = self.handle.clone();
         tokio::task::block_in_place(|| {
             let win = ui::active_page_webview(&handle)
                 .ok_or("page webview not ready")?
                 .window_ref()
                 .clone();
-            // 窗口 = 内容区宽 x (内容区高 + 工具栏高);set_size 触发 Resized → apply_layout 重排
-            win.set_size(tauri::LogicalSize::new(cw, win_h))
-                .map_err(|e| format!("resize failed: {e}"))
-        })?;
-        Ok(json!({
-            "resized": true,
-            "content": { "w": cw, "h": ch },
-            "window": { "w": cw, "h": win_h },
-            "clamped": clamped,
-        }))
+            // 目标窗口 = 内容区宽 x (内容区高 + 工具栏高)
+            let want_w = cw;
+            let want_h = ch + ui::TOOLBAR_HEIGHT;
+            // 屏幕工作区防护:尺寸超出 → 钳到工作区;出屏 → 回位(保持窗口可见;helper 内部统一逻辑像素口径)
+            let (x, y, fw, fh, screen_clamped) =
+                ui::clamp_window_to_work_area(&win, want_w, want_h);
+            // 先定位再设尺寸;位置与尺寸都是**逻辑**像素(set_position/set_size 口径一致,避免窗口漂移)
+            win.set_position(tauri::LogicalPosition::new(x, y))
+                .map_err(|e| format!("resize set position failed: {e}"))?;
+            win.set_size(tauri::LogicalSize::new(fw, fh))
+                .map_err(|e| format!("resize failed: {e}"))?;
+            // 主动重排一次(带日志+重试):用**目标尺寸**(LogicalSize→物理)换算,不赌系统 Resized 事件。
+            // 不读 inner_size():set_size 异步生效,立即读到的可能是旧值 → 会拿旧尺寸排版
+            let scale = win.scale_factor().unwrap_or(1.0);
+            let phys: tauri::PhysicalSize<u32> = tauri::LogicalSize::new(fw, fh).to_physical(scale);
+            ui::apply_layout_or_log(&handle, phys, scale);
+            // 钳制后的真实内容区 = 窗口高 - 工具栏
+            let real_ch = (fh - ui::TOOLBAR_HEIGHT).max(ui::CONTENT_MIN_SIZE);
+            let real_cw = fw.max(ui::CONTENT_MIN_SIZE);
+            Ok(json!({
+                "resized": true,
+                "content": { "w": real_cw, "h": real_ch },
+                "window": { "w": fw, "h": fh },
+                "clamped": clamped,
+                // 是否被屏幕工作区钳制(模型可见,与 clamped 的内容区下限钳制分开)
+                "screenClamped": screen_clamped,
+            }))
+        })
     }
 
     /// 读取页面控制台日志(由页面桥 __btLogs 捕获,元素形如 {level,msg})
@@ -876,17 +898,21 @@ impl App {
         let device = crate::devices::find(&name).ok_or_else(|| format!("unknown device: {name}"))?;
         let handle = self.handle.clone();
         // apply 内 UA 必被处理(覆盖或恢复),失败直接报错不静默 → ua=(default) 只在真重置后才可能返回
-        tokio::task::block_in_place(|| crate::devices::apply(&handle, device))?;
+        // 返回**实际生效**内容区(大预设被工作区钳制时 ≠ 预设值),避免返回体与真实窗口不一致
+        let (cw, ch, screen_clamped) =
+            tokio::task::block_in_place(|| crate::devices::apply(&handle, device))?;
         Ok(json!({
             "device": device.name,
-            // width/height 保持字段名不变,语义改为内容区(视口)尺寸(与预设表一致)
-            "width": device.width,
-            "height": device.height,
-            "content": { "w": device.width, "h": device.height },
-            "window": { "w": device.width, "h": device.height + ui::TOOLBAR_HEIGHT },
+            // width/height 保持字段名不变,语义改为**实际**内容区(视口)尺寸(未被钳制时 = 预设值)
+            "width": cw,
+            "height": ch,
+            "content": { "w": cw, "h": ch },
+            "window": { "w": cw, "h": ch + ui::TOOLBAR_HEIGHT },
             "ua": device.ua.unwrap_or("(default)"),
             // 本次是否把 UA 恢复成默认(桌面预设/「默认」项为 true;覆盖型预设为 false)
             "uaReset": device.ua.is_none(),
+            // 是否被屏幕工作区钳制(与 resize 的同名字段一致)
+            "screenClamped": screen_clamped,
         }))
     }
 

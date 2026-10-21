@@ -59,19 +59,36 @@ pub fn find(name: &str) -> Option<&'static Device> {
 /// 应用设备预设:设置窗口尺寸(**内容区高 + 工具栏**,逻辑像素) + 运行时处理 UA
 /// UA 语义统一:`device.ua = Some` → 覆盖;`None` → 恢复默认 UA(1.9.0 起不再跳过,
 /// 否则桌面预设/「默认」项会保留上一个移动 UA,输出标 (default) 却是假的)
-pub fn apply(app: &AppHandle, device: &Device) -> Result<(), String> {
+/// 屏幕工作区防护:大预设(1080p 等)超出工作区 → 钳到工作区;set_size 后立即主动重排,
+/// 不单独依赖系统 Resized 事件(避免极端时序下不重排 → 内容全黑)
+///
+/// 返回:`(content_w, content_h, screen_clamped)` **实际生效**的内容区尺寸与是否被工作区钳制
+/// (预设被钳时调用方据此回填真实值,避免返回体报预设值却已是小窗口)
+pub fn apply(app: &AppHandle, device: &Device) -> Result<(f64, f64, bool), String> {
     // 窗口 = 内容区宽 x (内容区高 + 工具栏高);set_size 自动换算物理尺寸并触发 Resized 重排
     let win = ui::active_page_webview(app)
         .ok_or("page webview not ready")?
         .window_ref()
         .clone();
-    let win_h = device.height + ui::TOOLBAR_HEIGHT;
-    win.set_size(LogicalSize::new(device.width, win_h))
+    let want_w = device.width;
+    let want_h = device.height + ui::TOOLBAR_HEIGHT;
+    // 屏幕工作区防护:尺寸超出 → 钳到工作区;出屏 → 回位(helper 内部统一逻辑像素口径)
+    let (x, y, fw, fh, screen_clamped) = ui::clamp_window_to_work_area(&win, want_w, want_h);
+    win.set_position(tauri::LogicalPosition::new(x, y))
+        .map_err(|e| format!("set window position failed: {e}"))?;
+    win.set_size(LogicalSize::new(fw, fh))
         .map_err(|e| format!("set window size failed: {e}"))?;
+    // 主动重排一次(带日志+重试):用**目标尺寸**(LogicalSize→物理)换算,不赌系统 Resized 事件
+    let scale = win.scale_factor().unwrap_or(1.0);
+    let phys: tauri::PhysicalSize<u32> = LogicalSize::new(fw, fh).to_physical(scale);
+    ui::apply_layout_or_log(app, phys, scale);
 
     // UA 必被处理(覆盖或恢复);失败向上报错,不静默
     set_user_agent(app, device.ua)?;
-    Ok(())
+    // 实际生效内容区 = 窗口高 - 工具栏
+    let content_h = (fh - ui::TOOLBAR_HEIGHT).max(ui::CONTENT_MIN_SIZE);
+    let content_w = fw.max(ui::CONTENT_MIN_SIZE);
+    Ok((content_w, content_h, screen_clamped))
 }
 
 /// 运行时修改/恢复页面 Webview 的 User-Agent

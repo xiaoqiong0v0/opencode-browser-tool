@@ -124,6 +124,66 @@ pub fn eval(app: &AppHandle, js: &str) -> ControlResult<Value> {
     serde_json::from_str(&raw).map_err(|e| format!("parse eval result: {e}"))
 }
 
+/// 收选择器的请求字段名(统一入口校验覆盖范围)
+const SELECTOR_KEYS: &[&str] = &[
+    "selector",
+    "iframeSelector",
+    "sourceSelector",
+    "targetSelector",
+];
+
+/// 请求体级选择器校验:对已知选择器字段逐个执行 `validate_selector`(空值放行)
+///
+/// 参数:`body` HTTP 端点请求体
+/// 返回:Ok 表示所有选择器字段可用;Err 为「字段名: 原因」,直接回给模型即可读
+/// 用途:service 分发入口统一调用一次,覆盖 click/fill/iframe_click 等**所有**收选择器的端点
+pub fn validate_selector_fields(body: &serde_json::Value) -> Result<(), String> {
+    for key in SELECTOR_KEYS {
+        if let Some(v) = body.get(key).and_then(|v| v.as_str()) {
+            validate_selector(v).map_err(|e| format!("{key}: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// 单个选择器入口校验:拒绝 Playwright 风格选择器,统一在**进入点击/解析链路前**快速明确报错
+///
+/// 参数:`selector` 选择器(空串放行 —— 必填与否由各端点自己的校验决定)
+/// 返回:Ok(()) 表示可继续;Err 为可读提示(本项目只支持 CSS 选择器)
+///
+/// 背景:`text=`/`xpath=`/以 `/` 开头等都不是合法 CSS,`querySelector` 会抛 SyntaxError,
+/// 原先会把晦涩的解析错误(甚至看似「卡住」后的超时)甩给用户;现入口拦截、不进链路。
+pub fn validate_selector(selector: &str) -> Result<(), String> {
+    let s = selector.trim();
+    if s.is_empty() {
+        return Ok(());
+    }
+    let lower = s.to_ascii_lowercase();
+    // Playwright/其它引擎前缀:本项目只支持 CSS,统一拒绝并给出可执行的改法
+    const ENGINES: &[(&str, &str)] = &[
+        ("text=", "text="),
+        ("xpath=", "xpath="),
+        ("role=", "role="),
+        ("id=", "id="),
+        ("css=", "css="),
+        (">>", ">>"),
+    ];
+    for (prefix, label) in ENGINES {
+        if lower.starts_with(prefix) {
+            return Err(format!(
+                "不支持 {label} 选择器（Playwright 风格），请改用 CSS 选择器（如 div > a.btn）: {s}"
+            ));
+        }
+    }
+    // 以 `/` 开头 = XPath 路径(//div、/html/body 等)
+    if s.starts_with('/') {
+        return Err(format!(
+            "不支持 XPath 路径选择器（以 / 开头），请改用 CSS 选择器（如 div > a.btn）: {s}"
+        ));
+    }
+    Ok(())
+}
+
 /// 导航到 URL
 pub fn navigate(app: &AppHandle, url: &str) -> ControlResult<()> {
     ui::active_page_webview(app)

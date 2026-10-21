@@ -17,6 +17,10 @@ use tauri::AppHandle;
 
 use crate::ui;
 
+/// Windows CDP 截图等待总超时(ms):发起 `Page.captureScreenshot` 到回调送达的全过程有界
+#[cfg(windows)]
+const SCREENSHOT_TIMEOUT_MS: u64 = 10_000;
+
 /// 截图页面 Webview,返回 PNG base64
 pub fn screenshot(app: &AppHandle) -> Result<String, String> {
     screenshot_impl(app, None, false)
@@ -110,23 +114,20 @@ fn screenshot_impl(
                     };
                     let method = windows::core::HSTRING::from("Page.captureScreenshot");
                     let params = windows::core::HSTRING::from(params);
-                    // 在 UI 线程泵消息等待回调
-                    // 回调签名 (windows::core::Result<()>, String) → windows::core::Result<()>
-                    let result = CallDevToolsProtocolMethodCompletedHandler::wait_for_async_operation(
-                        Box::new(move |handler| {
-                            webview
-                                .CallDevToolsProtocolMethod(&method, &params, &handler)
-                                .map_err(webview2_com::Error::from)
-                        }),
+                    // 只发起、不在此等待:旧实现 wait_for_async_operation 在 UI 线程内 GetMessage 无限阻塞
+                    // (与 cdp.rs 同根因 → 浏览器可被永久卡死);结果等待改到下方 wait_bounded(有界)
+                    let completed = CallDevToolsProtocolMethodCompletedHandler::create(
                         Box::new(
-                            move |_result: windows::core::Result<()>, json: String| -> windows::core::Result<()> {
+                            move |_result: windows::core::Result<()>, json: String| {
                                 let _ = tx2.send(Ok(json));
                                 Ok(())
                             },
                         ),
                     );
-                    if let Err(e) = result {
-                        let _ = tx.send(Err(e.to_string()));
+                    if let Err(e) =
+                        webview.CallDevToolsProtocolMethod(&method, &params, &completed)
+                    {
+                        let _ = tx.send(Err(format!("CallDevToolsProtocolMethod failed: {e}")));
                     }
                 }
             }
@@ -134,18 +135,15 @@ fn screenshot_impl(
     })
     .map_err(|e| format!("with_webview failed: {e}"))?;
 
-    // 等待回调结果(10s 超时)
-    rx.recv_timeout(std::time::Duration::from_secs(10))
-        .map_err(|_| "screenshot timeout".to_string())?
-        .and_then(|json| {
-            // CDP 返回 { "data": "<base64>", ... }
-            let v: serde_json::Value =
-                serde_json::from_str(&json).map_err(|e| format!("parse cdp result: {e}"))?;
-            v.get("data")
-                .and_then(|d| d.as_str())
-                .map(|s| s.to_string())
-                .ok_or_else(|| format!("no data in cdp result: {json}"))
-        })
+    // 等待回调结果(有界:超时返回明确错误,不无限阻塞)再解析 CDP 的 { "data": "<base64>" }
+    super::cdp::wait_bounded(rx, SCREENSHOT_TIMEOUT_MS).and_then(|json| {
+        let v: serde_json::Value =
+            serde_json::from_str(&json).map_err(|e| format!("parse cdp result: {e}"))?;
+        v.get("data")
+            .and_then(|d| d.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| format!("no data in cdp result: {json}"))
+    })
 }
 
 /// Linux:WebKitGTK 快照 → cairo 图像面 → PNG base64
