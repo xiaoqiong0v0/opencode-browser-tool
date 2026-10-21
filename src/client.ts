@@ -227,7 +227,10 @@ export async function startService(
   // 推送式投递:把插件本地通知地址传给 shell(亦可用 BT_SHELL_NOTIFY_URL;附着模式用 /api/notify-url 注册)
   const notifyUrl = getNotifyUrl();
   if (notifyUrl) args.push("--notify-url", notifyUrl);
-  let serviceProcess;
+  // 修(泄漏 bug):原此处写的是 `let serviceProcess;` —— **局部声明遮蔽了模块级同名变量**,
+  // spawn 句柄只落在局部,模块级 serviceProcess 恒为 null → stopService 的 waitForExit/SIGTERM
+  // 兜底是死代码;`profile --set`(不走 /api/close)等异常路径会泄漏 shell 进程。
+  // 现改为直接赋值模块级变量,兜底恢复有效。
   try {
     serviceProcess = spawn(shell, args, { stdio: ["ignore", "pipe", "pipe"] });
   } catch (e) {
