@@ -43,7 +43,7 @@ export function setAppDirectory(dir: string): void {
 export function resolveShellBinary(): { path: string; source: ShellSource } {
   const platform = process.platform === "win32" ? "win-x64" : "linux-x64";
   const bin = process.platform === "win32" ? "bt-shell.exe" : "bt-shell";
-  // 1) 显式指定:最优先(即使文件暂不存在也返回,由 startService 给出明确错误)
+  // 1) 显式指定:最优先(即使文件暂不存在也返回,由启动链路 resolveShellPath 给出明确错误)
   const envPath = process.env.BT_SHELL_PATH;
   if (envPath) return { path: envPath, source: "env" };
   const cargoTargetDir = process.env.CARGO_TARGET_DIR;
@@ -72,7 +72,7 @@ export function resolveShellBinary(): { path: string; source: ShellSource } {
   for (const [p, source] of candidates) {
     if (p && existsSync(p)) return { path: p, source };
   }
-  // 5) 下载缓存(未下载时由 startService 先 ensureBinary)
+  // 5) 下载缓存(未下载时由 resolveShellPath 先 ensureBinary)
   return { path: cachedBinaryPath(), source: "download-cache" };
 }
 
@@ -108,6 +108,8 @@ interface ShellInstance {
 const sessions = new Map<string, ShellInstance>();
 /** 正在启动中的会话 → Promise(并发保护:同一 sid 多个工具同时调用只启动一次) */
 const startingSid = new Map<string, Promise<ShellInstance>>();
+/** 已请求关闭的会话(P3-①):close 与启动并发时置位,启动链完成后据此自毁,避免孤儿窗口 */
+const closedSids = new Set<string>();
 /** 附着模式共享实例(外部 shell;所有 sid 共用,放弃会话隔离) */
 let attachInstance: ShellInstance | null = null;
 
@@ -361,9 +363,21 @@ async function attachToService(baseUrl: string, sid: string): Promise<ShellInsta
   return inst;
 }
 
-/** 确保某会话的实例存在并就绪(懒启动;并发调用复用同一启动 Promise) */
-export async function ensureInstance(explicitSid?: string): Promise<ShellInstance> {
+/**
+ * 确保某会话的实例存在并就绪(懒启动;并发调用复用同一启动 Promise)
+ *
+ * **已关闭语义(用户口径)**:用户 `close` 或手动点 X 之后,该 sid 进入「已关闭」态
+ * (`closedSids` 置位)—— 之后的**工具调用一律不 spawn**,只返回指引,必须由
+ * `open_window`(唯一打开入口,`allowClosed=true` 且先清标记)显式打开。
+ */
+export async function ensureInstance(explicitSid?: string, opts?: { allowClosed?: boolean }): Promise<ShellInstance> {
   const sid = resolveSessionId(explicitSid);
+  const allowClosed = opts?.allowClosed === true;
+
+  // 已关闭态:不 spawn、不 attach,直接给指引(唯一例外是 open_window 的显式打开)
+  if (!allowClosed && closedSids.has(sid)) {
+    throw new Error(tf("client.browser_closed"));
+  }
 
   // 附着模式:外部 shell 单例,所有 sid 共用(连接一次,之后直接返回)
   const attachUrl = resolveAttachBaseUrl();
@@ -372,6 +386,11 @@ export async function ensureInstance(explicitSid?: string): Promise<ShellInstanc
     const existing = sessions.get(sid);
     if (existing?.attach) return existing;
     const inst = await attachToService(attachUrl, sid);
+    // P3-①:附着期间该 sid 被关闭 → 只解本地关联(外部进程不归插件管,绝不 kill)
+    if (closedSids.has(sid)) {
+      log.info(`[session] sid=${sid} was closed during attach; discarding local association`);
+      throw new Error(tf("client.session_closed_during_start"));
+    }
     attachInstance = inst;
     sessions.set(sid, inst);
     await fireReady(sid);
@@ -389,6 +408,13 @@ export async function ensureInstance(explicitSid?: string): Promise<ShellInstanc
   const p = (async (): Promise<ShellInstance> => {
     const shell = await resolveShellPath();
     const inst = await spawnForSession(sid, shell);
+    // P3-①:启动期间该 sid 被 closeSession/closeAllSessions 关闭 → 立即自毁刚起的 shell,不注册。
+    // 注意**不删** closedSids:用户已表达关闭意图,后续工具调用仍应指引 open_window(不自动重开)
+    if (closedSids.has(sid)) {
+      log.info(`[session] sid=${sid} was closed during startup; terminating freshly spawned pid=${inst.proc?.pid ?? "?"}`);
+      await terminateOwnProcess(inst.proc);
+      throw new Error(tf("client.session_closed_during_start"));
+    }
     sessions.set(sid, inst);
     await fireReady(sid);
     return inst;
@@ -431,12 +457,15 @@ async function registerNotifyUrl(baseUrl: string, sid: string): Promise<void> {
  */
 export async function closeSession(explicitSid?: string): Promise<void> {
   const sid = resolveSessionId(explicitSid);
+  // P3-①:先置关闭标记 —— 即使实例尚不存在(启动进行中),启动链完成后也会据此自毁,不留孤儿
+  closedSids.add(sid);
   const inst = sessions.get(sid) || (attachInstance && attachInstance.sid === sid ? attachInstance : null);
   if (!inst) {
     log.info(`[session] sid=${sid} has no shell instance; nothing to close (never spawn on close)`);
     return;
   }
   sessions.delete(inst.sid);
+  // 已关闭态保留 closedSids:后续工具调用不再自动重开,须 open_window 显式打开
   if (attachInstance === inst) attachInstance = null;
   if (inst.attach) {
     // 附着模式:外部 shell 进程不归插件管,**绝不 kill**,只清本地关联
@@ -469,9 +498,17 @@ export async function ensureService(sid?: string): Promise<void> {
   await ensureInstance(sid);
 }
 
+/** 清「已关闭」标记(会话删除时用,避免集合无限增长;open_window 亦会清) */
+export function clearClosedState(sid: string): void {
+  closedSids.delete(sid);
+}
+
 /** 打开浏览器窗口(未启动则启动该会话实例;已启动幂等) */
 export async function openWindow(sid?: string): Promise<void> {
-  await ensureInstance(sid);
+  // 唯一打开入口:显式清「已关闭」标记后再启动
+  const s = resolveSessionId(sid);
+  closedSids.delete(s);
+  await ensureInstance(s, { allowClosed: true });
 }
 
 /**
@@ -521,21 +558,70 @@ async function probeOnce(baseUrl: string, timeoutMs: number): Promise<any | null
 }
 
 /**
+ * 判断是否为**连接层**错误(shell 进程已死/端口没人听 → fetch 直接抛)。
+ * 只认这类;HTTP 4xx/5xx 不算(它们不会抛错,而是 res.ok=false → 走 json.success 分支)。
+ */
+function isConnectionError(e: unknown): boolean {
+  if (!(e instanceof Error)) return false;
+  // undici/node 的连接失败:message = "fetch failed",真实原因在 cause.code;部分场景直接带码
+  const code = String((e as any)?.cause?.code || (e as any)?.code || "");
+  if (/ECONNREFUSED|ECONNRESET|EPIPE|ENOTFOUND|EAI_AGAIN|EHOSTUNREACH|ENETUNREACH|UND_ERR|ETIMEDOUT/.test(code)) {
+    return true;
+  }
+  // 退化:message 里出现连接类字样(不同 node/undici 版本的文案差异)
+  return /fetch failed|socket hang up|other side closed|connect ECONN|network error/i.test(e.message);
+}
+
+/** 把一个已死实例从注册表摘除并回收残留句柄(只按该实例自己的句柄/PID,绝不按名) */
+async function markInstanceDead(sid: string, inst: ShellInstance): Promise<void> {
+  // 只在注册项仍指向该实例时删除(避免误删之后由 open_window 重新注册的新实例)
+  if (sessions.get(sid) === inst) sessions.delete(sid);
+  if (attachInstance === inst) attachInstance = null;
+  if (inst.proc) await terminateOwnProcess(inst.proc);
+}
+
+/** 发一次 POST 并解析 {success,data};连接层错误直接抛(fetch 的 TypeError 等) */
+async function postJson(baseUrl: string, path: string, payload: unknown): Promise<any> {
+  const res = await fetch(`${baseUrl}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload ?? {}),
+  });
+  const json = await res.json();
+  if (!json.success) throw new Error(json.error || tf("client.service_error"));
+  return json.data;
+}
+
+/**
  * 统一 API 调用:按 sid 路由到该会话的实例(懒启动)。
  * sid 来源:显式 sessionId 参数 > body._sessionId > 钩子缓存兜底 > "default" 桶。
+ *
+ * P3-②:连接层错误(手关窗口/进程被杀)→ 标记实例死亡 + 置「已关闭」态 → 抛 `client.browser_closed`
+ * 指引,**绝不自动重开**(唯一打开入口是 `open_window`)。**例外**:
+ * - 附着模式:外部进程不归插件管 → 只报 `client.attach_gone`,不动任何进程;
+ * - get_browser_status(走 probeStatus/probeOnce,不经本函数)保持纯查询,不 spawn;
+ * - HTTP 4xx/5xx 不算连接错误,原样抛服务端错误。
  */
 async function callApi(path: string, body?: any, sessionId?: string): Promise<any> {
   const sid = resolveSessionId(sessionId || (body && body._sessionId));
   const inst = await ensureInstance(sid);
   const payload = { ...(body || {}), _sessionId: sid };
-  const res = await fetch(`${inst.baseUrl}${path}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  const json = await res.json();
-  if (!json.success) throw new Error(json.error || tf("client.service_error"));
-  return json.data;
+  try {
+    return await postJson(inst.baseUrl, path, payload);
+  } catch (e) {
+    if (!isConnectionError(e)) throw e;
+    if (inst.attach) {
+      // 附着模式:不拥有该进程,只报明确错误(不 respawn)
+      throw new Error(tf("client.attach_gone", { url: inst.baseUrl }));
+    }
+    log.error(
+      `[session] sid=${sid} instance dead (port=${inst.port}, pid=${inst.proc?.pid ?? "?"}): ${(e as Error).message}; marking closed`,
+    );
+    await markInstanceDead(sid, inst);
+    // 用户口径:手动关窗**绝不自动重开** → 置位「已关闭」态,指引显式 open_window(不做 respawn 重试)
+    closedSids.add(sid);
+    throw new Error(tf("client.browser_closed"));
+  }
 }
 
 function cmd(name: string) {

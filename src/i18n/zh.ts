@@ -114,7 +114,7 @@ const zh: LocaleStrings = {
     "cli.out.click_switch_tab": "已点击 {sel}，当前 URL: {url}",
     "cli.out.iframe_click": "已在 iframe 内点击",
     "cli.out.iframe_fill": "已在 iframe 内填写",
-    "cli.out.status.not_running": "浏览器未运行。\nbt-shell: {bin}\n（执行任意其它工具会自动启动；也可用 open_window 显式启动）",
+    "cli.out.status.not_running": "浏览器未运行。\nbt-shell: {bin}\n（执行任意其它工具会自动启动；也可用 open_window 显式启动。若已手动关闭，请用 open_window）",
     "cli.out.status.installing": "正在安装 {list}。",
     "cli.out.status.not_open": "浏览器未打开。请用 command=open_window 或 navigate。",
     "cli.out.status.open": "浏览器已打开\n标题: {title}\nURL: {url}\n标签数: {n}",
@@ -170,6 +170,9 @@ const zh: LocaleStrings = {
     "client.service_error": "服务错误",
     "client.bt_shell_path_missing": "BT_SHELL_PATH 指向的二进制不存在（路径见环境变量配置）",
     "client.spawn_failed": "bt-shell 进程启动失败（请稍后经 bt_cli 重试；勿直接执行二进制文件）",
+  "client.session_closed_during_start": "该会话在浏览器启动过程中被关闭，实例已回收（未注册）。如需浏览器请重新调用工具。",
+  "client.attach_gone": "附着的外部 bt-shell 在 {url} 已断开（附着模式不接管进程，请自行重启该 shell）。",
+  "client.browser_closed": "浏览器已关闭。请先调用 open_window 打开后再试。",
 
     "tool.set_media_mode.desc":
       "切换摄像头/麦克风模式：simulate（模拟设备，默认）或 real（真实设备，无设备自动回退模拟）。不带参数时查询当前模式。",

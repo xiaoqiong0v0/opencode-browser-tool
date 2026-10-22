@@ -11,7 +11,7 @@ import en from "./i18n/en.js";
 import zh from "./i18n/zh.js";
 import {
   configureService, setAppDirectory, setServiceReadyHandler, setSessionIdResolver, setTitleResolver,
-  resolveSessionId, openWindow, isRunning, closeSession, closeAllSessions, service, probeStatus,
+  resolveSessionId, openWindow, isRunning, closeSession, closeAllSessions, clearClosedState, service, probeStatus,
 } from "./client.js";
 import { startNotifyServer } from "./notify-server.js";
 import { startDownload, getBinaryStatus, describeBinaryStatus } from "./binary.js";
@@ -78,7 +78,7 @@ const TIMEOUT_MIN_MS = 100;
 const TIMEOUT_MAX_MS = 60000;
 
 /** 解析并规范化模型传入的 `--timeout`(毫秒,与 `wait_for_selector` 既有单位一致)
- * - 未传/空:返回空串,各命令默认行为不变(不改现状默认:eval 5s / CDP 10s / 截图 10s)
+ * - 未传/空:返回空串,各命令走服务端默认(1.9.0 批次4 起 eval/CDP/截图/wait_for_selector 均 15s)
  * - 非正整数:抛错 —— 快速明确拒绝,不带着坏值进浏览器
  * - 超出 [100, 60000]:钳制并把 `a.timeout` 改写为钳后值(实际生效值),返回如实标注文案
  * 服务端 Rust 侧同口径二次钳制兜底(直连 HTTP 也安全);响应体的 timeoutClamped 与这里一致
@@ -151,7 +151,7 @@ const COMMANDS: Record<string, CmdDef> = {
   close: { usage: "", descKey: "cli.cmd.close", run: async (a) => { const sid = sidOf(a); if (!isRunning(sid)) return _t("cli.out.close_already"); await closeSession(sid); return _t("cli.out.close_done"); } },
   show_notification: { usage: "--message [--type]", descKey: "cli.cmd.show_notification", args: [{ flag: "message" }, { flag: "type" }], run: async (a) => { await service.notify(a); return _t("cli.out.notify_shown"); } },
   scroll: { usage: "[--direction --amount]", descKey: "cli.cmd.scroll", args: [{ flag: "direction" }, { flag: "amount" }], run: async (a) => { const r = await service.scroll(a); return _t("cli.out.scroll", { dir: a.direction || "down", n: a.amount || 300 }) + stableNote(r); } },
-  wait_for_selector: { usage: "--selector [--timeout]", descKey: "cli.cmd.wait_for_selector", args: [{ flag: "selector" }, { flag: "timeout" }], run: async (a) => { await service.waitForSelector(a); return _t("cli.out.wait_appeared"); } },
+  wait_for_selector: { usage: "--selector [--timeout ms]", descKey: "cli.cmd.wait_for_selector", args: [{ flag: "selector" }, { flag: "timeout" }], run: async (a) => { const tn = timeoutNote(a); await service.waitForSelector(a); return _t("cli.out.wait_appeared") + tn; } },
   click_and_switch_tab: { usage: "--selector", descKey: "cli.cmd.click_and_switch_tab", args: [{ flag: "selector" }], run: async (a) => { const r = await service.clickSwitchTab(a); return _t("cli.out.click_switch_tab", { sel: a.selector, url: r.url || "" }) + degradedNote(r); } },
   iframe_click: { usage: "--iframeSelector --selector [--timeout ms]", descKey: "cli.cmd.iframe_click", args: [{ flag: "iframeSelector" }, { flag: "selector" }, { flag: "timeout" }], run: async (a) => { const tn = timeoutNote(a); const r = await service.iframeClick(a); return _t("cli.out.iframe_click") + degradedNote(r) + tn; } },
   iframe_fill: { usage: "--iframeSelector --selector --value [--timeout ms]", descKey: "cli.cmd.iframe_fill", args: [{ flag: "iframeSelector" }, { flag: "selector" }, { flag: "value" }, { flag: "timeout" }], run: async (a) => { const tn = timeoutNote(a); const r = await service.iframeFill(a); return _t("cli.out.iframe_fill") + degradedNote(r) + tn; } },
@@ -331,6 +331,7 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree, directory,
           if (delId) {
             sessionCache.clearIf(delId);
             await closeSession(delId);
+            clearClosedState(delId);
           }
           return;
         }
@@ -512,42 +513,43 @@ async function drainAnnotate(sid: string): Promise<void> {
   drainingSid.add(sid);
   try {
     const r = await service.annotateConsumeSent({ _sessionId: sid });
-      const records = r?.records || [];
-      if (records.length === 0) return; // 空结果不刷屏
-      const imgInfo = records
-        .filter((x: any) => x.type === "screenshot" && x.image)
-        .map((x: any) => `#${x.index}:${x.image.length}B`);
-      log.info(`[drain] consume-sent -> ${records.length} record(s) ids=[${records.map((x: any) => x.index).join(",")}] images=[${imgInfo.join(",")}]`);
-      const lines = ["User annotated via panel:", ""];      for (const item of records) {
-        const label =
-          item.type === "screenshot"
-            ? `[#${item.index}] 截图${item.url ? ` @ ${item.url}` : ""}`
-            : `[#${item.index}] ${item.selector || "(no selector)"}${item.url ? ` @ ${item.url}` : ""}`;
-        lines.push(`- ${label}${item.note ? `: ${item.note}` : ""}`);
-        // 截图:落盘保留并写入文本路径。与参考实现(opencode-playwright-tool)一致 ——
-        // 图片**不经 session.prompt**(服务端对 image/* part 返回 400),而是走
-        // 「工具结果附件」(bt_screenshot)或「读记录返回缓存路径」(read_record_content)。
-        if (item.type === "screenshot" && item.image) {
-          const savedPath = saveShotImage(log, sid, item.index, item.image);
-          if (savedPath) lines.push(`  (image saved: ${savedPath})`);
-        }
-        lines.push("");
+    const records = r?.records || [];
+    if (records.length === 0) return; // 空结果不刷屏
+    const imgInfo = records
+      .filter((x: any) => x.type === "screenshot" && x.image)
+      .map((x: any) => `#${x.index}:${x.image.length}B`);
+    log.info(`[drain] consume-sent -> ${records.length} record(s) ids=[${records.map((x: any) => x.index).join(",")}] images=[${imgInfo.join(",")}]`);
+    const lines = ["User annotated via panel:", ""];
+    for (const item of records) {
+      const label =
+        item.type === "screenshot"
+          ? `[#${item.index}] 截图${item.url ? ` @ ${item.url}` : ""}`
+          : `[#${item.index}] ${item.selector || "(no selector)"}${item.url ? ` @ ${item.url}` : ""}`;
+      lines.push(`- ${label}${item.note ? `: ${item.note}` : ""}`);
+      // 截图:落盘保留并写入文本路径。与参考实现(opencode-playwright-tool)一致 ——
+      // 图片**不经 session.prompt**(服务端对 image/* part 返回 400),而是走
+      // 「工具结果附件」(bt_screenshot)或「读记录返回缓存路径」(read_record_content)。
+      if (item.type === "screenshot" && item.image) {
+        const savedPath = saveShotImage(log, sid, item.index, item.image);
+        if (savedPath) lines.push(`  (image saved: ${savedPath})`);
       }
-      const text = lines.join("\n");
-      // 投递目标 = 通知 URL 里的 sid(1.9.0 会话隔离:取代旧的 hook-cache last-writer-wins)
-      log.info(`[drain] sid=${sid} prompt parts=text-only textLen=${text.length}`);
-      const res = await c.session.prompt({ path: { id: sid }, body: { noReply: false, parts: [{ type: "text", text }] } });
-      const err = res?.error;
-      if (err) {
-        // 不再静默:写日志 + 页面通知(SDK 返回 {error} 不抛,必须显式检查)
-        log.error(`[drain] prompt FAILED sid=${sid}: ${JSON.stringify(err).slice(0, 300)}`, new Error("prompt error"));
-        try {
-          await service.notify({ message: `发送记录失败: ${JSON.stringify(err).slice(0, 180)}`, type: "err" }, sid);
-        } catch {}
-      } else {
-        log.info(`[drain] prompt OK sid=${sid} delivered ${records.length} record(s)`);
-      }
-    } catch (e) {
+      lines.push("");
+    }
+    const text = lines.join("\n");
+    // 投递目标 = 通知 URL 里的 sid(1.9.0 会话隔离:取代旧的 hook-cache last-writer-wins)
+    log.info(`[drain] sid=${sid} prompt parts=text-only textLen=${text.length}`);
+    const res = await c.session.prompt({ path: { id: sid }, body: { noReply: false, parts: [{ type: "text", text }] } });
+    const err = res?.error;
+    if (err) {
+      // 不再静默:写日志 + 页面通知(SDK 返回 {error} 不抛,必须显式检查)
+      log.error(`[drain] prompt FAILED sid=${sid}: ${JSON.stringify(err).slice(0, 300)}`, new Error("prompt error"));
+      try {
+        await service.notify({ message: `发送记录失败: ${JSON.stringify(err).slice(0, 180)}`, type: "err" }, sid);
+      } catch {}
+    } else {
+      log.info(`[drain] prompt OK sid=${sid} delivered ${records.length} record(s)`);
+    }
+  } catch (e) {
       log.error("annotate drain error", e as Error);
     } finally {
       drainingSid.delete(sid);

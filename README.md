@@ -48,8 +48,7 @@ sha256 校验（**幂等**：sha 与当前 release 期望值一致即跳过；**
 ```jsonc
 {
   "panelLang": "zh",
-  "toolLang": "en",
-  "sessionIsolation": false
+  "toolLang": "en"
 }
 ```
 
@@ -121,6 +120,8 @@ opencode（Bun）
 
 ### 工具参数
 
+> **`--timeout ms`（可选，1.9.0 起）** —— 阻塞型命令（如 `bt_click` / `bt_fill` / `bt_evaluate` / `bt_screenshot` / `bt_wait_for_selector` 等）均支持按次传 `--timeout`，钳制到 `[100, 60000]` 毫秒；未传走服务端默认（15s），传小值可让慢操作**快失败**（如 `--timeout 800` 让卡住的 `evaluate` 在约 0.8s 返回 `eval timeout`），被钳制时输出会如实标注。
+
 | 工具 | 参数（类型） | 说明 |
 |------|------|------|
 | `bt_navigate` | `url`(string) 必填 | 导航到指定地址（裸域名自动补 http://） |
@@ -162,7 +163,7 @@ opencode（Bun）
 | `bt_open_window` | 无 | 打开浏览器窗口（未启动则启动；已启动幂等） |
 | `bt_fake_audio` | `kind`(string) 必填，`data`/`freq`/`durMs`/`notes`/`digits`(string)，`loop`(boolean) | 向页面注入模拟麦克风音频 |
 | `bt_fake_video` | `kind`(string) 必填，`data`/`url`(string)，`loop`(boolean) | 向页面注入模拟摄像头画面 |
-| `bt_profile` | `set` / `delete`(string) 可选 | user-data 配置管理：空参列出；`--set` 切换并重启服务；`--delete` 删除（默认/激活项除外） |
+| `bt_profile` | `set` / `delete`(string) 可选 | user-data 配置管理：空参列出；`--set` 切换默认配置（影响**后续新会话**的数据根，不重启浏览器）；`--delete` 删除（默认/激活项除外） |
 | `bt_exports` | 无 | 显示导出目录与 Edge/Chrome 导出指引 |
 | `bt_lookup` | `csv`, `url`(string) 必填 | 从密码 CSV 按站点匹配并返回凭据（写入临时文件，不进上下文） |
 | `bt_expect_response` | `url`(string) 必填 | 记录期望匹配的响应模式，清空响应历史后重新捕获 |
@@ -218,14 +219,14 @@ opencode（Bun）
 - **批注模式** — 悬停高亮元素（覆盖层自绘），点击元素弹出输入框填写说明；引擎层拦截，弹框/下拉类元素不失焦
 - **截图模式** — 点击立即截全屏；也可进入截图模式后拖动框选区域（选区可拖拽手柄调整大小），保存时可按需裁剪（遮罩式选区，默认整图，双击还原）
 - **记录列表** — 面板「AI 功能」区：批注/截图记录卡片（截图带缩略图），显示所属标签 URL 与说明
-- **发送** — 面板底部「发送」按钮：所有记录（批注文字 + 截图图片）推送到 opencode 对话；发送后**面板列表清空**（与旧 Playwright 工具一致，仅列表为空），但**记录本身保留**并标记 `[sent]`（`bt_list_records` 仍可读取，截图也可通过 `bt_read_record_content` 取到）。投递为**推送式**：shell 发送后主动通知插件（`POST /notify`），插件收到即拉取并推送到对话（无轮询、无 2s 延迟）
+- **发送** — 面板底部「发送」按钮：所有记录（批注文字 + 截图图片）推送到 opencode 对话；发送后**面板列表清空**（与旧 Playwright 工具一致，仅列表为空），但**记录本身保留**并标记 `[sent]`（`bt_list_records` 仍可读取，截图也可通过 `bt_read_record_content` 取到）。投递为**推送式**：shell 发送后主动通知插件（`POST /notify/<sid>`，按会话归属），插件收到即拉取并推送到对话（无轮询、无 2s 延迟）
 - 批注和截图**必须填写说明**才能保存/发送，否则弹出提示
 
 面板「配置」区：外观主题（跟随系统/浅色/深色）、设备预设下拉（等价 `bt_set_device`）、开发者工具按钮（等价 `bt_devtools`）。
 
 ## 多会话
 
-父子会话共享一个浏览器。开启 `sessionIsolation: true` 后，每个 opencode 会话有独立上下文（cookies/存储隔离）。
+自 1.9.0 起**每个 opencode 会话独享一个浏览器窗口**：独立进程 / 独立端口 / 独立用户数据目录（`sessions/<profile>/<sid>`），窗口、标签、UA、批注与 cookie/存储全部互不共享（原 `sessionIsolation` 开关已移除，隔离是唯一行为）。例外：附着模式（`BT_SHELL_URL` / `BT_SHELL_PORT`）连接外部单例 shell，放弃会话隔离。
 
 ## 发布
 

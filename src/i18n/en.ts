@@ -114,7 +114,7 @@ const en: LocaleStrings = {
     "cli.out.click_switch_tab": "Clicked {sel}, current URL: {url}",
     "cli.out.iframe_click": "Clicked in iframe",
     "cli.out.iframe_fill": "Filled in iframe",
-    "cli.out.status.not_running": "Browser is not running.\nbt-shell: {bin}\n(Any other tool call will start it; or use open_window)",
+    "cli.out.status.not_running": "Browser is not running.\nbt-shell: {bin}\n(Any other tool call will start it; or use open_window. If you have closed the browser, use open_window)",
     "cli.out.status.installing": "Installing {list}.",
     "cli.out.status.not_open": "Browser is not open. Use command=open_window or navigate.",
     "cli.out.status.open": "Browser is open\nTitle: {title}\nURL: {url}\nTabs: {n}",
@@ -170,6 +170,9 @@ const en: LocaleStrings = {
     "client.service_error": "Service error",
     "client.bt_shell_path_missing": "BT_SHELL_PATH points to a binary that does not exist (path is in the environment variable)",
     "client.spawn_failed": "Failed to start the bt-shell process (retry via bt_cli later; do not run the executable directly)",
+  "client.session_closed_during_start": "Session was closed while the browser was starting; that instance was recycled (not registered). Call the tool again to reopen.",
+  "client.attach_gone": "Attached external bt-shell at {url} is gone (attach mode does not own that process; restart the shell yourself).",
+  "client.browser_closed": "Browser is closed. Call open_window to open it first, then retry.",
 
     "tool.set_media_mode.desc":
       "Switch camera/microphone mode: 'simulate' (fake devices, default) or 'real' (real devices, falls back to simulate if unavailable). Call without mode to query the current mode.",

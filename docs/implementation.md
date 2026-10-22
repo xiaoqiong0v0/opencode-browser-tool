@@ -83,7 +83,7 @@
 
 - 每个 shell 实例注册**自己**的 `--notify-url` = `<插件监听端口>/notify/<sid>`(`notify-server.ts:62`,`client.ts:316`)。
 - 通知到达 → `notify-server` 从 URL 提取 sid(`notify-server.ts:27`)→ 只 drain **该会话**(`index.ts:497` → `drainAnnotate(sid)`,`index.ts:505`)。彻底取代旧的「最后活跃会话」(last-writer-wins)。
-- 实例就绪回调同样带 sid(`setServiceReadyHandler`,`client.ts:144`;`index.ts:493`)。
+- 实例就绪回调同样带 sid(`setServiceReadyHandler`,`client.ts:149`;`index.ts:493`)。
 
 ### 窗口标题
 
