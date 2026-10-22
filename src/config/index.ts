@@ -1,9 +1,22 @@
 import { readFileSync, existsSync, writeFileSync, mkdirSync } from "fs";
-import { resolve, dirname } from "path";
+import { resolve, dirname, relative, isAbsolute, sep } from "path";
 import { homedir } from "os";
+import { tf } from "../i18n/index.js";
+import { log } from "../logger.js";
 
 const PLUGIN_NAME = "opencode-browser-tool";
 const CONFIG_FILE = "browser-tool.jsonc";
+
+/** profile 名长度上限(字符) */
+const PROFILE_NAME_MAX_LEN = 64;
+/** profile 名禁止出现的字符(/ \ : NUL 与 Windows 非法文件名字符) */
+const PROFILE_NAME_FORBIDDEN = /[\/\\:\u0000<>"|?*]/;
+/** Windows 保留设备名(大小写不敏感;含带扩展名的形式,如 CON.txt) */
+const WINDOWS_RESERVED_NAMES = new Set([
+  "CON", "PRN", "AUX", "NUL",
+  ...Array.from({ length: 9 }, (_, i) => `COM${i + 1}`),
+  ...Array.from({ length: 9 }, (_, i) => `LPT${i + 1}`),
+]);
 
 export type Lang = "en" | "zh";
 
@@ -55,9 +68,47 @@ export function getProfilesDir(): string {
   return resolve(getCacheDir(), "user-data");
 }
 
-/** 某个配置的 WebView2 用户数据目录 */
-export function getProfileDir(name: string): string {
-  return resolve(getProfilesDir(), name);
+/**
+ * 校验 profile 名并返回原名(不合法则抛错,消息走 i18n `cli.err.profile_invalid_name`)
+ * 规则:非空、≤64 字符、不含 / \ : NUL 及 < > " | ? *、不等于 . / ..、不以 . 开头、
+ * 不是 Windows 保留设备名(CON/PRN/AUX/NUL/COM1-9/LPT1-9,大小写不敏感)。
+ */
+export function assertSafeProfileName(name: string): string {
+  const bad = (): never => {
+    throw new Error(tf("cli.err.profile_invalid_name", { name: String(name) }));
+  };
+  if (typeof name !== "string" || name.length === 0) bad();
+  if (name.length > PROFILE_NAME_MAX_LEN) bad();
+  if (PROFILE_NAME_FORBIDDEN.test(name)) bad();
+  if (name === "." || name === "..") bad();
+  if (name.startsWith(".")) bad();
+  // Windows 保留名对带扩展名的写法同样生效(CON.txt 也不可创建)
+  if (WINDOWS_RESERVED_NAMES.has(name.split(".")[0].toUpperCase())) bad();
+  return name;
+}
+
+/**
+ * 把 profile 名解析为绝对路径:先校验名字,再用 relative 断言结果位于 profiles 目录内
+ * (非空、不以 .. 开头、非绝对路径),防止 path traversal。
+ */
+export function resolveProfilePath(name: string): string {
+  const safe = assertSafeProfileName(name);
+  const base = getProfilesDir();
+  const full = resolve(base, safe);
+  const rel = relative(base, full);
+  if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    throw new Error(tf("cli.err.profile_invalid_name", { name: String(name) }));
+  }
+  return full;
+}
+
+/**
+ * 判断 child 是否在 parent **内部**(不包含 parent 自身)。
+ * 用 path.relative 判定,避免 `startsWith` 的前缀误判(如 tmpX/a 对 tmp)。
+ */
+export function isInsideDir(child: string, parent: string): boolean {
+  const rel = relative(resolve(parent), resolve(child));
+  return !!rel && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
 }
 
 // ---- 会话隔离(1.9.0):每会话独立 shell 实例的数据目录 ----
@@ -96,11 +147,25 @@ function activeProfileFile(): string {
   return resolve(getCacheDir(), "active-profile");
 }
 
-/** 获取当前激活配置(默认 "default";不存在时回落默认) */
+/** 已记录过「activeProfile 非法」告警的值(避免每次读取都刷日志) */
+let _badActiveProfileLogged = "";
+
+/** 获取当前激活配置(默认 "default";不存在或值非法时回落默认并记日志) */
 export function getActiveProfile(): string {
   try {
     const v = readFileSync(activeProfileFile(), "utf-8").trim();
-    if (v) return v;
+    if (v) {
+      try {
+        return assertSafeProfileName(v);
+      } catch {
+        // 状态文件被手工改坏时,启动路径不能因此抛错:回落 default(仅记一次日志)
+        if (_badActiveProfileLogged !== v) {
+          _badActiveProfileLogged = v;
+          log.error(`active-profile contains invalid name (${v.length} chars); falling back to "default"`);
+        }
+        return "default";
+      }
+    }
   } catch {}
   return "default";
 }

@@ -3,8 +3,9 @@ import { resolve } from "path";
 import stringArgv from "string-argv";
 import { parseArgs } from "node:util";
 import {
-  loadConfig, getConfig, getBrowsersDir, getCacheDir, getProfilesDir, getProfileDir,
+  loadConfig, getConfig, getBrowsersDir, getCacheDir, getProfilesDir,
   getExportsDir, getTmpDir, getActiveProfile, setActiveProfile, getSessionDataDir, getSessionTmpDir,
+  getSessionsDir, resolveProfilePath, isInsideDir,
 } from "./config/index.js";
 import { registerLocale, tf } from "./i18n/index.js";
 import en from "./i18n/en.js";
@@ -12,6 +13,7 @@ import zh from "./i18n/zh.js";
 import {
   configureService, setAppDirectory, setServiceReadyHandler, setSessionIdResolver, setTitleResolver,
   resolveSessionId, openWindow, isRunning, isStarting, closeSession, closeAllSessions, clearClosedState, service, probeStatus,
+  clearAttachNotifyForSid,
 } from "./client.js";
 import { startNotifyServer } from "./notify-server.js";
 import { startDownload, getBinaryStatus, describeBinaryStatus } from "./binary.js";
@@ -189,27 +191,40 @@ const COMMANDS: Record<string, CmdDef> = {
   fake_audio: { usage: "--kind [--data --freq --durMs --notes --digits --loop]", descKey: "cli.cmd.fake_audio", args: [{ flag: "kind" }, { flag: "data" }, { flag: "freq" }, { flag: "durMs" }, { flag: "notes" }, { flag: "digits" }, { flag: "loop", type: "boolean" }], run: async (a) => { const r = await service.mediaAudio(a); return _t("cli.out.fake_audio", { injected: r.injected }); } },
   fake_video: { usage: "--kind [--data --url --loop]", descKey: "cli.cmd.fake_video", args: [{ flag: "kind" }, { flag: "data" }, { flag: "url" }, { flag: "loop", type: "boolean" }], run: async (a) => { const r = await service.mediaVideo(a); return _t("cli.out.fake_video", { injected: r.injected }); } },
   profile: { usage: "[--set <name> | --delete <name>]", descKey: "cli.cmd.profile", args: [{ flag: "set" }, { flag: "delete" }], run: async (a) => {
-    mkdirSync(getProfilesDir(), { recursive: true });
     const active = getActiveProfile();
+    /** 解析 profile 路径;名字非法时返回错误文案(不 mkdir、不 rm) */
+    const resolveOrError = (raw: any): { dir?: string; name: string; err?: string } => {
+      const name = String(raw);
+      try {
+        return { dir: resolveProfilePath(name), name };
+      } catch {
+        return { name, err: _t("cli.err.profile_invalid_name", { name }) };
+      }
+    };
     if (a.delete) {
-      const name = String(a.delete);
+      const r = resolveOrError(a.delete);
+      if (r.err) return r.err;
+      const name = r.name;
       if (name === "default") return _t("cli.out.profile_no_delete_default");
       if (name === active) return _t("cli.out.profile_no_delete_active");
-      const dir = getProfileDir(name);
+      const dir = r.dir!;
       if (!existsSync(dir)) return _t("cli.out.profile_not_found", { name });
       rmSync(dir, { recursive: true, force: true });
       return _t("cli.out.profile_deleted", { name });
     }
     if (a.set) {
-      const name = String(a.set);
+      const r = resolveOrError(a.set);
+      if (r.err) return r.err;
+      const name = r.name;
       // 目标配置目录不存在则创建(允许 "profile --set <新名>" 直接新建并切换)
-      mkdirSync(getProfileDir(name), { recursive: true });
+      mkdirSync(r.dir!, { recursive: true });
       setActiveProfile(name);
       // 1.9.0 会话隔离:profile 作用域改为「影响**后续新会话**的数据根(sessions/<profile>/<sid>)」。
       // **不再重启共享 shell** —— 运行中的会话各自持有独立实例,切换互不打扰(旧实现会杀掉全局唯一窗口)。
       return _t("cli.out.profile_switched", { name });
     }
     // 列出 user-data 下的配置目录
+    mkdirSync(getProfilesDir(), { recursive: true });
     const dirs = readdirSync(getProfilesDir(), { withFileTypes: true })
       .filter((d) => d.isDirectory())
       .map((d) => d.name);
@@ -336,6 +351,10 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree, directory 
             sessionCache.clearIf(delId);
             await closeSession(delId);
             clearClosedState(delId);
+            // 清该 sid 的附着 notify 记录(附着模式共享 shell,避免残留 key 无限增长)
+            clearAttachNotifyForSid(delId);
+            // 回收该会话的数据目录(P1:否则退出后磁盘目录永不释放)
+            removeSessionDataDir(delId);
           }
           return;
         }
@@ -377,17 +396,29 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree, directory 
               }
               // @file: 引用解析:值以 @file:<path> 开头时读文件内容作为实际值
               // (密码等敏感值不进 LLM 上下文,如 fill --value @file:C:\...\secret.tmp)
-              // 仅删除临时目录(getTmpDir)内的文件,避免误删用户文件
-              const tmpDir = resolve(getTmpDir());
+              // 安全边界:只允许读全局 tmp(getTmpDir)或**该会话** tmp(getSessionTmpDir)之内的文件;
+              // 其余路径一律拒绝(不读取),避免模型借助 @file: 读取任意本地文件。
+              // sid 形态校验:resolveSessionId 会原样返回外部传入的 sessionID,任意字符串(含 .. 、路径分隔符)
+              // 会把 getSessionTmpDir 带到 sessions 目录之外,从而左右 allowed dirs。不匹配 SESSION_SID_RE
+              // 一律回退 "default" 桶(而非 resolveSessionId(""):后者仍可能返回同一个非法的钩子缓存值)。
+              // "default" 本身合法,getSessionTmpDir("default") = sessions/<profile>/default/tmp,必在 sessions 内。
+              const fileSidRaw = resolveSessionId(context?.sessionID || "");
+              const fileSid = SESSION_SID_RE.test(fileSidRaw) ? fileSidRaw : "default";
+              const globalTmpDir = getTmpDir();
+              const allowedTmpDirs = [globalTmpDir, getSessionTmpDir(fileSid)];
               for (const key of Object.keys(params)) {
                 const v = params[key];
                 if (typeof v === "string" && v.startsWith("@file:")) {
                   const p = v.slice(6);
+                  const abs = resolve(p);
+                  if (!allowedTmpDirs.some((d) => isInsideDir(abs, d))) {
+                    return _t("cli.err.file_outside_tmp", { path: p });
+                  }
                   try {
-                    params[key] = readFileSync(p, "utf-8").replace(/\r?\n$/, "");
-                    // 用完即删(仅限 lookup 生成的临时密码文件)
-                    if (resolve(p).startsWith(tmpDir)) {
-                      unlinkSync(p);
+                    params[key] = readFileSync(abs, "utf-8").replace(/\r?\n$/, "");
+                    // 用完即删(仅限 lookup 生成的全局 tmp 临时密码文件;会话 tmp 内的截图等保留)
+                    if (isInsideDir(abs, globalTmpDir)) {
+                      unlinkSync(abs);
                     }
                   } catch (e: any) {
                     return _t("cli.read_file_failed", { path: p, msg: e.message });
@@ -482,6 +513,70 @@ function saveShotImage(log: any, sid: string, index: number, b64: string): strin
     log.error("save screenshot image failed", e as Error);
     return null;
   }
+}
+
+/** 合法会话 id 形态(opencode 生成的 sid);不匹配则不删目录,避免意外路径 */
+const SESSION_SID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+/** 会话目录删除失败后的重试延迟(ms;Windows 上文件常被短暂占用) */
+const SESSION_DIR_RETRY_MS = 800;
+
+/** 同步删除某 sid 的数据目录(失败仅记录,由调用方决定是否重试) */
+function rmSessionDir(dir: string): boolean {
+  try {
+    rmSync(dir, { recursive: true, force: true });
+    log.info(`[session] removed data dir for deleted session: ${dir}`);
+    return true;
+  } catch (e) {
+    log.error(`[session] failed to remove data dir ${dir}: ${(e as Error).message}`, e as Error);
+    return false;
+  }
+}
+
+/**
+ * 会话删除后回收**所有 profile 下**属于该 sid 的数据目录(sessions/<profile>/<sid>)。
+ * 用户切换过 activeProfile 时,老 profile 目录里的同名会话也要清掉,故枚举 sessions 根的直接子目录。
+ * 约束:sid 必须合法;每个目标必须在 getSessionsDir() 之内,且不等于 sessions 根或 profile 根
+ *      (只删名为 <sid> 的目录,profile 目录本身永不删除)。
+ * Windows 文件锁导致失败时 800ms 后对失败列表重试一次;全部成功则不设定时器。
+ */
+function removeSessionDataDir(sid: string): void {
+  if (!SESSION_SID_RE.test(sid)) {
+    log.error(`[session] skip data dir cleanup: invalid session id (${sid.length} chars)`);
+    return;
+  }
+  const sessionsDir: string = getSessionsDir();
+  // 枚举直接子目录:每个 = 一个 profile;读不到(根不存在/无权限)视为无可回收目录
+  let profileNames: string[];
+  try {
+    profileNames = readdirSync(sessionsDir, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => e.name);
+  } catch {
+    return;
+  }
+  const targets: string[] = [];
+  for (const name of profileNames) {
+    const profileDir: string = resolve(sessionsDir, name);
+    const target: string = resolve(profileDir, sid);
+    // 路径断言:仍在 sessions 根内,且不是 sessions 根/profile 根本身
+    if (!isInsideDir(target, sessionsDir) || target === sessionsDir || target === profileDir) continue;
+    if (!existsSync(target)) continue;
+    targets.push(target);
+  }
+  if (!targets.length) return;
+  const failed: string[] = targets.filter((t) => !rmSessionDir(t));
+  if (!failed.length) {
+    log.info(`[session] cleaned data dir for sid=${sid} across ${targets.length} profile dir(s)`);
+    return;
+  }
+  const timer = setTimeout(() => {
+    const stillFailing: string[] = failed.filter((t) => !rmSessionDir(t));
+    if (stillFailing.length) {
+      log.error(`[session] data dir cleanup still failing after retry (sid=${sid}): ${stillFailing.length} dir(s)`);
+    }
+  }, SESSION_DIR_RETRY_MS);
+  // 不让重试定时器拖住进程退出
+  (timer as any).unref?.();
 }
 
 /** 事件驱动投递:插件本地监听 shell 通知(收到即 drain),不再 setInterval 轮询 */

@@ -17,6 +17,8 @@ const zh: LocaleStrings = {
     "cli.unknown": "未知命令: {cmd}",
     "cli.invalid_args": "参数无效 {cmd}: {msg}",
     "cli.err.timeout_invalid": "--timeout 须为正整数（毫秒，100~60000），收到：{v}",
+    "cli.err.profile_invalid_name": "配置名无效：{name}。要求 1~64 个字符，不含 / \\ : 及 < > \" | ? *，不以点开头，且不是 Windows 保留名（CON/PRN/AUX/NUL/COM1-9/LPT1-9）。",
+    "cli.err.file_outside_tmp": "拒绝读取插件临时目录之外的 @file: {path}",
     "cli.failed": "命令 {cmd} 失败: {msg}",
 
     "cli.cmd.navigate": "导航浏览器到 URL",

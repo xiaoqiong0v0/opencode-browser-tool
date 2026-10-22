@@ -120,6 +120,14 @@ let attachInstance: ShellInstance | null = null;
  * drain 由 notify URL 里带的 sid 执行(后注册的 sid 覆盖前一个,与「按 sid 分发」不同)。
  */
 const attachNotifyRegistered = new Set<string>();
+/**
+ * 同一 key 的注册**进行中** Promise:并发 ensure 共享同一次 POST(第二个调用 await 第一个结果,
+ * 而不是直接返回)。失败时只删这里,使下一次调用能重试;成功才写入 attachNotifyRegistered。
+ */
+const attachNotifyInFlight = new Map<string, Promise<boolean>>();
+
+/** notify-url 注册失败后的重试延迟(ms) */
+const NOTIFY_RETRY_DELAY_MS = 300;
 
 /** 服务启动参数(configureService 保存,懒启动时使用) */
 let serviceConfig: {
@@ -327,8 +335,13 @@ async function spawnForSession(sid: string, shell: string): Promise<ShellInstanc
       await terminateOwnProcess(proc);
       continue;
     }
-    // 就绪:把本会话的通知地址注册给该实例(推送式投递)
-    await registerNotifyUrl(baseUrl, sid);
+    // 就绪:把本会话的通知地址注册给该实例(推送式投递;失败重试一次,不影响工具调用成功)
+    const notifyOk = await registerNotifyUrl(baseUrl, sid);
+    if (!notifyOk) {
+      await new Promise((r) => setTimeout(r, NOTIFY_RETRY_DELAY_MS));
+      const retried = await registerNotifyUrl(baseUrl, sid);
+      if (!retried) log.error(`[notify] sid=${sid} notify-url registration failed after retry (delivery may be degraded)`);
+    }
     log.info(`[session] sid=${sid} ready on port ${port} (title="${title}", dataDir=${dataDir || "(default)"}, attempt ${attempt})`);
     return { sid, proc, baseUrl, port, dataDir, title, ready: true, attach: false };
   }
@@ -416,6 +429,10 @@ export async function ensureInstance(explicitSid?: string, opts?: { allowClosed?
       throw new Error(tf("client.session_closed_during_start"));
     }
     sessions.set(sid, inst);
+    // P0 竞态收尾:本轮是 open_window 的显式打开 → 成功后清「已关闭」标记。
+    // 期间若有并发 callApi 探活失败把 sid 重新置为 closed,这里也要清掉,
+    // 否则会出现「窗口明明开着,后续工具却报已关闭」。
+    if (allowClosed) closedSids.delete(sid);
     await fireReady(sid);
     return inst;
   })().finally(() => {
@@ -457,14 +474,27 @@ async function registerNotifyUrl(baseUrl: string, sid: string): Promise<boolean>
   }
 }
 
-/** 附着模式:按 baseUrl+sid 去重注册 notify(附着模式共享一个 shell,队列全局) */
+/** 附着模式:按 baseUrl+sid 去重注册 notify(附着模式共享一个 shell,队列全局)
+ * 并发语义:同 key 的并发调用共享同一次 POST(await 同一个 Promise),失败只清 in-flight,
+ * 使下一次调用自动重试;成功才写入「已注册」集合。 */
 async function ensureAttachNotify(baseUrl: string, sid: string): Promise<void> {
   const key = `${baseUrl}|${sid}`;
   if (attachNotifyRegistered.has(key)) return;
-  // 先置位:并发 ensure 不重复 POST;失败则回滚,下次再试
-  attachNotifyRegistered.add(key);
-  const ok = await registerNotifyUrl(baseUrl, sid);
-  if (!ok) attachNotifyRegistered.delete(key);
+  const inflight = attachNotifyInFlight.get(key);
+  if (inflight) {
+    await inflight;
+    return;
+  }
+  const p = registerNotifyUrl(baseUrl, sid);
+  attachNotifyInFlight.set(key, p);
+  let ok = false;
+  try {
+    ok = await p;
+  } finally {
+    // settle 后清理,避免 Promise 常驻导致内存泄漏
+    if (attachNotifyInFlight.get(key) === p) attachNotifyInFlight.delete(key);
+  }
+  if (ok) attachNotifyRegistered.add(key);
 }
 
 /** 清掉某外部 shell 的 notify 注册记录(断开/换实例后重新连接需重新注册) */
@@ -472,6 +502,21 @@ function clearAttachNotify(baseUrl: string): void {
   const prefix = `${baseUrl}|`;
   for (const key of [...attachNotifyRegistered]) {
     if (key.startsWith(prefix)) attachNotifyRegistered.delete(key);
+  }
+  for (const key of [...attachNotifyInFlight.keys()]) {
+    if (key.startsWith(prefix)) attachNotifyInFlight.delete(key);
+  }
+}
+
+/** 清掉某 sid 的 attach notify 记录(会话删除时调用;键格式为 `baseUrl|sid`) */
+export function clearAttachNotifyForSid(sid: string): void {
+  if (!sid) return;
+  const suffix = `|${sid}`;
+  for (const key of [...attachNotifyRegistered]) {
+    if (key.endsWith(suffix)) attachNotifyRegistered.delete(key);
+  }
+  for (const key of [...attachNotifyInFlight.keys()]) {
+    if (key.endsWith(suffix)) attachNotifyInFlight.delete(key);
   }
 }
 
@@ -554,6 +599,9 @@ export async function openWindow(sid?: string): Promise<void> {
     }
   }
   await ensureInstance(s, { allowClosed: true });
+  // 启动期间并发的 callApi 可能因连接层错误再次置 closedSids(其探活的是旧实例);
+  // 本窗口已确认打开 → 成功路径再清一次,避免「窗口开着却报已关闭」。
+  closedSids.delete(s);
 }
 
 /**

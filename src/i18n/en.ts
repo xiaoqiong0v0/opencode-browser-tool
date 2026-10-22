@@ -17,6 +17,8 @@ const en: LocaleStrings = {
     "cli.unknown": "Unknown command: {cmd}",
     "cli.invalid_args": "Invalid args for {cmd}: {msg}",
     "cli.err.timeout_invalid": "--timeout must be a positive integer in ms (100-60000), got: {v}",
+    "cli.err.profile_invalid_name": "Invalid profile name: {name}. Use 1-64 chars, no / \\ : or < > \" | ? *, must not start with a dot, and must not be a Windows reserved name (CON/PRN/AUX/NUL/COM1-9/LPT1-9).",
+    "cli.err.file_outside_tmp": "Refusing to read @file outside the plugin temp directory: {path}",
     "cli.failed": "Command {cmd} failed: {msg}",
 
     "cli.cmd.navigate": "Navigate browser to a URL",
