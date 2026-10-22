@@ -38,6 +38,7 @@ import { fileURLToPath, pathToFileURL } from "url";
 import { getPluginDataDir } from "./config/index.js";
 import { tf } from "./i18n/index.js";
 import { log } from "./logger.js";
+import { sanitizeForModel } from "./util/sanitize.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -188,7 +189,8 @@ export function getBinaryStatus(): BinaryStatus {
 }
 
 function setStatus(next: BinaryStatus): void {
-  current = next;
+  // reason 会经 describeBinaryStatus 回流模型：写入状态时先脱敏（保留错误分类信息，去掉本机路径）
+  current = next.reason ? { ...next, reason: sanitizeForModel(next.reason) } : next;
 }
 
 /** 触发后台下载(幂等;fire-and-forget,失败不抛出) */
@@ -221,22 +223,31 @@ export async function ensureBinary(timeoutMs = 20000): Promise<BinaryStatus> {
  * 约定:输出**不含任何本机绝对路径**(路径只进插件日志,不回流模型上下文)
  */
 export function describeBinaryStatus(s: BinaryStatus): string {
+  let raw: string;
   switch (s.state) {
     case "ready":
       // 只报就绪态;不返回路径(旧版 return s.path 会把绝对 exe 路径回给模型)
-      return tf("bin.ready");
+      raw = tf("bin.ready");
+      break;
     case "downloading":
-      return tf("bin.downloading", { progress: s.progress ?? 0 });
+      raw = tf("bin.downloading", { progress: s.progress ?? 0 });
+      break;
     case "failed":
-      return tf("bin.failed", { reason: s.reason ?? "unknown" });
+      raw = tf("bin.failed", { reason: s.reason ?? "unknown" });
+      break;
     case "disabled":
       // 不拼绝对路径(旧版含 s.path ?? cachedBinaryPath());只指环境变量,期望路径见插件日志
-      return tf("bin.disabled");
+      raw = tf("bin.disabled");
+      break;
     case "unsupported":
-      return tf("bin.unsupported", { reason: s.reason ?? `${process.platform}/${process.arch}` });
+      raw = tf("bin.unsupported", { reason: s.reason ?? `${process.platform}/${process.arch}` });
+      break;
     default:
-      return tf("bin.not_ready");
+      raw = tf("bin.not_ready");
+      break;
   }
+  // 最后一道闸:无论 reason 来自哪个分支,返回模型前统一脱敏
+  return sanitizeForModel(raw);
 }
 
 // ---- 下载主流程 ----

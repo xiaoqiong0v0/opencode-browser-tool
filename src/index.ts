@@ -17,6 +17,7 @@ import {
 } from "./client.js";
 import { startNotifyServer } from "./notify-server.js";
 import { startDownload, getBinaryStatus, describeBinaryStatus } from "./binary.js";
+import { sanitizeForModel } from "./util/sanitize.js";
 import { tool, type Plugin } from "@opencode-ai/plugin";
 import { log } from "./logger.js";
 import { createSessionIDCache, extractSessionIDFromEvent } from "./session-id.js";
@@ -396,7 +397,8 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree, directory 
                 try {
                   params = parseFlagArgs(tokens, def);
                 } catch (e: any) {
-                  return `${_t("cli.invalid_args").replace("{cmd}", cmdName).replace("{msg}", e.message)}\n\nUsage: bt_cli({ args: "${cmdName} ${def.usage}" })`;
+                  // 解析错误可能夹带底层异常文本:进模型前先脱敏(用法提示本身不含路径)
+                  return `${_t("cli.invalid_args").replace("{cmd}", cmdName).replace("{msg}", sanitizeForModel(e?.message || String(e)))}\n\nUsage: bt_cli({ args: "${cmdName} ${def.usage}" })`;
                 }
               }
               // @file: 引用解析:值以 @file:<path> 开头时读文件内容作为实际值
@@ -426,7 +428,8 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree, directory 
                       unlinkSync(abs);
                     }
                   } catch (e: any) {
-                    return _t("cli.read_file_failed", { path: p, msg: e.message });
+                    // {path} 是模型自己传入的值,保持原样;{msg} 来自 fs 错误,必须脱敏
+                    return _t("cli.read_file_failed", { path: p, msg: sanitizeForModel(e?.message || String(e)) });
                   }
                 }
               }
@@ -437,7 +440,8 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree, directory 
               try {
                 return await def.run(params);
               } catch (e: any) {
-                return `${_t("cli.failed").replace("{cmd}", cmdName).replace("{msg}", e.message || e)}`;
+                // 命令失败可能带 fs/网络错误文本:统一脱敏后再回模型
+                return `${_t("cli.failed").replace("{cmd}", cmdName).replace("{msg}", sanitizeForModel(e?.message || String(e)))}`;
               }
             },
           }),

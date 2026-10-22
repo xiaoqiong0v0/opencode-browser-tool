@@ -14,6 +14,7 @@ import { getNotifyUrlForSession } from "./notify-server.js";
 import { tf } from "./i18n/index.js";
 
 import { cachedBinaryPath, describeBinaryStatus, ensureBinary } from "./binary.js";
+import { sanitizeForModel } from "./util/sanitize.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -88,11 +89,6 @@ function resolveAttachBaseUrl(): string | null {
   const port = process.env.BT_SHELL_PORT?.trim();
   if (port) return `http://127.0.0.1:${port}`;
   return null;
-}
-
-/** 本地 API 统一请求头:JSON + 鉴权令牌(服务端拒绝任何带 Origin 的浏览器跨源请求) */
-function authHeaders(token: string): Record<string, string> {
-  return { "Content-Type": "application/json", "x-bt-token": token };
 }
 
 /** 附着模式令牌:由 BT_SHELL_TOKEN 提供(外部 shell 须用同一值启动);缺失直接抛明确错误 */
@@ -248,21 +244,11 @@ async function waitForReady(
 ): Promise<void> {
   const deadline = Date.now() + READY_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    let authRejected = false;
-    try {
-      const res = await fetch(`${baseUrl}/api/status`, {
-        method: "POST",
-        headers: authHeaders(token),
-        body: "{}",
-      });
-      if (res.ok) return;
-      // 鉴权类失败(401 令牌不匹配 / 403 请求被拒)在附着模式下意味着令牌写错了
-      authRejected = authHint && (res.status === HTTP_UNAUTHORIZED || res.status === HTTP_FORBIDDEN);
-    } catch {
-      // 连接层错误(服务还没开始监听),继续等待
-    }
-    // 抛在 try 之外:避免鉴权错误被上面的 catch 吞掉、退化成继续重试
-    if (authRejected) throw new Error(tf("client.attach_bad_token"));
+    // 就绪语义:只有 ok 算起来;transport(端口还没监听)、server/badjson 都属于
+    // 「还没可用」继续等;auth 在附着模式是确定性失败(令牌写错),立即报错不再空等。
+    const out = await httpCall(baseUrl, token, "/api/status", {});
+    if (out.kind === "ok") return;
+    if (out.kind === "auth" && authHint) throw new Error(tf("client.attach_bad_token"));
     await new Promise((r) => setTimeout(r, READY_POLL_INTERVAL_MS));
   }
   throw new Error(timeoutMessage);
@@ -511,22 +497,17 @@ async function fireReady(sid: string): Promise<void> {
 async function registerNotifyUrl(baseUrl: string, sid: string, token: string): Promise<boolean> {
   const url = getNotifyUrlForSession(sid);
   if (!url) return false;
-  try {
-    const res = await fetch(`${baseUrl}/api/notify-url`, {
-      method: "POST",
-      headers: authHeaders(token),
-      body: JSON.stringify({ url }),
-    });
-    if (res.ok) {
-      log.info(`[notify] sid=${sid} notify-url registered: ${url}`);
-      return true;
-    }
-    log.error(`[notify] sid=${sid} register failed: HTTP ${res.status}`);
-    return false;
-  } catch (e) {
-    log.error("[notify] register failed", e as Error);
-    return false;
+  // 增强路径:只有 ok 算成功,其余(transport/auth/server/badjson)都降级为 false,
+  // 由调用方决定是否重试;绝不因注册失败影响工具调用或实例存活判定。
+  const out = await httpCall(baseUrl, token, "/api/notify-url", { url });
+  if (out.kind === "ok") {
+    log.info(`[notify] sid=${sid} notify-url registered: ${url}`);
+    return true;
   }
+  const detail =
+    out.kind === "auth" ? `HTTP ${out.status}` : out.kind === "server" ? `server: ${out.error}` : out.kind;
+  log.error(`[notify] sid=${sid} register failed: ${detail}`);
+  return false;
 }
 
 /** 附着模式:按 baseUrl+sid 去重注册 notify(附着模式共享一个 shell,队列全局)
@@ -597,15 +578,9 @@ export async function closeSession(explicitSid?: string): Promise<void> {
     log.info(`Detached from external bt-shell at ${inst.baseUrl} (process left running)`);
     return;
   }
-  try {
-    await fetch(`${inst.baseUrl}/api/close`, {
-      method: "POST",
-      headers: authHeaders(inst.token),
-      body: "{}",
-    });
-  } catch {
-    // 进程可能已自行退出;下面的 waitForExit 会兜住
-  }
+  // 关闭路径 best-effort:任何结果都忽略(进程可能已自行退出,transport 也正常),
+  // 存活收尾交给下面的 terminateOwnProcess/waitForExit。
+  await httpCall(inst.baseUrl, inst.token, "/api/close", {});
   await terminateOwnProcess(inst.proc);
   log.info(`[session] sid=${sid} closed (port=${inst.port})`);
 }
@@ -686,40 +661,139 @@ export async function probeStatus(timeoutMs = 1500, sid?: string): Promise<any |
   return null;
 }
 
-/** 对单个端点做一次短超时探测 */
+/** 对单个端点做一次短超时探测:只有 ok 有值;其余(auth/server/badjson/transport)一律 null */
 async function probeOnce(baseUrl: string, timeoutMs: number, token: string): Promise<any | null> {
-  const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), timeoutMs);
+  const out = await httpCall(baseUrl, token, "/api/status", {}, { timeoutMs });
+  return out.kind === "ok" ? out.data : null;
+}
+
+/**
+ * 一次 HTTP 调用的**分类结果**。
+ *
+ * 本原语只负责「发请求 + 归类」,**不决定抛还是吞** —— 抛/吞/重试策略由各调用方
+ * 按自身语义映射(见 `httpCall` 注释的对照表),避免在每个 fetch 点各写补丁。
+ */
+type HttpOutcome =
+  /** 传输成功且服务端 success=true */
+  | { kind: "ok"; data: any }
+  /** 服务端明确 success=false(业务错误;实例仍存活) */
+  | { kind: "server"; error: string }
+  /** 401/403:令牌不匹配或被拒绝(确定性鉴权失败,不是连接故障) */
+  | { kind: "auth"; status: number }
+  /** fetch 本身抛错或请求超时(端口没人听/进程已死/超时),已标记为 ConnectionError */
+  | { kind: "transport"; error: ConnectionError }
+  /** 拿到了 HTTP 响应但响应体不是 JSON(协议异常,不等于实例死亡) */
+  | { kind: "badjson" };
+
+/**
+ * 单一 HTTP 原语:POST JSON 到 bt-shell 本地 API 并归类结果。**从不抛错**,也不决定
+ * 调用方语义(唯一出口是 `HttpOutcome`)。
+ *
+ * 统一请求头(`Content-Type` + `x-bt-token`)与统一超时(AbortController;`timeoutMs`
+ * 省略则不限,与原实现一致)。归类顺序:fetch 抛错/超时 → transport;401/403 → auth;
+ * 响应体非 JSON → badjson;其余看 `success` 字段。
+ *
+ * 策略分工(调用方各自映射,不在本函数里做):
+ * - `postJson`(工具调用):ok→data、server→抛错、auth→抛鉴权错、transport→抛
+ *   `ConnectionError`(供 callApi 判定实例死亡)、badjson→抛解析错(不判死);
+ * - `probeOnce`(探活):只有 ok 有值,其余 null;
+ * - `registerNotifyUrl`(增强路径):只有 ok 返回 true,其余 false;
+ * - `waitForReady`(就绪轮询):ok 结束,transport/server/badjson 继续等,attach 的 auth 立即报错;
+ * - `closeSession`(关闭):忽略任何结果。
+ */
+async function httpCall(
+  baseUrl: string,
+  token: string,
+  path: string,
+  payload: unknown,
+  opts?: { timeoutMs?: number },
+): Promise<HttpOutcome> {
+  const timeoutMs = opts?.timeoutMs && opts.timeoutMs > 0 ? opts.timeoutMs : 0;
+  const ac = timeoutMs > 0 ? new AbortController() : null;
+  const timer = ac ? setTimeout(() => ac.abort(), timeoutMs) : null;
   try {
-    const res = await fetch(`${baseUrl}/api/status`, {
-      method: "POST",
-      headers: authHeaders(token),
-      body: "{}",
-      signal: ac.signal,
-    });
-    if (!res.ok) return null;
-    const json = await res.json();
-    return json?.success ? json.data : null;
-  } catch {
-    return null;
+    let res: Response;
+    try {
+      res = await fetch(`${baseUrl}${path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-bt-token": token },
+        body: JSON.stringify(payload ?? {}),
+        signal: ac?.signal,
+      });
+    } catch (e) {
+      // 超时与连接失败同归 transport:由抛错点显式标记类型,调用方无需识别运行时文案;
+      // 超时在 cause 里留下标记,便于日志区分「端口没监听」与「服务没响应」。
+      const timedOut = ac?.signal.aborted === true;
+      return {
+        kind: "transport",
+        error: timedOut
+          ? new ConnectionError(`request timed out after ${timeoutMs}ms`, { timeout: true, cause: e })
+          : new ConnectionError((e as Error)?.message || "connection failed", e),
+      };
+    }
+    if (res.status === HTTP_UNAUTHORIZED || res.status === HTTP_FORBIDDEN) {
+      return { kind: "auth", status: res.status };
+    }
+    let json: any;
+    try {
+      json = await res.json();
+    } catch {
+      return { kind: "badjson" };
+    }
+    if (json?.success) return { kind: "ok", data: json.data };
+    return { kind: "server", error: typeof json?.error === "string" ? json.error : "" };
   } finally {
-    clearTimeout(timer);
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * 传输层连接错误:`fetch` **本身**抛错(端口没人听 / shell 进程已死)或请求超时时,
+ * 由 `httpCall` 标记并用 `HttpOutcome.transport` 交给调用方。
+ *
+ * 为什么要显式类型:同一份代码会跑在不同运行时上 —— opencode 默认跑在 **Bun**,Bun 的 fetch
+ * 失败是 `TypeError: Unable to connect. Is the computer able to access the url?`(无 `cause.code`);
+ * Node/undici 是 `TypeError: fetch failed`,真实原因在 `cause.code=ECONNREFUSED`。
+ * 靠猜文案/码跨运行时必漏(1.10.1 真机缺陷),因此传输层失败**由抛错点标记类型**,判断方只认类型。
+ */
+export class ConnectionError extends Error {
+  /** 原始 fetch 异常(保留运行时细节,便于日志取证) */
+  override cause?: unknown;
+
+  /**
+   * @param message 人类可读的连接失败信息(通常取原始异常 message)
+   * @param cause 原始 fetch 异常
+   */
+  constructor(message: string, cause?: unknown) {
+    super(message);
+    this.name = "ConnectionError";
+    if (cause !== undefined) this.cause = cause;
   }
 }
 
 /**
  * 判断是否为**连接层**错误(shell 进程已死/端口没人听 → fetch 直接抛)。
- * 只认这类;HTTP 4xx/5xx 不算(它们不会抛错,而是 res.ok=false → 走 json.success 分支)。
+ * 只认这类;HTTP 4xx/5xx 不算(它们是正常响应,由 `httpCall` 归入 auth/server 分支)。
+ *
+ * 优先级:显式 `ConnectionError`(运行时无关) → Node/undici 的码/文案(兼容旧路径) →
+ * Bun 等运行时的文案兜底(`Unable to connect` / `ConnectionRefused` / `Failed to connect`)。
+ * 导出仅供自验/单测直接构造运行时文案验证。
  */
-function isConnectionError(e: unknown): boolean {
+export function isConnectionError(e: unknown): boolean {
+  // 首选:传输层抛错点已显式标记类型(不依赖任何运行时文案)
+  if (e instanceof ConnectionError) return true;
   if (!(e instanceof Error)) return false;
-  // undici/node 的连接失败:message = "fetch failed",真实原因在 cause.code;部分场景直接带码
+  // 兼容 Node/undici:message = "fetch failed",真实原因在 cause.code;部分场景直接带码。
+  // `ConnectionRefused` 是 Bun 的码名(大小写不固定,故 i 忽略大小写)。
   const code = String((e as any)?.cause?.code || (e as any)?.code || "");
-  if (/ECONNREFUSED|ECONNRESET|EPIPE|ENOTFOUND|EAI_AGAIN|EHOSTUNREACH|ENETUNREACH|UND_ERR|ETIMEDOUT/.test(code)) {
+  if (/ECONNREFUSED|ECONNRESET|EPIPE|ENOTFOUND|EAI_AGAIN|EHOSTUNREACH|ENETUNREACH|UND_ERR|ETIMEDOUT|ConnectionRefused/i.test(code)) {
     return true;
   }
-  // 退化:message 里出现连接类字样(不同 node/undici 版本的文案差异)
-  return /fetch failed|socket hang up|other side closed|connect ECONN|network error/i.test(e.message);
+  // 文案兜底(多运行时):Bun 无 cause.code 只有 "Unable to connect...";Node/undici 各有自己的措辞。
+  // 只在这里做兜底,正常路径以 ConnectionError 类型为准。
+  return /fetch failed|socket hang up|other side closed|connect ECONN|network error|Unable to connect|ConnectionRefused|Failed to connect/i.test(
+    e.message,
+  );
 }
 
 /** 把一个已死实例从注册表摘除并回收残留句柄(只按该实例自己的句柄/PID,绝不按名) */
@@ -732,16 +806,26 @@ async function markInstanceDead(sid: string, inst: ShellInstance): Promise<void>
   if (inst.proc) await terminateOwnProcess(inst.proc);
 }
 
-/** 发一次 POST 并解析 {success,data};连接层错误直接抛(fetch 的 TypeError 等) */
-async function postJson(baseUrl: string, path: string, payload: unknown, token: string): Promise<any> {
-  const res = await fetch(`${baseUrl}${path}`, {
-    method: "POST",
-    headers: authHeaders(token),
-    body: JSON.stringify(payload ?? {}),
-  });
-  const json = await res.json();
-  if (!json.success) throw new Error(json.error || tf("client.service_error"));
-  return json.data;
+/**
+ * 工具调用链路的 POST:把 `httpCall` 的分类**映射为对外语义**(这里是唯一决定抛/吞的地方)。
+ * 映射规则见 `httpCall` 注释;其中 auth 在自建实例上属异常(令牌由插件自己生成),
+ * 报鉴权错误而**不**报连接错误。
+ */
+async function postJson(inst: ShellInstance, path: string, payload: unknown): Promise<any> {
+  const out = await httpCall(inst.baseUrl, inst.token, path, payload);
+  switch (out.kind) {
+    case "ok":
+      return out.data;
+    case "server":
+      // 服务端错误文本可能夹带底层路径(如 WebView2/fs 细节):回模型前统一脱敏
+      throw new Error(sanitizeForModel(out.error || tf("client.service_error")));
+    case "auth":
+      throw new Error(tf(inst.attach ? "client.attach_bad_token" : "client.auth_rejected"));
+    case "transport":
+      throw out.error;
+    case "badjson":
+      throw new Error(tf("client.bad_response"));
+  }
 }
 
 /**
@@ -759,7 +843,7 @@ async function callApi(path: string, body?: any, sessionId?: string): Promise<an
   const inst = await ensureInstance(sid);
   const payload = { ...(body || {}), _sessionId: sid };
   try {
-    return await postJson(inst.baseUrl, path, payload, inst.token);
+    return await postJson(inst, path, payload);
   } catch (e) {
     if (!isConnectionError(e)) throw e;
     if (inst.attach) {
