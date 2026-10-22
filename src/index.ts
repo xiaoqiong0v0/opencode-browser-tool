@@ -11,7 +11,7 @@ import en from "./i18n/en.js";
 import zh from "./i18n/zh.js";
 import {
   configureService, setAppDirectory, setServiceReadyHandler, setSessionIdResolver, setTitleResolver,
-  resolveSessionId, openWindow, isRunning, closeSession, closeAllSessions, clearClosedState, service, probeStatus,
+  resolveSessionId, openWindow, isRunning, isStarting, closeSession, closeAllSessions, clearClosedState, service, probeStatus,
 } from "./client.js";
 import { startNotifyServer } from "./notify-server.js";
 import { startDownload, getBinaryStatus, describeBinaryStatus } from "./binary.js";
@@ -148,7 +148,13 @@ const COMMANDS: Record<string, CmdDef> = {
   devtools: { usage: "[--action]", descKey: "cli.cmd.devtools", args: [{ flag: "action" }], run: async (a) => { const r = await service.devtools({ action: a.action || "toggle" }); return r.open ? _t("cli.out.devtools_open") : _t("cli.out.devtools_closed"); } },
   reload: { usage: "", descKey: "cli.cmd.reload", run: async (a) => { const r = await service.reload(sidArgs(a)); return r?.url ? _t("cli.out.reload", { url: r.url }) : _t("cli.out.reload_nourl"); } },
   open_window: { usage: "", descKey: "cli.cmd.open_window", run: async (a) => { await openWindow(sidOf(a)); return _t("cli.out.open_window"); } },
-  close: { usage: "", descKey: "cli.cmd.close", run: async (a) => { const sid = sidOf(a); if (!isRunning(sid)) return _t("cli.out.close_already"); await closeSession(sid); return _t("cli.out.close_done"); } },
+  close: { usage: "", descKey: "cli.cmd.close", run: async (a) => {
+    const sid = sidOf(a);
+    // 运行中或**启动中**都算「有实例可关」:启动中的实例由 closeSession 置 closedSids,启动链随后自毁
+    if (!isRunning(sid) && !isStarting(sid)) return _t("cli.out.close_already");
+    await closeSession(sid);
+    return _t("cli.out.close_done");
+  } },
   show_notification: { usage: "--message [--type]", descKey: "cli.cmd.show_notification", args: [{ flag: "message" }, { flag: "type" }], run: async (a) => { await service.notify(a); return _t("cli.out.notify_shown"); } },
   scroll: { usage: "[--direction --amount]", descKey: "cli.cmd.scroll", args: [{ flag: "direction" }, { flag: "amount" }], run: async (a) => { const r = await service.scroll(a); return _t("cli.out.scroll", { dir: a.direction || "down", n: a.amount || 300 }) + stableNote(r); } },
   wait_for_selector: { usage: "--selector [--timeout ms]", descKey: "cli.cmd.wait_for_selector", args: [{ flag: "selector" }, { flag: "timeout" }], run: async (a) => { const tn = timeoutNote(a); await service.waitForSelector(a); return _t("cli.out.wait_appeared") + tn; } },
@@ -282,9 +288,7 @@ function splitCsvLine(line: string): string[] {
   return out;
 }
 
-export const opencodeBrowserTool: Plugin = async ({ client, worktree, directory, serverUrl }) => {
-  // 插件上下文(仅用于诊断:定位 session.list() 为空时是哪个实例/目录)
-  pluginCtx = { directory: directory || "", worktree: worktree || "", serverUrl: serverUrl ? String(serverUrl) : "" };
+export const opencodeBrowserTool: Plugin = async ({ client, worktree, directory }) => {
   // 供 resolveShellBinary 定位本地 Rust 构建(publish-local 到缓存目录后仍能找到仓库)
   setAppDirectory(directory || "");
   registerLocale("en", en);
@@ -326,7 +330,7 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree, directory,
         if (event.type === "session.deleted") {
           // 删除会话(1.9.0 语义升级):清钩子缓存 + **回收该会话自己的浏览器实例**。
           // 仍是「绝不因删除而 spawn」:closeSession 只在注册表里有该 sid 时才动进程,
-          // 没有实例就直接返回(不会再走 callApi → ensureService 那条会弹窗的老路)。
+          // 没有实例就直接返回(不会再走 callApi → ensureInstance 那条会弹窗的老路)。
           const delId = extractSessionIDFromEvent(event);
           if (delId) {
             sessionCache.clearIf(delId);
@@ -455,19 +459,15 @@ function filterDisabled(tools: Record<string, any>, disabled?: string[]): Record
   return result;
 }
 
-/** 轮询批注发送队列:面板"发送全部"/截图"发送"后,拉取记录推送当前对话
- * 注意:插件函数会随会话/切目录多次执行,轮询器必须进程级单例,
- * 否则同一进程会累积多个 interval 空转(server 与 TUI 进程各一份,互不共享)
+/** 事件驱动投递:shell 面板"发送全部"/截图"发送"后 POST 插件本地 /notify/<sid> 触发 drain
+ * 注意:插件函数会随会话/切目录多次执行,notify server 与 drain 状态必须进程级单例,
+ * 否则同一进程会累积多个监听/重复投递(server 与 TUI 进程各一份,互不共享)
  */
 let annotateClient: any = null;
 /** drain 进行中(按 sid 隔离:会话 A 的 drain 不会挡住会话 B 的投递) */
 const drainingSid = new Set<string>();
 /** 最近一次见到的会话 id 缓存(来自 event/chat.message/tool.execute.before 钩子) */
 const sessionCache = createSessionIDCache();
-/** 已记录过的 sid(避免重复刷屏) */
-let lastLoggedSessionID = "";
-/** 插件上下文(诊断用) */
-let pluginCtx: { directory: string; worktree: string; serverUrl: string } = { directory: "", worktree: "", serverUrl: "" };
 
 /** 把截图 base64 落盘为临时 PNG,返回路径(失败返回 null);用于发送时保留图片与给出可读路径
  * 1.9.0:落盘到**该会话**的临时目录 sessions/<profile>/<sid>/tmp(不再与其它会话共享全局 tmp) */

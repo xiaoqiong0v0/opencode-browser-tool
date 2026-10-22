@@ -5,6 +5,7 @@
 // 1.9.0 会话隔离:每个 shell 实例注册自己的 `/notify/<sid>`,通知按 URL 里的 sid 路由到
 // 对应会话的 drain —— 彻底取代旧的「最后活跃会话」(last-writer-wins)投递。
 import { createServer, type Server } from "node:http";
+import { log } from "./logger.js";
 
 let server: Server | null = null;
 let port = 0;
@@ -24,7 +25,17 @@ export async function startNotifyServer(handler: (sid: string) => void): Promise
         return;
       }
       // 从路径提取 sid:/notify/<sid>;裸 /notify(旧格式)→ sid = ""
-      const sid = url.startsWith("/notify/") ? decodeURIComponent(url.slice("/notify/".length)) : "";
+      // 非法百分号编码不能让异常冒到 request listener 外(会打崩进程),按无 sid 处理
+      let sid = "";
+      if (url.startsWith("/notify/")) {
+        try {
+          sid = decodeURIComponent(url.slice("/notify/".length));
+        } catch {
+          sid = "";
+          // 公共 logger 无 warn()(只有 info/error),降级用 info 并显式标注 [warn]
+          log.info(`[notify][warn] malformed sid in url (undecodable), treated as empty: ${url.slice(0, 120)}`);
+        }
+      }
       // 只读取/丢弃最小 payload,避免大内容经此通道
       let bytes = 0;
       req.on("data", (c: Buffer) => {
@@ -51,11 +62,6 @@ export async function startNotifyServer(handler: (sid: string) => void): Promise
       resolvePort(port);
     });
   });
-}
-
-/** 未带 sid 的基础通知地址(仅兼容旧用法;新代码请用 getNotifyUrlForSession) */
-export function getNotifyUrl(): string | null {
-  return server && port ? `http://127.0.0.1:${port}/notify` : null;
 }
 
 /** 某会话的通知地址:每个 shell 实例注册各自这条 → 通知可按 sid 归属 */

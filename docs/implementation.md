@@ -21,13 +21,13 @@
 - [x] 可信输入全链路：Windows CDP（`Input.dispatchKeyEvent`/`dispatchMouseEvent`/`DOM.setFileInputFiles`/鼠标序列拖拽）、Linux GDK `gdk_event_put`；统一降级策略（可信优先，无通道则 DOM/JS 兜底并在返回标注 `degraded`，原本不可用者明确报错）
 - [x] 时序/就绪：`navigate`/`go_back`/`go_forward` 等"确实发生导航（URL 或 `performance.timeOrigin` 变化）且新文档就绪"，`scroll` 等位置稳定，均**有界超时并如实报告**；`scroll_to_element` 支持内层滚动容器
 - [x] 二进制分发：插件启动后台从 GitHub Release 下载到固定路径并校验/原子替换/并发锁；版本策略（二进制只挂 `x.Y.0`、插件自动推导 tag）
-- [x] 纯查询命令不懒启动：`get_browser_status` 走 `probeStatus()`（短超时 HTTP 探测，**不 spawn**）；未运行时返回未运行 + bt-shell 二进制状态
+- [x] 纯查询命令不懒启动：`get_browser_status` 走 `probeStatus()`（`client.ts:564`，短超时 HTTP 探测，**不 spawn**）；未运行时返回未运行 + bt-shell 二进制状态
 - [x] 发送（批注/截图）修复（以旧 `opencode-playwright-tool` 为参考）：面板"发送"**只发文本**（与参考一致；`session.prompt` 的 parts 不支持图片 —— `image/*` 走 `image.normalize` 返回 400，参考实现从不这么发）；截图图片走**工具结果附件**交付：`attachments:[{type:"file", mime:"image/png", url:"data:image/png;base64,…"}]`（关键：opencode 只接受 `url` 以 `data:` 开头且含 `,` 的附件，旧形状 `url:""+data` 会被静默丢弃；见 `message-v2.ts:170-187`，该路径**绕过** `image.normalize`）；发送时截图另落盘并在文本里给出路径；显式检查 SDK 返回的 `{error}`（不抛异常）并 log+notify；轮询器出错不再 `clearInterval`；发送后**面板列表清空**（仅面板列表为空、不再显示已发送项——与参考实现 `clearRecords()` 语义一致；Rust 侧 `panel_records`/`records-changed` 均按 `!sent` 过滤），**记录本身保留并标记 `sent`**（Rust `records` 不清空；`list_records`/`read_record_content` 走 `/api/annotate/records` 仍能读到全部，含截图）
 
 - [x] 投递前 session id 可靠来源：真实 GUI 取证 `client.session.list()` 返回 `sessions=0` 导致无法投递；改为**优先用插件钩子缓存的 sid**（`Event.properties.sessionID`、`session.created/updated/deleted` 的 `properties.info.id`、`chat.message`/`tool.execute.before`/`shell.env` 入参 `sessionID`、工具 `context.sessionID`），`list()` 仅兜底并打印原始包络；仍拿不到则 log+notify 不静默
-- [x] 日志规范（插件侧）：统一用公共包 `@xiaoqiong0v0/opencode-plugin-logger`，项目内 `src/logger.ts` 导出共用实例 `log`；**禁止用 `console.*` 往 stdout/stderr 打**（会污染 opencode TUI），`src/**` 的 `console.*` 仅允许出现在独立 CLI 的 `isMain` 守卫内（`src/binary.ts`）；Rust 的 `println!`/`eprintln!` 默认被 spawn 管道吞掉，必须由插件把子进程 stdout/stderr 转发进 logger 才可见（`src/client.ts` startService）
+- [x] 日志规范（插件侧）：统一用公共包 `@xiaoqiong0v0/opencode-plugin-logger`，项目内 `src/logger.ts` 导出共用实例 `log`；**禁止用 `console.*` 往 stdout/stderr 打**（会污染 opencode TUI），`src/**` 的 `console.*` 仅允许出现在独立 CLI 的 `isMain` 守卫内（`src/binary.ts`）；Rust 的 `println!`/`eprintln!` 默认被 spawn 管道吞掉，必须由插件把子进程 stdout/stderr 转发进 logger 才可见（`src/client.ts` 的 `attachStdio`，client.ts:262-271）
 
-- [x] 面板发送改为**推送式投递**（对齐参考 `opencode-playwright-tool` 的 bridge 机制）：插件本地监听 `127.0.0.1:<随机端口>/notify`（仅接收最小 `{count}`，大内容仍走 drain）；shell `send_all_records` 标记 sent 后 **fire-and-forget** POST 一次（2s 超时、最多重试 2 次；失败 `eprintln!` 经插件转发可见）；地址传递：spawn 传 `--notify-url` / 环境变量 `BT_SHELL_NOTIFY_URL` / 附着模式用 `/api/notify-url` 注册。原 `startAnnotatePoller`（`setInterval` 2s）**已删除**，改为事件驱动 `drainAnnotate`：通知即 drain + 服务就绪/插件启动各 drain 一次（覆盖窗口，幂等）；拿不到 sid 时仍 log+notify
+- [x] 面板发送改为**推送式投递**（对齐参考 `opencode-playwright-tool` 的 bridge 机制）：插件本地监听 `127.0.0.1:<随机端口>/notify`（仅接收最小 `{count}`，大内容仍走 drain）；shell `send_all_records` 标记 sent 后 **fire-and-forget** POST 一次（2s 超时、最多尝试 2 次，间隔 200ms，`ui/mod.rs:1368-1399`；失败 `eprintln!` 经插件转发可见）；地址传递：spawn 传 `--notify-url` / 环境变量 `BT_SHELL_NOTIFY_URL` / 附着模式同样通过 `/api/notify-url` 注册到插件通知服务（1.9.1 起；共享 shell 的批注队列为全局，由接收 sid 执行 drain）。原 `startAnnotatePoller`（`setInterval` 2s）**已删除**，改为事件驱动 `drainAnnotate`（`index.ts:506`）：通知即 drain + 服务就绪/插件启动各 drain 一次（覆盖窗口，幂等）；拿不到 sid 时仍 log+notify
 - [x] Linux 布局尺寸口径修复（v1.5.0，动 Rust）：`apply_layout` 在 Linux 正常路径改用顶层 GtkWindow `allocation()` 的 **GTK 逻辑尺寸**（新增 `rust/src/ui/linux_layout.rs::logical_window_size`）并以 `layout_scale = 1.0` 计算，取不到时回退 `size`+`scale` 物理口径；修复 GNOME 分数缩放/HiDPI 下子视图按物理值放大、内容区超出窗口（坐标口径=GTK 逻辑像素，见 `linux-support.md` §2）
 
 - [x] 地址栏/标题/图标改**事件驱动**（删除 `main.rs` 的 `poll_tab_title` 1 秒轮询）：导航级 `on_navigation`（请求即更新地址栏）+ `on_page_load`（完成后异步读真实 `location.href`/`title`）；站内 SPA（包装 `pushState`/`replaceState`、`popstate`/`hashchange`）与标题/图标变化由注入脚本经 **HTTP `POST /api/page-event`** 上报。守卫：`is_internal_url`/`is_error_url` 不覆盖 `TabState.url`，错误页置 `errored`。刷新语义：错误页 → 重新导航原 URL（`/api/reload` 与工具栏共用 `ui::reload_active_tab`），否则原生 reload；工具栏导航不再静默（未就绪写日志）
@@ -62,42 +62,44 @@
 ### 实例注册表
 
 - **数据结构**:`Map<sid, ShellInstance>`(`src/client.ts:108`);`ShellInstance`(`client.ts:89`)持有 `sid / proc / baseUrl / port / dataDir / title / ready / attach`。启动中的会话另存 `Map<sid, Promise>` 做并发保护(`client.ts:110`),同一 sid 多个工具同时调用只 spawn 一次。
-- **sid 来源**(`resolveSessionId`,`client.ts:157`):工具调用的显式 `_sessionId` → 请求体 `_sessionId` → 钩子缓存兜底(`setSessionIdResolver`,`client.ts:139`;`index.ts:306` 指向 `sessionCache.get()`)→ `"default"` 桶。`index.ts` 的 `sidOf`/`sidArgs`(`index.ts:26,31`)把每条命令的 sid 塞进请求体。
-- **路由**:`callApi`(`client.ts:527`)按 sid `ensureInstance` 后打到该实例的 `baseUrl`;**旧的模块级单例(`serviceProcess/serviceReady/serviceBaseUrl`)已删除**。
+- **sid 来源**(`resolveSessionId`,`client.ts:167`):工具调用的显式 `_sessionId` → 请求体 `_sessionId` → 钩子缓存兜底(`setSessionIdResolver`,`client.ts:149`;`index.ts:310` 指向 `sessionCache.get()`)→ `"default"` 桶。`index.ts` 的 `sidOf`/`sidArgs`(`index.ts:26,31`)把每条命令的 sid 塞进请求体。
+- **路由**:`callApi`(`client.ts:655`)按 sid 走 `ensureInstance`(`client.ts:363`) 后打到该实例的 `baseUrl`;**旧的模块级单例(`serviceProcess/serviceReady/serviceBaseUrl`)已删除**。
 
 ### 数据目录
 
 - 每会话独立 WebView2 profile:`getSessionDataDir(sid)` = `<cacheDir>/sessions/<profile>/<sid>`(`config/index.ts:75`)→ 传给该实例的 `--user-data-dir`,cookie/localStorage/缓存全隔离。实测目录内出现 `EBWebView` 即 WebView2 真实在用。
-- 会话临时产物(截图落盘)走 `getSessionTmpDir(sid)` = `<...>/<sid>/tmp`(`config/index.ts:80`,`index.ts:475`),不再共享全局 `tmp/`。
+- 会话临时产物(截图落盘)走 `getSessionTmpDir(sid)` = `<...>/<sid>/tmp`(`config/index.ts:80`,`index.ts:476`),不再共享全局 `tmp/`。
 - **路径取舍**:需求字面为 `sessions/<sid>`;实现多一层 `<profile>` 是为了保住 `profile --set` 的语义(见下)。要严格字面路径,去掉 `getSessionsDir` 里的 profile 段即可。
 
 ### 生命周期
 
-- **懒启动**:`ensureInstance(sid)`(`client.ts:365`)在首次工具调用时 spawn;**端口重试**(`client.ts:309-343`,上限 `PORT_START_ATTEMPTS=5`,`client.ts:24`):启动超时(常见于端口被占 → bind 失败)则只杀掉**本次刚 spawn 的**子进程、换随机端口重来,5 次全失败才报错。实测占住 18000-18200 共 201 端口后仍成功落在 18766。
-- **关闭**:`closeSession(sid)`(`client.ts:432`)= `/api/close` 优雅 → `terminateOwnProcess`(`client.ts:255`)等退出(有界 5s)→ 超时才 SIGTERM。**只按注册表里的句柄/PID,绝不按名杀**;实例不存在直接返回(**绝不因 close 而 spawn**)。
-- **会话删除**:`session.deleted` 事件 → 清钩子缓存 + `closeSession(delId)`(`index.ts:326-334`)。语义升级为「回收该会话的浏览器」,但仍是「没有实例就不动进程」。
-- **插件卸载**:`dispose` 钩子 → `closeAllSessions()`(`client.ts:460`,`index.ts:420`)。
+- **懒启动**:`ensureInstance(sid)`(`client.ts:363`)在首次工具调用时 spawn;**端口重试**(`client.ts:296-336`,上限 `PORT_START_ATTEMPTS=5`,`client.ts:24`):启动超时(常见于端口被占 → bind 失败)则只杀掉**本次刚 spawn 的**子进程、换随机端口重来,5 次全失败才报错。实测占住 18000-18200 共 201 端口后仍成功落在 18766。
+- **关闭**:`closeSession(sid)`(`client.ts:482`)= `/api/close` 优雅 → `terminateOwnProcess`(`client.ts:247`)等退出(有界 5s)→ 超时才 SIGTERM。**只按注册表里的句柄/PID,绝不按名杀**;实例不存在直接返回(**绝不因 close 而 spawn**)。
+- **关闭后不自动重开(1.9.1)**:`closeSession` 同时置 `closedSids`(`client.ts:485`);`ensureInstance` 对已关会话直接抛 `client.browser_closed` 指引(`client.ts:367-370`);手动关窗/进程被杀这类连接层错误由 `callApi` 捕获 → `markInstanceDead`(`client.ts:624`)+置关闭态(`client.ts:670-673`),**绝不 respawn**。唯一打开入口 `openWindow`(`client.ts:539`,先探测死实例、再以 `allowClosed` 重开,`client.ts:556`);`bt_close` 对启动中的实例也生效(`isStarting`,`client.ts:527`)。
+- **会话删除**:`session.deleted` 事件 → 清钩子缓存 + `closeSession(delId)`(`index.ts:330-338`)。语义升级为「回收该会话的浏览器」,但仍是「没有实例就不动进程」。
+- **插件卸载**:`dispose` 钩子 → `closeAllSessions()`(`client.ts:516`,`index.ts:425`)。
 - **未做**(可选后续):idle TTL 回收(会话长时间无操作后自动关浏览器)。
 
 ### 投递归属
 
-- 每个 shell 实例注册**自己**的 `--notify-url` = `<插件监听端口>/notify/<sid>`(`notify-server.ts:62`,`client.ts:316`)。
-- 通知到达 → `notify-server` 从 URL 提取 sid(`notify-server.ts:27`)→ 只 drain **该会话**(`index.ts:497` → `drainAnnotate(sid)`,`index.ts:505`)。彻底取代旧的「最后活跃会话」(last-writer-wins)。
-- 实例就绪回调同样带 sid(`setServiceReadyHandler`,`client.ts:149`;`index.ts:493`)。
+- 每个 shell 实例注册**自己**的 `--notify-url` = `<插件监听端口>/notify/<sid>`(`notify-server.ts:68`;spawn 时传参 `client.ts:308`,就绪后再 `registerNotifyUrl`(`client.ts:439`) 兜底注册)。
+- 附着模式共享一个外部 shell(队列全局):每个 sid 首次连接都按 `baseUrl+sid` 去重注册 notify(`ensureAttachNotify`,`client.ts:461`),避免重复 POST。
+- 通知到达 → `notify-server` 从 URL 提取 sid(`notify-server.ts:29-38`)→ 只 drain **该会话**(`index.ts:498` → `drainAnnotate(sid)`,`index.ts:506`)。彻底取代旧的「最后活跃会话」(last-writer-wins)。
+- 实例就绪回调同样带 sid(`setServiceReadyHandler`,`client.ts:159`;`index.ts:493`)。
 
 ### 窗口标题
 
 - spawn 时传 `--title "bt-shell · <会话标识>"`;Rust `main.rs:53` 解析、`ui/mod.rs:738` 应用(`title.unwrap_or("bt-shell")`),任务栏可分辨多实例。
-- 标识优先用会话标题(`setTitleResolver`,`client.ts:144`;`index.ts:308` 经 `client.session.get`,**250ms 有界超时**,拿不到回退 sid 后 6 位),不阻塞启动。
+- 标识优先用会话标题(`setTitleResolver`,`client.ts:154`;`index.ts:312` 经 `client.session.get`;**250ms 有界超时**由 `client.ts:191-204` 的 `Promise.race` 实现,上限常量 `client.ts:26`),拿不到回退 sid 后 6 位,不阻塞启动。
 - `/api/title`(`service.rs:157,234`)返回主窗口标题,供自验/诊断。
 
 ### 附着模式边界
 
-- `BT_SHELL_URL`/`BT_SHELL_PORT` 存在时(`client.ts` `resolveAttachBaseUrl`)→ 连接外部单例,**所有 sid 共用、不 spawn、不 kill、放弃会话隔离**(`attachInstance`,`client.ts:112`)。假地址时明确报错且列表为空(自验已测)。
+- `BT_SHELL_URL`/`BT_SHELL_PORT` 存在时(`client.ts` `resolveAttachBaseUrl`)→ 连接外部单例,**所有 sid 共用、不 spawn、不 kill、放弃会话隔离**(`attachInstance`,`client.ts:114`)。假地址时明确报错且列表为空(自验已测)。
 
 ### 死参数清理
 
-- 插件不再透传 `--browser` / `--session-isolation`(Rust `main.rs` 本就不解析);`PluginConfig` 移除 `browserType`/`sessionIsolation`(`config/index.ts:10`)。旧配置文件里若仍写着这两项,`applyConfigFile` 自然忽略(`config/index.ts:146`)。
+- **已删除（1.9.0）**：`--browser` / `--session-isolation` 参数不再存在（Rust `main.rs` 本就不解析）；`PluginConfig` 移除 `browserType`/`sessionIsolation`(`config/index.ts:10`)。旧配置文件里若仍写着这两项,`applyConfigFile` 自然忽略(`config/index.ts:146`)。**会话隔离已改为默认行为，不可再配置。**
 - **每会话独立实例现在是唯一行为**,不存在「开关」。
 
 ### profile 作用域变更

@@ -1,8 +1,8 @@
 import { getConfig, type Lang } from "../config/index.js";
-import type { LocaleStrings, PanelStrings } from "./types.js";
+import type { LocaleStrings } from "./types.js";
 import en from "./en.js";
 
-export type { LocaleStrings, PanelStrings } from "./types.js";
+export type { LocaleStrings } from "./types.js";
 export type { ToolStrings } from "./types.js";
 export type { Lang } from "../config/index.js";
 
@@ -33,19 +33,4 @@ export function tf(key: string, vars?: Record<string, string | number>, lang?: L
     for (const [k, v] of Object.entries(vars)) s = s.split(`{${k}}`).join(String(v));
   }
   return s;
-}
-
-/** 获取面板 UI 翻译 */
-export function panelT(key: string, lang?: Lang): string {
-  ensureFallback();
-  const l = lang || getConfig().panelLang;
-  const str = _strings[l] || _strings.en;
-  return str?.panel[key] || _strings.en?.panel[key] || key;
-}
-
-/** 获取面板完整翻译对象（供注入） */
-export function getPanelStrings(lang?: Lang): PanelStrings {
-  const l = lang || getConfig().panelLang;
-  const str = _strings[l] || _strings.en;
-  return str?.panel || ({} as PanelStrings);
 }

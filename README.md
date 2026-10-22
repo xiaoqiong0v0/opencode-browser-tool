@@ -65,7 +65,7 @@ sha256 校验（**幂等**：sha 与当前 release 期望值一致即跳过；**
 - `BT_SHELL_VERSION` — 显式指定**二进制发布版本**（形如 `1.2.0`，即 `x.Y.0` 的 Release；**原样使用、不做归 0 推导**；不设时由插件版本自动推导）
 - `BT_SHELL_NOTIFY_URL` — 插件通知地址（**推送式投递**；一般由插件自动通过 `--notify-url` / `/api/notify-url` 设置，仅在手动启动 shell 时需自行指定）
 
-> **附着模式 vs 启动模式**：设置了 `BT_SHELL_URL`（优先）或 `BT_SHELL_PORT` 时进入附着模式——插件**不 spawn** 任何进程，直接连接该地址的外部 shell；两者都未设置时按启动模式 spawn 本地二进制（`BT_SHELL_PATH` 可覆盖查找路径）。附着模式下 `bt_close` 只关闭浏览器窗口并断开连接，**不会**结束外部 shell 进程（进程不归插件管理）。
+> **附着模式 vs 启动模式**：设置了 `BT_SHELL_URL`（优先）或 `BT_SHELL_PORT` 时进入附着模式——插件**不 spawn** 任何进程，直接连接该地址的外部 shell；两者都未设置时按启动模式 spawn 本地二进制（`BT_SHELL_PATH` 可覆盖查找路径）。附着模式下 `bt_close` 只断开本地连接（**不关闭外部窗口、不结束外部进程**；进程不归插件管理）。
 
 **WSL / Linux 附着示例**（shell 跑在 WSL，插件跑在 Windows 宿主）：
 
@@ -103,7 +103,7 @@ opencode（Bun）
 - 真多标签：每标签独立 page Webview，切换不重载；`target=_blank` / `window.open` 链接通过 WebView2 原生事件拦截并打开为新标签
 - 地址栏/标题/图标**事件驱动同步（无轮询）**：导航用 `on_navigation`（请求即更新）+ `on_page_load`（完成后读真实 `location.href`/`title`）；站内 SPA（`pushState`/`replaceState`/`popstate`/`hashchange`）与标题/图标变化由注入脚本上报 `POST /api/page-event`。`TabState.url` 只反映**最后一次真实导航请求**，内部/错误 scheme（`chrome-error:`/`about:`/`tauri:`/`data:` 等）不覆盖地址栏
 - 刷新语义：标签处于错误页（`errored`）时，工具栏刷新 / `bt_reload` **重新导航原 URL**（而非刷错误页）；否则走原生 reload
-- 窗口无标题栏，自定义窗口按钮在标签行右侧；最小尺寸 500×400（逻辑像素）
+- 窗口无标题栏，自定义窗口按钮在标签行右侧；最小尺寸 360×432（逻辑像素；内容区最小 360×360，含 72px 工具栏）
 
 ## 工具
 
@@ -120,7 +120,7 @@ opencode（Bun）
 
 ### 工具参数
 
-> **`--timeout ms`（可选，1.9.0 起）** —— 阻塞型命令（如 `bt_click` / `bt_fill` / `bt_evaluate` / `bt_screenshot` / `bt_wait_for_selector` 等）均支持按次传 `--timeout`，钳制到 `[100, 60000]` 毫秒；未传走服务端默认（15s），传小值可让慢操作**快失败**（如 `--timeout 800` 让卡住的 `evaluate` 在约 0.8s 返回 `eval timeout`），被钳制时输出会如实标注。
+> **`--timeout ms`（可选，1.9.0 起）** —— 共 **17 条命令声明**带 `timeout` 参数（`src/index.ts:104-186`；其中 `bt_wait_for_selector` 原本就有该参数，其余 16 条为 1.9.0 起新增），均支持按次传 `--timeout`，钳制到 `[100, 60000]` 毫秒（`rust/src/service.rs:96-97,104-115`）；未传走服务端默认（15s），传小值可让慢操作**快失败**（如 `--timeout 800` 让卡住的 `evaluate` 在约 0.8s 返回 `eval timeout`），被钳制时输出会如实标注。
 
 | 工具 | 参数（类型） | 说明 |
 |------|------|------|
@@ -141,10 +141,10 @@ opencode（Bun）
 | `bt_go_back` | 无 | 浏览器后退，返回当前 URL |
 | `bt_go_forward` | 无 | 浏览器前进，返回当前 URL |
 | `bt_resize` | `width`, `height`(number) 必填 | 调整**页面内容区（视口）**尺寸（非 OS 窗口；下限 360×360，低于下限被钳制并在返回标 `clamped`） |
-| `bt_set_device` | `name`(string) 可选 | 应用设备预设（空参数列出 13 种预设；**预设尺寸为内容区（视口）尺寸**） |
+| `bt_set_device` | `name`(string) 可选 | 应用设备预设（空参数列出 14 种预设；**预设尺寸为内容区（视口）尺寸**） |
 | `bt_devtools` | `action`(string)：`toggle`/`open`/`close` | 开关开发者工具 |
 | `bt_reload` | 无 | 刷新当前页面；若当前为错误页则**重新导航原 URL**（返回 `retried`） |
-| `bt_close` | 无 | 退出浏览器外壳 |
+| `bt_close` | 无 | 关闭浏览器外壳（`bt_close` 与手动关窗同一语义）。关闭后后续工具调用返回指引（`browser closed … call open_window`），**绝不自动重开**，需 `bt_open_window` 显式打开；attach 模式下只断开本地关联（不关闭外部窗口/进程） |
 | `bt_show_notification` | `message`(string), `type`(string)：`ok`/`bad`/`err` | 显示页面通知气泡 |
 | `bt_scroll` | `direction`(string)：`up`/`down`/`left`/`right`, `amount`(number) | 滚动页面 |
 | `bt_wait_for_selector` | `selector`, `timeout`(number, ms) | 等待元素出现 |
@@ -186,7 +186,7 @@ opencode（Bun）
 
 **坐标系（实测，v1.7.0）**：CDP `clip` **恒为文档坐标**（`captureBeyondViewport` true/false 均如此）——传视口坐标会在滚动后的页面截到错误区域（旧版元素截图在滚动页面上即踩此坑）；截图层内部统一做 视口坐标 + `scrollX/Y` 换算，调用方一律传视口坐标。
 
-错误口径不变：`element not found: <sel>` / `element has zero size: <sel>`。输出图片尺寸 = 元素 rect × devicePixelRatio。
+错误口径不变：`element not found: <sel>` / `element has zero size: <sel>`。**输出图片尺寸**：元素/区域截图（Windows CDP `clip` 固定 `scale:1`，`rust/src/control/screenshot.rs:148`；Linux cairo 裁剪不缩放，`rust/src/control/screenshot.rs:277`）为**选区 CSS 像素 1:1**（插件不额外乘 DPR；Linux 实现按「CSS 像素 = 设备像素」的 1:1 假设，WSLg dpr=1 实测）；无 `selector` 的整视口截图**不带 `clip`/`scale`**（`rust/src/control/screenshot.rs:150`），由平台默认整屏捕获、插件不做缩放（具体像素尺寸取决于 WebView2/CDP 默认；Linux `Visible` 快照按上述 1:1 假设输出）。
 
 **已知限制**
 
@@ -201,14 +201,14 @@ opencode（Bun）
 - **内容区下限 360×360**：`bt_resize` 低于下限会被钳制，返回 `clamped:true`（工具输出也标注）；窗口 `min_inner_size` 同步为 360×432（= 360 内容高 + 72 工具栏）
 - **窄模式（窗口逻辑宽 < 480）**：面板改为**填满整个窗口**（覆盖式，x=0；页面 webview 保持全宽在下层，关闭面板即见完整页面）；工具栏的批注/截图/面板三按钮**去文字只留图标**（媒体查询 `@media (max-width: 479px)`，与 Rust `ui::NARROW_MODE_MAX_W=480` 同步维护）。手机类预设（360~412 宽）天然落入窄模式，避免按钮溢出
 
-内置 13 种设备预设（**内容区尺寸** + User-Agent），可通过 `bt_set_device` 或右侧面板下拉框一键切换：
+内置 14 种设备预设（**内容区尺寸** + User-Agent），可通过 `bt_set_device` 或右侧面板下拉框一键切换：
 
-| 分类 | 预设 |
+| 分类 | 预设（内容区尺寸） |
 |------|------|
-| 桌面 | `desktop-1080p`, `desktop-1440p` |
-| iPad | `ipad-pro-11`, `ipad-10`, `ipad-mini-6` |
-| iPhone | `iphone-15-pro`, `iphone-14`, `iphone-13`, `iphone-12`, `iphone-se` |
-| Android | `pixel-7`, `pixel-6`, `galaxy-s23` |
+| 桌面 | `desktop-720p`（1024×720）, `desktop-1080p`（1920×1080）, `desktop-900p`（1440×900） |
+| iPad | `ipad-pro-11`（834×1194）, `ipad-10`（820×1180）, `ipad-mini-6`（744×1133） |
+| iPhone | `iphone-15-pro`（393×852）, `iphone-14`（390×844）, `iphone-13`（390×844）, `iphone-12`（390×844）, `iphone-se`（375×667） |
+| Android | `pixel-7`（412×915）, `pixel-6`（411×914）, `galaxy-s23`（360×780） |
 
 切换时自动调整窗口尺寸并运行时修改 UA（UA 修改 Windows/Linux 支持；macOS 未实现）。
 
@@ -226,7 +226,7 @@ opencode（Bun）
 
 ## 多会话
 
-自 1.9.0 起**每个 opencode 会话独享一个浏览器窗口**：独立进程 / 独立端口 / 独立用户数据目录（`sessions/<profile>/<sid>`），窗口、标签、UA、批注与 cookie/存储全部互不共享（原 `sessionIsolation` 开关已移除，隔离是唯一行为）。例外：附着模式（`BT_SHELL_URL` / `BT_SHELL_PORT`）连接外部单例 shell，放弃会话隔离。
+自 1.9.0 起**每个 opencode 会话独享一个浏览器窗口**：独立进程 / 独立端口 / 独立用户数据目录（`sessions/<profile>/<sid>`），窗口、标签、UA、批注与 cookie/存储全部互不共享（`sessionIsolation` / `browserType` 配置项及 `--session-isolation` / `--browser` 参数自 1.9.0 已删除，会话隔离是唯一行为；旧配置文件里的这两项会被忽略）。例外：附着模式（`BT_SHELL_URL` / `BT_SHELL_PORT`）连接外部单例 shell，放弃会话隔离。
 
 ## 发布
 
@@ -254,9 +254,15 @@ npm publish
 
 ```bash
 npm install
+# 1) 前端产物（frontend/dist；tauri.conf.json 的 build.frontendDist 指向它，Rust 编译期嵌入）
+npm run build:frontend        # 等价：cd frontend && npm install && npm run build
+# 2) Rust 外壳（开发构建；发布用 cargo build --release）
 cd rust && cargo build
-npm run build
+# 3) 插件 TS → dist/
+cd .. && npm run build
 ```
+
+> **Windows 构建前置**：Tauri 的 Windows 资源需要 `rust/icons/icon.ico`（Tauri 默认图标路径）。该目录被 `.gitignore` 忽略、仓库不含图标源文件，需自行准备 `rust/icons/icon.ico`（可另放 `icon.png`）。Linux 构建不需要该图标。
 
 ## 日志
 

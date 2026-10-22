@@ -112,6 +112,14 @@ const startingSid = new Map<string, Promise<ShellInstance>>();
 const closedSids = new Set<string>();
 /** 附着模式共享实例(外部 shell;所有 sid 共用,放弃会话隔离) */
 let attachInstance: ShellInstance | null = null;
+/**
+ * 附着模式下**已注册过** notify-url 的 `baseUrl|sid`(去重,避免重复 POST)
+ *
+ * 语义:`/api/notify-url` 在 shell 侧是**全局单值**(见 rust/src/service.rs 的 set_notify_url),
+ * 待发送队列(state.sent_records)也是**全局唯一**的。附着模式只共享一个 shell ⇒ 队列全局,
+ * drain 由 notify URL 里带的 sid 执行(后注册的 sid 覆盖前一个,与「按 sid 分发」不同)。
+ */
+const attachNotifyRegistered = new Set<string>();
 
 /** 服务启动参数(configureService 保存,懒启动时使用) */
 let serviceConfig: {
@@ -177,24 +185,6 @@ export function isRunning(sid?: string): boolean {
   }
   for (const inst of sessions.values()) if (inst.ready) return true;
   return !!attachInstance?.ready;
-}
-
-/** 诊断/自验用:列出当前注册的实例(只读,不 spawn) */
-export function listSessions(): Array<{ sid: string; baseUrl: string; port: number; ready: boolean; attach: boolean; dataDir: string; title: string; pid: number | null }> {
-  const out: Array<{ sid: string; baseUrl: string; port: number; ready: boolean; attach: boolean; dataDir: string; title: string; pid: number | null }> = [];
-  for (const inst of sessions.values()) {
-    out.push({
-      sid: inst.sid,
-      baseUrl: inst.baseUrl,
-      port: inst.port,
-      ready: inst.ready,
-      attach: inst.attach,
-      dataDir: inst.dataDir,
-      title: inst.title,
-      pid: inst.proc?.pid ?? null,
-    });
-  }
-  return out;
 }
 
 /** 组装窗口标题:优先会话标题(有界等待),拿不到用 sid 后 6 位,保证任务栏可分辨 */
@@ -379,12 +369,21 @@ export async function ensureInstance(explicitSid?: string, opts?: { allowClosed?
     throw new Error(tf("client.browser_closed"));
   }
 
-  // 附着模式:外部 shell 单例,所有 sid 共用(连接一次,之后直接返回)
+  // 附着模式:外部 shell 单例,所有 sid 共用(连接一次,之后直接返回)。
+  // notify 语义:`/api/notify-url` 在 shell 内是**全局单值**,待发送队列也是**全局唯一**;
+  // 附着模式共享同一个 shell ⇒ 队列全局,drain 由 notify URL 里带的 sid 执行。
+  // 因此每个 sid 首次走 attach 分支时都必须注册自己的 notify 地址(按 baseUrl+sid 去重)。
   const attachUrl = resolveAttachBaseUrl();
   if (attachUrl) {
-    if (attachInstance?.ready) return attachInstance;
+    if (attachInstance?.ready) {
+      await ensureAttachNotify(attachInstance.baseUrl, sid);
+      return attachInstance;
+    }
     const existing = sessions.get(sid);
-    if (existing?.attach) return existing;
+    if (existing?.attach) {
+      await ensureAttachNotify(existing.baseUrl, sid);
+      return existing;
+    }
     const inst = await attachToService(attachUrl, sid);
     // P3-①:附着期间该 sid 被关闭 → 只解本地关联(外部进程不归插件管,绝不 kill)
     if (closedSids.has(sid)) {
@@ -393,6 +392,7 @@ export async function ensureInstance(explicitSid?: string, opts?: { allowClosed?
     }
     attachInstance = inst;
     sessions.set(sid, inst);
+    await ensureAttachNotify(inst.baseUrl, sid);
     await fireReady(sid);
     return inst;
   }
@@ -434,20 +434,44 @@ async function fireReady(sid: string): Promise<void> {
   }
 }
 
-/** 把某会话的通知地址注册给该实例(/api/notify-url);直接 fetch,避免 callApi 触发 ensure 递归 */
-async function registerNotifyUrl(baseUrl: string, sid: string): Promise<void> {
+/** 把某会话的通知地址注册给该实例(/api/notify-url);直接 fetch,避免 callApi 触发 ensure 递归
+ * 返回是否注册成功(失败不抛出:推送是增强路径,不能因注册失败阻断工具调用) */
+async function registerNotifyUrl(baseUrl: string, sid: string): Promise<boolean> {
   const url = getNotifyUrlForSession(sid);
-  if (!url) return;
+  if (!url) return false;
   try {
     const res = await fetch(`${baseUrl}/api/notify-url`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ url }),
     });
-    if (res.ok) log.info(`[notify] sid=${sid} notify-url registered: ${url}`);
-    else log.error(`[notify] sid=${sid} register failed: HTTP ${res.status}`);
+    if (res.ok) {
+      log.info(`[notify] sid=${sid} notify-url registered: ${url}`);
+      return true;
+    }
+    log.error(`[notify] sid=${sid} register failed: HTTP ${res.status}`);
+    return false;
   } catch (e) {
     log.error("[notify] register failed", e as Error);
+    return false;
+  }
+}
+
+/** 附着模式:按 baseUrl+sid 去重注册 notify(附着模式共享一个 shell,队列全局) */
+async function ensureAttachNotify(baseUrl: string, sid: string): Promise<void> {
+  const key = `${baseUrl}|${sid}`;
+  if (attachNotifyRegistered.has(key)) return;
+  // 先置位:并发 ensure 不重复 POST;失败则回滚,下次再试
+  attachNotifyRegistered.add(key);
+  const ok = await registerNotifyUrl(baseUrl, sid);
+  if (!ok) attachNotifyRegistered.delete(key);
+}
+
+/** 清掉某外部 shell 的 notify 注册记录(断开/换实例后重新连接需重新注册) */
+function clearAttachNotify(baseUrl: string): void {
+  const prefix = `${baseUrl}|`;
+  for (const key of [...attachNotifyRegistered]) {
+    if (key.startsWith(prefix)) attachNotifyRegistered.delete(key);
   }
 }
 
@@ -469,6 +493,7 @@ export async function closeSession(explicitSid?: string): Promise<void> {
   if (attachInstance === inst) attachInstance = null;
   if (inst.attach) {
     // 附着模式:外部 shell 进程不归插件管,**绝不 kill**,只清本地关联
+    clearAttachNotify(inst.baseUrl);
     log.info(`Detached from external bt-shell at ${inst.baseUrl} (process left running)`);
     return;
   }
@@ -485,17 +510,22 @@ export async function closeSession(explicitSid?: string): Promise<void> {
   log.info(`[session] sid=${sid} closed (port=${inst.port})`);
 }
 
-/** 关闭全部实例(插件 dispose / 退出);只按注册表 PID,绝不按名 */
+/** 关闭全部实例(插件 dispose / 退出);只按注册表 PID,绝不按名
+ * 含**启动中**的 sid:先置 closedSids(启动链自查后自毁刚 spawn 的进程),再等启动链跑完 ——
+ * 确保 dispose 返回时不留孤儿窗口。 */
 export async function closeAllSessions(): Promise<void> {
-  const sids = [...sessions.keys()];
+  const starting = [...startingSid.values()];
+  const sids = new Set<string>([...sessions.keys(), ...startingSid.keys()]);
   for (const sid of sids) {
     await closeSession(sid);
   }
+  // 启动链可能仍在 waitForReady:等它自查 closedSids 并终止自己 spawn 的进程(失败也不阻塞 dispose)
+  await Promise.allSettled(starting);
 }
 
-/** 兼容旧名:确保默认/当前会话的实例存在(现语义 = 懒启动该 sid 的实例) */
-export async function ensureService(sid?: string): Promise<void> {
-  await ensureInstance(sid);
+/** 该会话是否正处于启动中(close 需要能关掉「还没就绪」的实例) */
+export function isStarting(sid?: string): boolean {
+  return startingSid.has(resolveSessionId(sid));
 }
 
 /** 清「已关闭」标记(会话删除时用,避免集合无限增长;open_window 亦会清) */
@@ -503,11 +533,26 @@ export function clearClosedState(sid: string): void {
   closedSids.delete(sid);
 }
 
-/** 打开浏览器窗口(未启动则启动该会话实例;已启动幂等) */
+/** 打开浏览器窗口(未启动则启动该会话实例;已启动幂等)
+ * 手动关窗后注册表里的实例可能仍是 ready(进程已死/窗口已关)→ 先做一次存活探测,
+ * 探测失败就摘除死实例再走 ensureInstance,避免「以为已打开」而空转。 */
 export async function openWindow(sid?: string): Promise<void> {
   // 唯一打开入口:显式清「已关闭」标记后再启动
   const s = resolveSessionId(sid);
   closedSids.delete(s);
+  const inst = sessions.get(s);
+  if (inst?.ready) {
+    const alive = await probeOnce(inst.baseUrl, 800);
+    if (!alive) {
+      log.info(`[session] sid=${s} open_window: probe failed (port=${inst.port}); discarding dead instance before reopening`);
+      await markInstanceDead(s, inst);
+      if (sessions.get(s) === inst) sessions.delete(s);
+      if (attachInstance === inst) attachInstance = null;
+    } else {
+      // 探测通过:实例仍存活,保持幂等直接返回
+      return;
+    }
+  }
   await ensureInstance(s, { allowClosed: true });
 }
 
@@ -519,8 +564,11 @@ export async function openWindow(sid?: string): Promise<void> {
 export async function probeStatus(timeoutMs = 1500, sid?: string): Promise<any | null> {
   const targets: string[] = [];
   if (sid) {
-    const inst = sessions.get(resolveSessionId(sid));
+    const key = resolveSessionId(sid);
+    const inst = sessions.get(key);
     if (inst?.ready) targets.push(inst.baseUrl);
+    // 附着模式:实例可能只挂在 attachInstance 上(共享单例,放弃按 sid 隔离)→ 同样纳入探测
+    if (attachInstance?.ready && !targets.includes(attachInstance.baseUrl)) targets.push(attachInstance.baseUrl);
   } else {
     const cur = sessions.get(resolveSessionId());
     if (cur?.ready) targets.push(cur.baseUrl);
@@ -577,6 +625,8 @@ async function markInstanceDead(sid: string, inst: ShellInstance): Promise<void>
   // 只在注册项仍指向该实例时删除(避免误删之后由 open_window 重新注册的新实例)
   if (sessions.get(sid) === inst) sessions.delete(sid);
   if (attachInstance === inst) attachInstance = null;
+  // 外部 shell 已不可达:清 notify 注册记录,重新附着时才会重新注册
+  if (inst.attach) clearAttachNotify(inst.baseUrl);
   if (inst.proc) await terminateOwnProcess(inst.proc);
 }
 
@@ -671,8 +721,6 @@ export const service = {
   expectResponse: cmd("expect-response"),
   assertResponse: cmd("assert-response"),
   panelConfig: cmd("panel-config"),
-  status: cmd("status"),
-  title: cmd("title"),
   tabs: cmd("tabs"),
   annotateToggle: cmd("annotate/toggle"),
   annotateRecords: cmd("annotate/records"),
