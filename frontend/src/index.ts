@@ -10,6 +10,36 @@ import { applyTheme, getTheme, initTheme, saveTheme } from "./theme";
  *  后端据此恢复默认 UA + 内容区回 1100x628) */
 const DEVICE_DEFAULT_NAME = "__default__";
 
+/** HTTP API 令牌缓存:实例创建期由 Rust 确定,首次 api() 时通过 invoke 读取 */
+let apiToken: string | null = null;
+/** 令牌读取中的在途 Promise:并发 api() 共享同一次 invoke */
+let apiTokenPromise: Promise<string | null> | null = null;
+
+/**
+ * 获取并缓存 API 令牌(面板 fetch /api/* 时作为 `x-bt-token` 头)
+ *
+ * 失败不阻断面板:在控制台打出明确错误并返回 null(后续请求会 401),下次调用重试。
+ */
+async function getApiToken(): Promise<string | null> {
+  if (apiToken !== null) return apiToken;
+  if (!apiTokenPromise) {
+    apiTokenPromise = invoke<string>("api_token")
+      .then((token) => {
+        apiToken = token;
+        return token as string | null;
+      })
+      .catch((e) => {
+        console.error("[panel] 获取 API 令牌失败(api_token invoke),/api/* 将返回 401:", e);
+        return null;
+      })
+      .finally(() => {
+        // 失败时清空在途 Promise,允许下次调用重试;成功则保留缓存值
+        if (apiToken === null) apiTokenPromise = null;
+      });
+  }
+  return apiTokenPromise;
+}
+
 /** DOM 引用集合 */
 interface PanelDoms {
   btnSend: HTMLButtonElement;
@@ -125,15 +155,21 @@ class Panel {
     paneConfig.hidden = which !== "config";
   }
 
-  /** 调用本地 HTTP 服务 API */
+  /** 调用本地 HTTP 服务 API(带实例鉴权头 `x-bt-token`) */
   private async api(path: string, body?: unknown): Promise<any> {
     const port = this.servicePort || (await invoke<number>("panel_service_port"));
     this.servicePort = port;
+    const token = await getApiToken();
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (token) headers["x-bt-token"] = token;
     const res = await fetch(`http://127.0.0.1:${port}${path}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify(body || {}),
     });
+    if (!res.ok) {
+      console.error(`[panel] api ${path} failed: HTTP ${res.status}${token ? "" : "(no api token)"}`);
+    }
     return res.json();
   }
 

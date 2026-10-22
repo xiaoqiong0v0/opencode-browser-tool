@@ -14,6 +14,10 @@
 | 会话删除回收数据目录 | 文件系统 `sessions/<profile>/<sid>` | sid 形态校验 + `isInsideDir` containment；`rmSync` try/catch；失败 800ms 后重试一次（定时器 `unref`） | 先 `closeSession` + `clearClosedState` 再删目录；只删该 sid 目录，绝不删 sessions 根或其它 sid | `index.ts:removeSessionDataDir` / `session.deleted` |
 | 会话删除与 attach notify | `attachNotifyRegistered` / `attachNotifyInFlight` | 按 sid 后缀清理（`baseUrl|sid`） | 删除事件只清理该 sid 的键，不影响其它会话 | `client.ts:clearAttachNotifyForSid` |
 | 通知 drain | `drainingSid: Set<sid>` | 同 sid 重入直接返回；`finally` 清理 | 每 sid 串行 drain；不因 drain 触发 spawn | `index.ts:drainAnnotate` |
+| API 鉴权令牌 | `ShellInstance.token`（每实例一份）、`BT_SHELL_TOKEN`（attach 模式）、Rust `HttpState.token`、面板前端 `apiToken` 缓存 | 令牌在**实例创建期**确定、随实例不可变（Rust 侧只读 `Arc<str>`）；attach 缺失环境变量直接抛错；前端并发 `api()` 共享同一个在途 `invoke` Promise | spawn 生成令牌并随 `--token` 传给子进程，端口重试沿用同一令牌；attach 令牌只来自环境变量，所有 `/api/*` 请求（含 probe/notify/close）带 `x-bt-token`；**面板经 Tauri `invoke("api_token")` 读取同一令牌**；**`/api/page-event` 精确路径豁免 `Origin`+令牌**（页面脚本无法持有令牌） | `client.ts:spawnForSession` / `attachToService` / `http.rs:handler` / `main.rs:api_token` / `frontend/src/index.ts:getApiToken` |
+| 插件通知投递 | `NOTIFY_TX: OnceLock<mpsc::Sender<(String, usize)>>` | 单线程 FIFO worker：`mpsc` 队列 + 独立线程 `current_thread` tokio runtime；一条通知**首发 + 3 次重试**（300/600/1200ms 退避，单次超时 2s）后才处理下一条 | 多次通知严格按入队顺序投递（**保序**、不并发），不阻塞 UI/事件线程；失败只记日志并继续后续通知 | `ui/mod.rs:notify_plugin` / `notify_worker` / `post_notify` |
+| 待发送队列 | `state.sent_records`（shell 内全局唯一，attach 模式下跨 sid 共享） | 追加 + 按记录 `index` 去重 + 上限 `SENT_QUEUE_MAX=500`（超出丢最旧）；`Mutex` 保护 | 只追加不覆盖（旧实现覆盖会丢未 drain 的批次）；同一批重复 send 不重复入队；消费由**插件 drain（通知触发）**完成，队列自身不并发消费 | `ui/mod.rs:append_sent_records` / `send_all_records` |
+| 批注/截图记录上限 | `state.records` | `MAX_RECORDS=200`（超出丢最旧）；`index` 单调递增（不按 `len` 推算，避免重号） | 发送只标 `sent`、不清表（面板按未发送过滤）；旧记录可被新记录按上限挤出 | `annotate.rs:push_record_capped` / `Annotator::push_record` |
 
 ## 已知边角（有意保留）
 

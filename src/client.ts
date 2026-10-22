@@ -5,6 +5,7 @@
 // 窗口/标签/UA/批注等一切 shell 状态;进程回收只按注册表里的 PID,**绝不按名杀进程**。
 // 附着模式(BT_SHELL_URL/BT_SHELL_PORT)例外:连接外部单例,放弃会话隔离(见 docs/implementation.md)。
 import { spawn } from "child_process";
+import { randomBytes } from "crypto";
 import { resolve, dirname } from "path";
 import { existsSync } from "fs";
 import { fileURLToPath } from "url";
@@ -24,6 +25,10 @@ const READY_POLL_INTERVAL_MS = 300;
 const PORT_START_ATTEMPTS = 5;
 /** 会话标题解析上限(ms):超时就用 sid 后缀,绝不因标题卡住启动 */
 const TITLE_RESOLVE_TIMEOUT_MS = 250;
+/** HTTP 401 Unauthorized:shell 明确判定令牌不匹配(rust/src/http.rs 的 auth_error) */
+const HTTP_UNAUTHORIZED = 401;
+/** HTTP 403 Forbidden:shell 明确拒绝该请求(带 Origin 的跨源请求) */
+const HTTP_FORBIDDEN = 403;
 
 /** 二进制来源(用于日志一眼判断用的是哪份) */
 type ShellSource = "env" | "local-dev" | "cargo-target-dir" | "download-cache";
@@ -85,6 +90,18 @@ function resolveAttachBaseUrl(): string | null {
   return null;
 }
 
+/** 本地 API 统一请求头:JSON + 鉴权令牌(服务端拒绝任何带 Origin 的浏览器跨源请求) */
+function authHeaders(token: string): Record<string, string> {
+  return { "Content-Type": "application/json", "x-bt-token": token };
+}
+
+/** 附着模式令牌:由 BT_SHELL_TOKEN 提供(外部 shell 须用同一值启动);缺失直接抛明确错误 */
+function requireAttachToken(): string {
+  const token = process.env.BT_SHELL_TOKEN?.trim();
+  if (!token) throw new Error(tf("client.attach_need_token"));
+  return token;
+}
+
 /** 一个会话的 shell 实例(进程 + 端点 + 就绪态) */
 interface ShellInstance {
   /** opencode 会话 id(注册表键;附着模式下为首次请求的 sid) */
@@ -95,6 +112,8 @@ interface ShellInstance {
   baseUrl: string;
   /** 端口(诊断用) */
   port: number;
+  /** HTTP API 鉴权令牌(实例创建期确定,随实例不可变;所有 /api/* 请求带 x-bt-token) */
+  token: string;
   /** 该实例的 --user-data-dir(诊断/取证用;未设置则为 "") */
   dataDir: string;
   /** 窗口标题(诊断/取证用) */
@@ -212,20 +231,38 @@ async function resolveWindowTitle(sid: string): Promise<string> {
   return fallback;
 }
 
-/** 轮询等待服务就绪(READY_TIMEOUT_MS 超时);超时抛出给定提示 */
-async function waitForReady(baseUrl: string, timeoutMessage: string): Promise<void> {
+/**
+ * 轮询等待服务就绪(READY_TIMEOUT_MS 超时);超时抛出给定提示。
+ *
+ * `authHint`(仅附着模式传 true):401/403 是**确定性失败** —— shell 已经起来并明确拒绝鉴权,
+ * 令牌不一致在它启动那一刻就定死了,重试到超时也永远不会变成 200,继续轮询只会白等
+ * READY_TIMEOUT_MS(20s)再报一句无关的超时。因此一旦拿到 401/403 立即抛鉴权错误。
+ * spawn 路径不传(authHint=false):令牌由插件自己随机生成并原样透传 --token,
+ * 出现 401 属异常(端口上坐着别的进程等),保持原有"继续重试→超时"路径。
+ */
+async function waitForReady(
+  baseUrl: string,
+  token: string,
+  timeoutMessage: string,
+  authHint = false,
+): Promise<void> {
   const deadline = Date.now() + READY_TIMEOUT_MS;
   while (Date.now() < deadline) {
+    let authRejected = false;
     try {
       const res = await fetch(`${baseUrl}/api/status`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders(token),
         body: "{}",
       });
       if (res.ok) return;
+      // 鉴权类失败(401 令牌不匹配 / 403 请求被拒)在附着模式下意味着令牌写错了
+      authRejected = authHint && (res.status === HTTP_UNAUTHORIZED || res.status === HTTP_FORBIDDEN);
     } catch {
-      // 服务未启动,继续等待
+      // 连接层错误(服务还没开始监听),继续等待
     }
+    // 抛在 try 之外:避免鉴权错误被上面的 catch 吞掉、退化成继续重试
+    if (authRejected) throw new Error(tf("client.attach_bad_token"));
     await new Promise((r) => setTimeout(r, READY_POLL_INTERVAL_MS));
   }
   throw new Error(timeoutMessage);
@@ -305,11 +342,22 @@ async function spawnForSession(sid: string, shell: string): Promise<ShellInstanc
   const cfg = serviceConfig;
   const dataDir = cfg?.resolveDataDir ? cfg.resolveDataDir(sid) : "";
   const title = await resolveWindowTitle(sid);
+  // 本实例的鉴权令牌:16 字节 → 32 hex;端口重试沿用同一令牌(新的子进程仍是同一实例语义)
+  const token = randomBytes(16).toString("hex");
   let lastErr: unknown = null;
   for (let attempt = 1; attempt <= PORT_START_ATTEMPTS; attempt++) {
     // 显式指定端口(release 模式 GUI 程序无控制台,无法解析 stdout);随机区间避开常用端口
     const port = 18000 + Math.floor(Math.random() * 1000);
-    const args = ["--browsers-path", cfg?.browsersPath || "", "--port", String(port), "--title", title];
+    const args = [
+      "--browsers-path",
+      cfg?.browsersPath || "",
+      "--port",
+      String(port),
+      "--title",
+      title,
+      "--token",
+      token,
+    ];
     // 每会话独立 user-data-dir(WebView2 profile 隔离);未提供则不传(回落 WebView2 默认目录)
     if (dataDir) args.push("--user-data-dir", dataDir);
     // 推送式投递:注册**本会话**的通知地址 → 通知按 sid 归属
@@ -327,7 +375,9 @@ async function spawnForSession(sid: string, shell: string): Promise<ShellInstanc
     attachStdio(proc, sid);
     const baseUrl = `http://127.0.0.1:${port}`;
     try {
-      await waitForReady(baseUrl, tf("client.service_timeout"));
+      // authHint 默认 false:spawn 的令牌是插件本会话随机生成并随 --token 传下去的,
+      // 不该出现 401;真出现(如端口被别的进程占住)属于"没起来"一类,走换端口重试而不是鉴权报错
+      await waitForReady(baseUrl, token, tf("client.service_timeout"));
     } catch (e) {
       // 启动超时(常见:端口被别的进程占住 → bind 失败 → 永远不就绪):杀掉本次子进程换端口重来
       lastErr = e;
@@ -336,27 +386,32 @@ async function spawnForSession(sid: string, shell: string): Promise<ShellInstanc
       continue;
     }
     // 就绪:把本会话的通知地址注册给该实例(推送式投递;失败重试一次,不影响工具调用成功)
-    const notifyOk = await registerNotifyUrl(baseUrl, sid);
+    const notifyOk = await registerNotifyUrl(baseUrl, sid, token);
     if (!notifyOk) {
       await new Promise((r) => setTimeout(r, NOTIFY_RETRY_DELAY_MS));
-      const retried = await registerNotifyUrl(baseUrl, sid);
+      const retried = await registerNotifyUrl(baseUrl, sid, token);
       if (!retried) log.error(`[notify] sid=${sid} notify-url registration failed after retry (delivery may be degraded)`);
     }
     log.info(`[session] sid=${sid} ready on port ${port} (title="${title}", dataDir=${dataDir || "(default)"}, attempt ${attempt})`);
-    return { sid, proc, baseUrl, port, dataDir, title, ready: true, attach: false };
+    return { sid, proc, baseUrl, port, token, dataDir, title, ready: true, attach: false };
   }
   throw lastErr instanceof Error ? lastErr : new Error(tf("client.service_timeout"));
 }
 
 /** 附着到外部已运行的 shell(所有 sid 共用;不 spawn、不 kill、放弃会话隔离) */
 async function attachToService(baseUrl: string, sid: string): Promise<ShellInstance> {
+  // 令牌必须先有:缺失时直接报错,不去连一个注定 401 的端点
+  const token = requireAttachToken();
   log.info(`Attaching to existing bt-shell at ${baseUrl} (no spawn; session isolation disabled in attach mode)`);
-  await waitForReady(baseUrl, tf("client.attach_timeout", { url: baseUrl }));
+  // authHint=true:令牌来自 BT_SHELL_TOKEN(与外部 shell 的启动令牌是两处配置),
+  // 401/403 说明两边不一致 → 立即报鉴权失败,不等 20s 超时
+  await waitForReady(baseUrl, token, tf("client.attach_timeout", { url: baseUrl }), true);
   const inst: ShellInstance = {
     sid,
     proc: null,
     baseUrl,
     port: Number(new URL(baseUrl).port || 0),
+    token,
     dataDir: "",
     title: "(external)",
     ready: true,
@@ -389,12 +444,12 @@ export async function ensureInstance(explicitSid?: string, opts?: { allowClosed?
   const attachUrl = resolveAttachBaseUrl();
   if (attachUrl) {
     if (attachInstance?.ready) {
-      await ensureAttachNotify(attachInstance.baseUrl, sid);
+      await ensureAttachNotify(attachInstance, sid);
       return attachInstance;
     }
     const existing = sessions.get(sid);
     if (existing?.attach) {
-      await ensureAttachNotify(existing.baseUrl, sid);
+      await ensureAttachNotify(existing, sid);
       return existing;
     }
     const inst = await attachToService(attachUrl, sid);
@@ -405,7 +460,7 @@ export async function ensureInstance(explicitSid?: string, opts?: { allowClosed?
     }
     attachInstance = inst;
     sessions.set(sid, inst);
-    await ensureAttachNotify(inst.baseUrl, sid);
+    await ensureAttachNotify(inst, sid);
     await fireReady(sid);
     return inst;
   }
@@ -453,13 +508,13 @@ async function fireReady(sid: string): Promise<void> {
 
 /** 把某会话的通知地址注册给该实例(/api/notify-url);直接 fetch,避免 callApi 触发 ensure 递归
  * 返回是否注册成功(失败不抛出:推送是增强路径,不能因注册失败阻断工具调用) */
-async function registerNotifyUrl(baseUrl: string, sid: string): Promise<boolean> {
+async function registerNotifyUrl(baseUrl: string, sid: string, token: string): Promise<boolean> {
   const url = getNotifyUrlForSession(sid);
   if (!url) return false;
   try {
     const res = await fetch(`${baseUrl}/api/notify-url`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders(token),
       body: JSON.stringify({ url }),
     });
     if (res.ok) {
@@ -477,15 +532,15 @@ async function registerNotifyUrl(baseUrl: string, sid: string): Promise<boolean>
 /** 附着模式:按 baseUrl+sid 去重注册 notify(附着模式共享一个 shell,队列全局)
  * 并发语义:同 key 的并发调用共享同一次 POST(await 同一个 Promise),失败只清 in-flight,
  * 使下一次调用自动重试;成功才写入「已注册」集合。 */
-async function ensureAttachNotify(baseUrl: string, sid: string): Promise<void> {
-  const key = `${baseUrl}|${sid}`;
+async function ensureAttachNotify(inst: ShellInstance, sid: string): Promise<void> {
+  const key = `${inst.baseUrl}|${sid}`;
   if (attachNotifyRegistered.has(key)) return;
   const inflight = attachNotifyInFlight.get(key);
   if (inflight) {
     await inflight;
     return;
   }
-  const p = registerNotifyUrl(baseUrl, sid);
+  const p = registerNotifyUrl(inst.baseUrl, sid, inst.token);
   attachNotifyInFlight.set(key, p);
   let ok = false;
   try {
@@ -545,7 +600,7 @@ export async function closeSession(explicitSid?: string): Promise<void> {
   try {
     await fetch(`${inst.baseUrl}/api/close`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders(inst.token),
       body: "{}",
     });
   } catch {
@@ -587,7 +642,7 @@ export async function openWindow(sid?: string): Promise<void> {
   closedSids.delete(s);
   const inst = sessions.get(s);
   if (inst?.ready) {
-    const alive = await probeOnce(inst.baseUrl, 800);
+    const alive = await probeOnce(inst.baseUrl, 800, inst.token);
     if (!alive) {
       log.info(`[session] sid=${s} open_window: probe failed (port=${inst.port}); discarding dead instance before reopening`);
       await markInstanceDead(s, inst);
@@ -610,36 +665,35 @@ export async function openWindow(sid?: string): Promise<void> {
  * 用于 get_browser_status 这类只读命令,避免查询也弹出浏览器窗口。
  */
 export async function probeStatus(timeoutMs = 1500, sid?: string): Promise<any | null> {
-  const targets: string[] = [];
+  // 按实例探测(令牌随实例走:spawn 实例用自己生成的令牌,attach 实例用 BT_SHELL_TOKEN)
+  const targets: ShellInstance[] = [];
+  const add = (inst: ShellInstance | null | undefined): void => {
+    if (inst?.ready && !targets.some((t) => t.baseUrl === inst.baseUrl)) targets.push(inst);
+  };
   if (sid) {
-    const key = resolveSessionId(sid);
-    const inst = sessions.get(key);
-    if (inst?.ready) targets.push(inst.baseUrl);
+    add(sessions.get(resolveSessionId(sid)));
     // 附着模式:实例可能只挂在 attachInstance 上(共享单例,放弃按 sid 隔离)→ 同样纳入探测
-    if (attachInstance?.ready && !targets.includes(attachInstance.baseUrl)) targets.push(attachInstance.baseUrl);
+    add(attachInstance);
   } else {
-    const cur = sessions.get(resolveSessionId());
-    if (cur?.ready) targets.push(cur.baseUrl);
-    for (const inst of sessions.values()) {
-      if (inst.ready && !targets.includes(inst.baseUrl)) targets.push(inst.baseUrl);
-    }
-    if (attachInstance?.ready && !targets.includes(attachInstance.baseUrl)) targets.push(attachInstance.baseUrl);
+    add(sessions.get(resolveSessionId()));
+    for (const inst of sessions.values()) add(inst);
+    add(attachInstance);
   }
-  for (const baseUrl of targets) {
-    const r = await probeOnce(baseUrl, timeoutMs);
+  for (const inst of targets) {
+    const r = await probeOnce(inst.baseUrl, timeoutMs, inst.token);
     if (r) return r;
   }
   return null;
 }
 
 /** 对单个端点做一次短超时探测 */
-async function probeOnce(baseUrl: string, timeoutMs: number): Promise<any | null> {
+async function probeOnce(baseUrl: string, timeoutMs: number, token: string): Promise<any | null> {
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), timeoutMs);
   try {
     const res = await fetch(`${baseUrl}/api/status`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders(token),
       body: "{}",
       signal: ac.signal,
     });
@@ -679,10 +733,10 @@ async function markInstanceDead(sid: string, inst: ShellInstance): Promise<void>
 }
 
 /** 发一次 POST 并解析 {success,data};连接层错误直接抛(fetch 的 TypeError 等) */
-async function postJson(baseUrl: string, path: string, payload: unknown): Promise<any> {
+async function postJson(baseUrl: string, path: string, payload: unknown, token: string): Promise<any> {
   const res = await fetch(`${baseUrl}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: authHeaders(token),
     body: JSON.stringify(payload ?? {}),
   });
   const json = await res.json();
@@ -705,7 +759,7 @@ async function callApi(path: string, body?: any, sessionId?: string): Promise<an
   const inst = await ensureInstance(sid);
   const payload = { ...(body || {}), _sessionId: sid };
   try {
-    return await postJson(inst.baseUrl, path, payload);
+    return await postJson(inst.baseUrl, path, payload, inst.token);
   } catch (e) {
     if (!isConnectionError(e)) throw e;
     if (inst.attach) {

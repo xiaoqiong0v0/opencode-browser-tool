@@ -186,8 +186,11 @@ fn dom_accessibility_tree(
 const DOM_AX_JS: &str = r##"
 (function(){
   try{
-    // 递归深度上限:防御异常深的 DOM
-    var MAX_DEPTH=100;
+    // 递归/规模上限:防御异常深的 DOM 与超大页面(与 Rust 侧 AX_MAX_DEPTH/AX_MAX_NODES 一致)
+    // 深度 64 / 输出节点 5000,超出即截断返回(不递归爆栈、不无界返回)
+    var MAX_DEPTH=64;
+    var MAX_NODES=5000;
+    var nodeCount=0;
     // 非内容元素:不参与可访问性树
     var SKIP_TAGS={SCRIPT:1,STYLE:1,NOSCRIPT:1,TEMPLATE:1,HEAD:1,META:1,LINK:1,TITLE:1,BASE:1};
     // 元素可见性:不可见元素及其子树跳过
@@ -300,7 +303,7 @@ const DOM_AX_JS: &str = r##"
     // 递归构建:返回输出节点数组(被过滤节点自身不输出,子树提升到父级)
     function walk(el,depth){
       var out=[];
-      if(depth>MAX_DEPTH)return out;
+      if(depth>MAX_DEPTH||nodeCount>=MAX_NODES)return out;
       var tag=el.tagName?el.tagName.toUpperCase():"";
       if(SKIP_TAGS[tag])return out;
       if(!isVisible(el))return out;
@@ -321,6 +324,9 @@ const DOM_AX_JS: &str = r##"
       var val=valueOf(el,role);
       if(val!=="")node.value=val;
       if(children.length)node.children=children;
+      // 输出节点总数上限:已满则不再输出自身,子树已提升(有界返回)
+      if(nodeCount>=MAX_NODES)return children;
+      nodeCount++;
       return [node];
     }
     var sel=__BT_AX_SELECTOR__;
@@ -342,6 +348,38 @@ const DOM_AX_JS: &str = r##"
   }
 })()
 "##;
+
+/// 可访问性树递归深度上限(与 Linux 侧 DOM_AX_JS 的 MAX_DEPTH 一致)
+/// 说明:异常深/超大的页面不得无限递归(栈溢出)或无界返回;超出即截断
+#[cfg(windows)]
+const AX_MAX_DEPTH: usize = 64;
+
+/// 可访问性树输出节点总数上限(与 Linux 侧 DOM_AX_JS 的 MAX_NODES 一致)
+#[cfg(windows)]
+const AX_MAX_NODES: usize = 5000;
+
+/// 遍历预算:节点计数 + 是否触顶(触顶只截断并留日志,绝不 panic)
+#[cfg(windows)]
+#[derive(Default)]
+struct AxBudget {
+    /// 已输出的节点数
+    emitted: usize,
+    /// 是否因深度/节点数上限被截断
+    truncated: bool,
+}
+
+#[cfg(windows)]
+impl AxBudget {
+    /// 为一个待输出节点占位;返回 false 表示已达节点上限(调用方应截断并提升子树)
+    fn take(&mut self) -> bool {
+        if self.emitted >= AX_MAX_NODES {
+            self.truncated = true;
+            return false;
+        }
+        self.emitted += 1;
+        true
+    }
+}
 
 /// CDP AX nodes → {role,name,value,children} 树(过滤 ignored/backdrop/none role)
 /// 根为 parentId 为空的节点(整页树入口)
@@ -387,14 +425,21 @@ fn build_tree_from(
         id: &str,
         id_node: &HashMap<String, &serde_json::Value>,
         children_map: &HashMap<String, Vec<String>>,
+        depth: usize,
+        budget: &mut AxBudget,
     ) -> Vec<serde_json::Value> {
+        // 深度上限:超出即停止(不再向下递归),仅标记截断
+        if depth > AX_MAX_DEPTH {
+            budget.truncated = true;
+            return Vec::new();
+        }
         let Some(n) = id_node.get(id) else { return Vec::new() };
         let role = n.get("role").and_then(|r| r.get("value")).and_then(|v| v.as_str()).unwrap_or("");
         // 先转换子节点(被过滤的节点自身不输出、其子树提升到当前层)
         let mut child_nodes: Vec<serde_json::Value> = Vec::new();
         if let Some(ids) = children_map.get(id) {
             for cid in ids {
-                child_nodes.extend(convert(cid, id_node, children_map));
+                child_nodes.extend(convert(cid, id_node, children_map, depth + 1, budget));
             }
         }
         // CDP 会把一段文本拆成多个(甚至逐字符的)StaticText 子节点:
@@ -426,6 +471,11 @@ fn build_tree_from(
             || (role == "generic" && name.is_empty());
         if skip {
             // 未输出的节点不吞文本:把 StaticText 放回,让文本冒泡到最近的可输出祖先再合并
+            kept.extend(statics);
+            return kept;
+        }
+        // 节点总数上限:已达上限后不再输出自身,子树提升(有界返回)
+        if !budget.take() {
             kept.extend(statics);
             return kept;
         }
@@ -478,14 +528,28 @@ fn build_tree_from(
             }
         }
     }
+    // 遍历预算:深度 64 / 节点 5000,超出截断(不 panic、不栈溢出)
+    let mut budget = AxBudget::default();
+    let mut tree: Option<serde_json::Value> = None;
     for r in roots {
-        let out = convert(&r, &id_node, &children_map);
+        let out = convert(&r, &id_node, &children_map, 0, &mut budget);
         match out.len() {
             0 => continue,
+            1 => {
+                tree = Some(out.into_iter().next().unwrap());
+                break;
+            }
             // 根被过滤且有多个被提升的孩子时,合成虚拟根(与 Linux 端一致)
-            1 => return Ok(out.into_iter().next().unwrap()),
-            _ => return Ok(json!({ "role": "generic", "children": out })),
+            _ => {
+                tree = Some(json!({ "role": "generic", "children": out }));
+                break;
+            }
         }
     }
-    Err("no accessibility nodes".into())
+    if budget.truncated {
+        eprintln!(
+            "[accessibility] tree truncated (cap: depth {AX_MAX_DEPTH} / {AX_MAX_NODES} nodes)"
+        );
+    }
+    tree.ok_or_else(|| "no accessibility nodes".to_string())
 }

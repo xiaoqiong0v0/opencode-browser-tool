@@ -104,6 +104,8 @@ const en: LocaleStrings = {
     "cli.out.device_applied": "Device preset applied: {name} ({w}x{h} content)\nUser-Agent: {ua}",
     "cli.out.devtools_open": "Devtools opened",
     "cli.out.devtools_closed": "Devtools closed",
+    // Windows/wry cannot actually close DevTools: report it instead of claiming success
+    "cli.out.devtools_unsupported": "Closing DevTools is not supported on this platform (wry limitation); toggle it with F12",
     "cli.out.reload": "Page reloaded: {url}",
     // Fallback when the backend response carries no url (no last-navigated URL on the tab) — keeps output from showing undefined
     "cli.out.reload_nourl": "Page reloaded",
@@ -174,6 +176,8 @@ const en: LocaleStrings = {
     "client.spawn_failed": "Failed to start the bt-shell process (retry via bt_cli later; do not run the executable directly)",
     "client.session_closed_during_start": "A close request was received while the browser was starting; that instance was terminated. Call open_window if you need it again.",
     "client.attach_gone": "Attached external bt-shell at {url} is gone (attach mode does not own that process; restart the shell yourself).",
+    "client.attach_need_token": "Attach mode requires an auth token: set BT_SHELL_TOKEN and start the external bt-shell with the same token (--token <token>, or the same environment variable).",
+    "client.attach_bad_token": "External bt-shell refused authentication: BT_SHELL_TOKEN does not match the --token/BT_SHELL_TOKEN the shell was started with.",
     "client.browser_closed": "Browser is closed. Call open_window to open it first, then retry.",
 
     "tool.set_media_mode.desc":

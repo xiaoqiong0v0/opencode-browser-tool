@@ -197,7 +197,7 @@ impl App {
             "/api/click-switch-tab" => self.click_switch_tab(&body).await,
             // 面板相关(批注状态机)
             "/api/annotate/toggle" => self.annotate_toggle().await,
-            "/api/annotate/records" => self.annotate_records().await,
+            "/api/annotate/records" => self.annotate_records(&body).await,
             "/api/annotate/send" => self.annotate_send().await,
             "/api/annotate/consume-sent" => self.annotate_consume_sent().await,
             // 推送式投递:插件注册通知地址(附着模式 / 晚注册)
@@ -678,7 +678,8 @@ impl App {
         tokio::task::block_in_place(|| ui::reload_active_tab(&handle))
     }
 
-    /// 页面事件上报(SPA 路由/标题/图标变化;注入脚本 POST 到此,http.rs 已开 CORS)
+    /// 页面事件上报(SPA 路由/标题/图标变化;注入脚本以 no-cors 简单 POST 到此。
+    /// http.rs 已移除 CORS 与 OPTIONS(一律 405),此路径是鉴权的唯一精确路径豁免(免令牌、免 Origin 校验))
     async fn page_event(&self, body: &Value) -> Result<Value, String> {
         let label = body.get("label").and_then(|v| v.as_str()).unwrap_or("");
         if label.is_empty() {
@@ -1045,16 +1046,22 @@ impl App {
     }
 
     /// 打开/关闭开发者工具
+    ///
     /// Linux(webkitgtk):wry 的 is_devtools_open 返回真实状态,用户在 devtools 窗口里点 ×
-    /// 关闭后标记不会失同步,动作以真实状态为准,动作结果写回 UiState.devtools_open。
-    /// Windows(webview2):wry 的 is_devtools_open 恒 false、close_devtools 为空实现,
-    /// 无法探测/关闭,沿用 UiState 本地标记(close 仅标记状态,窗口需手动关闭)。
+    /// 关闭后标记不会失同步,动作以真实状态为准,结果写回 UiState.devtools_open。
+    /// Windows(webview2):wry 0.55.1 的 `close_devtools()` 是**空实现**
+    /// (见 wry-0.55.1/src/webview2/mod.rs:`pub fn close_devtools(&self) {}`),
+    /// 且 WebView2 接口只有 `OpenDevToolsWindow`,没有对应的 Close API —— 无法真正关闭。
+    /// 因此 close/toggle-close 不再谎报 `open:false`,而是如实返回 `{open:true, supported:false}` 并留日志。
+    /// 返回体固定带 `open`(真实/推定状态)与 `supported`(该平台是否支持真正关闭)。
     async fn devtools(&self, body: &Value) -> Result<Value, String> {
         let action = body.get("action").and_then(|v| v.as_str()).unwrap_or("toggle").to_string();
         let state = self.handle.state::<crate::ui::UiState>();
         let mut open = state.devtools_open.lock().unwrap();
         let handle = self.handle.clone();
-        let now_open = tokio::task::block_in_place(|| {
+        // 能否真正关闭 devtools:Linux 由 webkitgtk 实现;Windows 侧 wry 为空实现
+        let close_supported = cfg!(target_os = "linux");
+        let (now_open, closed) = tokio::task::block_in_place(|| {
             let page = ui::active_page_webview(&handle).ok_or("page webview not ready")?;
             // Linux 用 webview 真实状态;其他平台探测不到,退回本地标记
             #[cfg(target_os = "linux")]
@@ -1062,35 +1069,50 @@ impl App {
             #[cfg(not(target_os = "linux"))]
             let actual = *open;
 
-            let open_now = match action.as_str() {
+            let state_now = match action.as_str() {
                 "open" => {
                     if !actual {
                         page.open_devtools();
                     }
-                    true
+                    (true, true)
                 }
                 "close" => {
-                    if actual {
-                        page.close_devtools();
+                    if !close_supported {
+                        // 无法真正关闭:保持 open=true,不让调用方误以为已关
+                        eprintln!(
+                            "[devtools] close unsupported on this platform (wry close_devtools is a no-op, WebView2 has no close API); devtools stays open"
+                        );
+                        (true, false)
+                    } else {
+                        if actual {
+                            page.close_devtools();
+                        }
+                        (false, true)
                     }
-                    false
                 }
                 "toggle" => {
                     if actual {
-                        page.close_devtools();
-                        false
+                        if !close_supported {
+                            eprintln!(
+                                "[devtools] toggle->close unsupported on this platform (wry close_devtools is a no-op); devtools stays open"
+                            );
+                            (true, false)
+                        } else {
+                            page.close_devtools();
+                            (false, true)
+                        }
                     } else {
                         page.open_devtools();
-                        true
+                        (true, true)
                     }
                 }
                 other => return Err(format!("unknown action: {other} (open/close/toggle)")),
             };
-            Ok::<bool, String>(open_now)
+            Ok::<(bool, bool), String>(state_now)
         })?;
-        // 动作后的真实结果写回本地标记,保持返回结构 { "open": bool }
+        // 动作后的状态写回本地标记,保持 `{ "open": bool }` 既有语义(新增 supported 为附加字段)
         *open = now_open;
-        Ok(json!({ "open": now_open }))
+        Ok(json!({ "open": now_open, "supported": closed }))
     }
 
     /// 查询/切换媒体设备模式(simulate=模拟设备 / real=真实设备)
@@ -1248,10 +1270,38 @@ impl App {
         Ok(json!({ "annotate": on }))
     }
 
-    async fn annotate_records(&self) -> Result<Value, String> {
+    /// 批注/截图记录列表
+    ///
+    /// body.includeImages(默认 **false**):true 时每条附带 `image`(PNG base64);
+    /// false 时只给 `hasImage` 标记不带 base64 —— 列表类调用(面板/`list_records`)无需整批图片,
+    /// 只有确需内容的 `read_record_content` 才显式要图,避免几十条截图 base64 一次性塞进响应。
+    async fn annotate_records(&self, body: &Value) -> Result<Value, String> {
+        let include_images = body.get("includeImages").and_then(|v| v.as_bool()).unwrap_or(false);
         let state = self.handle.state::<crate::ui::UiState>();
         let records = state.records.lock().unwrap().clone();
-        Ok(json!(records))
+        let list: Vec<Value> = records
+            .iter()
+            .map(|r| {
+                let mut obj = serde_json::Map::new();
+                obj.insert("index".into(), json!(r.index));
+                obj.insert("type".into(), json!(r.typ));
+                obj.insert("url".into(), json!(r.url));
+                obj.insert("selector".into(), json!(r.selector));
+                obj.insert("rect".into(), json!([r.rect.0, r.rect.1, r.rect.2, r.rect.3]));
+                obj.insert("note".into(), json!(r.note));
+                obj.insert("sent".into(), json!(r.sent));
+                // 每条都给 hasImage:调用方据此决定是否值得再按需取图
+                obj.insert("hasImage".into(), json!(r.image.is_some()));
+                // 仅显式要图时带上 base64(默认不带,避免整批大图塞进响应)
+                if include_images
+                    && let Some(img) = &r.image
+                {
+                    obj.insert("image".into(), json!(img));
+                }
+                Value::Object(obj)
+            })
+            .collect();
+        Ok(json!(list))
     }
 
     async fn annotate_send(&self) -> Result<Value, String> {

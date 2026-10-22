@@ -147,7 +147,12 @@ const COMMANDS: Record<string, CmdDef> = {
     const r = await service.device({ name: a.name });
     return _t("cli.out.device_applied", { name: r.device, w: r.width, h: r.height, ua: r.ua });
   } },
-  devtools: { usage: "[--action]", descKey: "cli.cmd.devtools", args: [{ flag: "action" }], run: async (a) => { const r = await service.devtools({ action: a.action || "toggle" }); return r.open ? _t("cli.out.devtools_open") : _t("cli.out.devtools_closed"); } },
+  devtools: { usage: "[--action]", descKey: "cli.cmd.devtools", args: [{ flag: "action" }], run: async (a) => {
+    const r = await service.devtools({ action: a.action || "toggle" });
+    // supported=false:该平台无法真正关闭(Windows/wry 空实现)→ 如实提示,不接受误导性的「已关闭」
+    if (r?.supported === false) return _t("cli.out.devtools_unsupported");
+    return r.open ? _t("cli.out.devtools_open") : _t("cli.out.devtools_closed");
+  } },
   reload: { usage: "", descKey: "cli.cmd.reload", run: async (a) => { const r = await service.reload(sidArgs(a)); return r?.url ? _t("cli.out.reload", { url: r.url }) : _t("cli.out.reload_nourl"); } },
   open_window: { usage: "", descKey: "cli.cmd.open_window", run: async (a) => { await openWindow(sidOf(a)); return _t("cli.out.open_window"); } },
   close: { usage: "", descKey: "cli.cmd.close", run: async (a) => {

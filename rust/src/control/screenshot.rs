@@ -192,7 +192,11 @@ fn screenshot_impl(
 /// - 越界区域(`beyond=true`,元素比视口还高/宽):截 `FullDocument` 整页快照,
 ///   裁剪前先把视口坐标换算成**文档**坐标(快照原点=文档 (0,0),与 Windows 的 CDP
 ///   clip 文档坐标口径一致)。
-/// 两条路径都用 cairo 裁剪,不做缩放(Linux 下假定 CSS 像素与设备像素 1:1)。
+///
+/// HiDPI 单位换算(1.10.0 修复):视口/文档坐标都是 **CSS 像素**,而 WebKitGTK 快照面
+/// 按**设备像素**输出(HiDPI 下 = CSS × 缩放),旧实现 1:1 裁剪 → 高 DPI 上裁错位置/尺寸。
+/// 现在裁剪前统一乘 `k`(webview 缩放因子),换算公式:
+/// `设备像素 = round(CSS 像素 × k)`(x/y/w/h 各自换算,非整数缩放四舍五入)。
 ///
 /// 线程模型:本函数的全部调用方(service.rs / ui/annotate.rs / main.rs)都在后台线程调用。
 /// `with_webview` 在非主线程只是把闭包投递到 GTK 主线程(tauri-runtime-wry 的
@@ -221,6 +225,12 @@ fn screenshot_impl(
     page.with_webview(move |platform_webview| {
         // PlatformWebview::inner() 在 Linux 返回 webkit2gtk::WebView
         let webview = platform_webview.inner();
+        // CSS → 设备像素的换算系数:取 widget 缩放(即快照面的渲染缩放);
+        // 分数缩放用 f64 承接,裁剪时四舍五入到整像素。异常值(<=0/非有限)回退 1.0
+        let scale = {
+            let s = f64::from(gtk::prelude::WidgetExt::scale_factor(&webview));
+            if s.is_finite() && s > 0.0 { s } else { 1.0 }
+        };
         webview.snapshot(
             // 越界:整页快照(原点=文档 0,0);常规:视口可见区域
             if beyond {
@@ -233,7 +243,7 @@ fn screenshot_impl(
             gtk::gio::Cancellable::NONE,
             move |result| {
                 let _ = tx.send(match result {
-                    Ok(surface) => encode_surface_png_base64(&surface, clip),
+                    Ok(surface) => encode_surface_png_base64(&surface, clip, scale),
                     Err(e) => Err(format!("snapshot failed: {e}")),
                 });
             },
@@ -248,18 +258,19 @@ fn screenshot_impl(
 
 /// 把 cairo 快照面编码为 PNG 并做标准 base64(可先按 CSS 像素坐标裁剪)
 ///
-/// 参数:`surface` WebKitGTK 返回的快照面;`clip` 选区 (x, y, w, h) —— 坐标系随快照区域而定
-/// (常规=视口 CSS 像素/Visible 快照,越界=文档 CSS 像素/FullDocument 快照),
-/// `None` 表示整幅快照不裁剪
+/// 参数:`surface` WebKitGTK 返回的快照面(设备像素);`clip` 选区 (x, y, w, h) ——
+/// 坐标系随快照区域而定(常规=视口 CSS 像素/Visible 快照,越界=文档 CSS 像素/FullDocument 快照),
+/// `None` 表示整幅快照不裁剪;`scale` CSS → 设备像素的换算系数(HiDPI 缩放)
 /// 返回:PNG 数据的标准 base64 字符串(不带 `data:` 前缀,与 Windows 分支输出格式一致)
 #[cfg(target_os = "linux")]
 fn encode_surface_png_base64(
     surface: &cairo::Surface,
     clip: Option<(i32, i32, i32, i32)>,
+    scale: f64,
 ) -> Result<String, String> {
     // 有选区:先裁出选区新面;无选区:直接用原面
     let cropped = match clip {
-        Some((x, y, w, h)) => Some(crop_surface(surface, x, y, w, h)?),
+        Some((x, y, w, h)) => Some(crop_surface(surface, x, y, w, h, scale)?),
         None => None,
     };
     let source: &cairo::Surface = match cropped.as_ref() {
@@ -274,11 +285,22 @@ fn encode_surface_png_base64(
     Ok(STANDARD.encode(&png))
 }
 
-/// 用 cairo 从快照面裁出指定 CSS 像素区域(1:1 设备像素,不做缩放)
+/// CSS 像素 → 设备像素并四舍五入(HiDPI 裁剪的坐标换算)
 ///
-/// 参数:`src` 源快照面;`x`/`y` 选区左上角(坐标系与快照面一致:常规=视口,越界=文档;
-/// 可为负);`w`/`h` 选区尺寸(负值按 0 处理)
-/// 返回:裁剪后的 ARGB32 图像面
+/// 参数:`css` CSS 像素值(可为负);`scale` 缩放系数(<=0/非有限按 1.0 处理)
+/// 返回:`round(css × scale)`
+#[cfg(target_os = "linux")]
+fn css_to_device(css: i32, scale: f64) -> i32 {
+    let k = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+    (f64::from(css) * k).round() as i32
+}
+
+/// 用 cairo 从快照面裁出指定区域(选区为 CSS 像素,内部换算为设备像素)
+///
+/// 参数:`src` 源快照面(设备像素);`x`/`y` 选区左上角 CSS 像素(坐标系与快照面一致:
+/// 常规=视口,越界=文档;可为负);`w`/`h` 选区尺寸 CSS 像素(负值按 0 处理);
+/// `scale` CSS → 设备像素的换算系数
+/// 返回:裁剪后的 ARGB32 图像面(尺寸 = 选区 CSS 尺寸 × scale,四舍五入)
 #[cfg(target_os = "linux")]
 fn crop_surface(
     src: &cairo::Surface,
@@ -286,15 +308,17 @@ fn crop_surface(
     y: i32,
     w: i32,
     h: i32,
+    scale: f64,
 ) -> Result<cairo::ImageSurface, String> {
-    let (w, h) = (w.max(0), h.max(0));
+    let (w, h) = (css_to_device(w.max(0), scale), css_to_device(h.max(0), scale));
+    let (dx, dy) = (css_to_device(x, scale), css_to_device(y, scale));
     let out = cairo::ImageSurface::create(cairo::Format::ARgb32, w, h)
         .map_err(|e| format!("create crop surface failed: {e}"))?;
-    // 把源面按 (-x, -y) 偏移绘制到新面,等价于裁剪
+    // 把源面按 (-dx, -dy) 偏移绘制到新面,等价于裁剪(均为设备像素)
     {
         let cr = cairo::Context::new(&out)
             .map_err(|e| format!("create cairo context failed: {e}"))?;
-        cr.set_source_surface(src, -f64::from(x), -f64::from(y))
+        cr.set_source_surface(src, -f64::from(dx), -f64::from(dy))
             .map_err(|e| format!("set cairo source failed: {e}"))?;
         cr.paint()
             .map_err(|e| format!("cairo paint failed: {e}"))?;

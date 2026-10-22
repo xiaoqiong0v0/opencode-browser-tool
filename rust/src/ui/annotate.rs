@@ -364,17 +364,24 @@ impl Annotator {
     ) {
         let url = ui::active_tab_url(app);
         let mut records = state.records.lock().unwrap();
-        let index = records.len() as u32 + 1;
-        records.push(AnnotationRecord {
-            index,
-            typ: typ.to_string(),
-            url,
-            selector: selector.to_string(),
-            rect,
-            note: note.to_string(),
-            image,
-            sent: false,
-        });
+        // index 单调递增:按 len 推算会在丢弃最旧记录后与队列里的旧 index 重号
+        let index = records.last().map_or(1, |r| r.index.saturating_add(1));
+        let dropped = push_record_capped(
+            &mut records,
+            AnnotationRecord {
+                index,
+                typ: typ.to_string(),
+                url,
+                selector: selector.to_string(),
+                rect,
+                note: note.to_string(),
+                image,
+                sent: false,
+            },
+        );
+        if dropped > 0 {
+            eprintln!("[annotate] records overflow: dropped {dropped} oldest (cap {MAX_RECORDS})");
+        }
         // 面板列表只推送"未发送"记录(发送后的记录仅保留在 records 里供工具读取)
         let list: Vec<AnnotationRecord> = records.iter().filter(|r| !r.sent).cloned().collect();
         drop(records);
@@ -384,8 +391,71 @@ impl Annotator {
     }
 }
 
+/// 批注/截图记录上限(超出丢最旧):截图记录内含 PNG base64,记录只增不清会让内存无界增长
+const MAX_RECORDS: usize = 200;
+
+/// 追加一条记录并按上限裁剪(超出丢最旧)
+///
+/// 参数:`records` 记录表(就地追加/裁剪);`record` 新记录
+/// 返回:为保持上限而丢弃的最旧记录条数(0 表示未溢出)
+fn push_record_capped(records: &mut Vec<AnnotationRecord>, record: AnnotationRecord) -> usize {
+    records.push(record);
+    if records.len() <= MAX_RECORDS {
+        return 0;
+    }
+    let dropped = records.len() - MAX_RECORDS;
+    records.drain(..dropped);
+    dropped
+}
+
 /// 注册批注相关事件监听
 pub fn register(_app: &AppHandle, state: tauri::State<'_, UiState>) {
     let _ = state;
     let _ = json!({});
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_RECORDS, push_record_capped};
+    use crate::ui::AnnotationRecord;
+
+    /// 造一条最小记录(只需 index 用于断言)
+    fn rec(index: u32) -> AnnotationRecord {
+        AnnotationRecord {
+            index,
+            typ: "annotate".into(),
+            url: "about:blank".into(),
+            selector: "div".into(),
+            rect: (0, 0, 1, 1),
+            note: "n".into(),
+            image: None,
+            sent: false,
+        }
+    }
+
+    /// 未超上限:全部保留、不丢弃
+    #[test]
+    fn records_keep_under_cap() {
+        let mut records = Vec::new();
+        for i in 1..=5u32 {
+            assert_eq!(push_record_capped(&mut records, rec(i)), 0);
+        }
+        assert_eq!(records.len(), 5);
+        assert_eq!(records.first().unwrap().index, 1);
+    }
+
+    /// 超上限:丢最旧,长度恒等于 MAX_RECORDS,最新记录仍在
+    #[test]
+    fn records_cap_drops_oldest() {
+        let mut records = Vec::new();
+        let total = MAX_RECORDS as u32 + 2;
+        let mut dropped_total = 0usize;
+        for i in 1..=total {
+            dropped_total += push_record_capped(&mut records, rec(i));
+        }
+        assert_eq!(records.len(), MAX_RECORDS);
+        assert_eq!(dropped_total, 2);
+        assert_eq!(records.first().unwrap().index, 3);
+        assert_eq!(records.last().unwrap().index, total);
+    }
 }

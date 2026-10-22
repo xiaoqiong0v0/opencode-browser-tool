@@ -10,7 +10,7 @@ pub mod new_window;
 #[cfg(target_os = "linux")]
 pub mod linux_layout;
 
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock, mpsc};
 
 use serde::Serialize;
 use tauri::window::WindowBuilder;
@@ -212,7 +212,7 @@ const PAGE_BRIDGE_JS: &str = r##"
 "##;
 
 /// 页面事件上报脚本(注入页面 Webview):SPA 路由 / 标题 / 图标变化时**主动上报**给 shell。
-/// 通道:HTTP POST 到 127.0.0.1:<port>/api/page-event(http.rs 已开 CORS,跨源可用;
+/// 通道:HTTP POST 到 127.0.0.1:<port>/api/page-event(http.rs 已移除 CORS、OPTIONS 一律 405,该路径是鉴权的唯一精确路径豁免(免令牌、免 Origin 校验),故只能走 no-cors 简单 POST;
 /// Tauri 自带 IPC 在远程页面被能力门禁挡住,实测 invoke 一直 pending,故不用)。
 /// 端口/label 由 Rust 逐 webview 注入(window.__btEventPort / window.__btPageLabel)。
 const PAGE_EVENT_JS: &str = r##"
@@ -1365,38 +1365,107 @@ pub fn close_panel(app: &AppHandle) {
     emit_tabs_changed(app);
 }
 
+/// 待发送队列上限(超出丢最旧):插件长期不 drain 时队列不得无界增长
+pub const SENT_QUEUE_MAX: usize = 500;
+
+/// 插件通知的重试退避(ms):首次失败后依次等 300 / 600 / 1200 再重试(共 3 次重试 + 首次投递)
+const NOTIFY_RETRY_DELAYS_MS: [u64; 3] = [300, 600, 1200];
+
+/// 通知 worker 的投递通道(单线程 FIFO:多次发送的通知按入队顺序 POST,不阻塞 UI 线程)
+static NOTIFY_TX: OnceLock<mpsc::Sender<(String, usize)>> = OnceLock::new();
+
 /// 主动通知插件"有新记录待 drain"(推送式投递,替代插件轮询)。
-/// fire-and-forget:短超时(2s)、最多重试 2 次;仅传最小信息(count),大内容仍由插件走 drain 拉取。
+///
+/// fire-and-forget:交给后台单线程 worker 顺序投递(不阻塞 UI/事件线程);
+/// 首发失败后按 300/600/1200ms 退避重试 3 次;仅传最小信息(count),
+/// 大内容仍由插件走 drain 拉取。
 fn notify_plugin(app: &AppHandle, count: usize) {
     let url = app.state::<UiState>().notify_url.lock().unwrap().clone();
     let Some(url) = url else {
         eprintln!("[notify] skipped: notify-url not configured");
         return;
     };
-    tauri::async_runtime::spawn(async move {
-        let client = match reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(2))
-            .build()
-        {
-            Ok(c) => c,
+    let tx = NOTIFY_TX.get_or_init(notify_worker);
+    if let Err(e) = tx.send((url.clone(), count)) {
+        eprintln!("[notify] worker unavailable ({e}), dropped count={count} -> {url}");
+    }
+}
+
+/// 启动通知 worker(仅首次调用;之后的通知全部排进同一条 FIFO 队列顺序投递)
+///
+/// 用独立线程 + current-thread tokio runtime 跑 reqwest:通知是纯后台行为,
+/// 既不能阻塞 UI 线程,也不能因重试退避推迟 send_all_records 的返回。
+fn notify_worker() -> mpsc::Sender<(String, usize)> {
+    let (tx, rx) = mpsc::channel::<(String, usize)>();
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(rt) => rt,
             Err(e) => {
-                eprintln!("[notify] client build failed: {e}");
+                eprintln!("[notify] worker runtime init failed: {e}");
                 return;
             }
         };
-        for attempt in 1..=2 {
-            match client.post(&url).json(&serde_json::json!({ "count": count })).send().await {
-                Ok(r) if r.status().is_success() => {
-                    eprintln!("[notify] posted count={count} -> {url} (attempt {attempt})");
-                    return;
-                }
-                Ok(r) => eprintln!("[notify] HTTP {} -> {url} (attempt {attempt})", r.status()),
-                Err(e) => eprintln!("[notify] post failed -> {url} (attempt {attempt}): {e}"),
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        while let Ok((url, count)) = rx.recv() {
+            rt.block_on(post_notify(&url, count));
         }
-        eprintln!("[notify] giving up after 2 attempts: {url}");
     });
+    tx
+}
+
+/// 单条通知 POST:首次 + 最多 3 次重试(失败后等 300/600/1200ms,单次超时 2s)
+async fn post_notify(url: &str, count: usize) {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[notify] client build failed: {e}");
+            return;
+        }
+    };
+    // 1 次首发 + NOTIFY_RETRY_DELAYS_MS.len() 次重试
+    let max_attempts = NOTIFY_RETRY_DELAYS_MS.len() + 1;
+    for attempt in 1..=max_attempts {
+        match client.post(url).json(&serde_json::json!({ "count": count })).send().await {
+            Ok(r) if r.status().is_success() => {
+                eprintln!("[notify] posted count={count} -> {url} (attempt {attempt})");
+                return;
+            }
+            Ok(r) => eprintln!("[notify] HTTP {} -> {url} (attempt {attempt})", r.status()),
+            Err(e) => eprintln!("[notify] post failed -> {url} (attempt {attempt}): {e}"),
+        }
+        // 还有重试机会才退避(退避顺序 300 / 600 / 1200)
+        if let Some(delay) = NOTIFY_RETRY_DELAYS_MS.get(attempt - 1) {
+            tokio::time::sleep(std::time::Duration::from_millis(*delay)).await;
+        }
+    }
+    eprintln!("[notify] giving up after {max_attempts} attempts: {url}");
+}
+
+/// 把新记录追加进待发送队列(按记录 `index` 去重,超出 `SENT_QUEUE_MAX` 丢最旧)
+///
+/// 参数:`queue` 待发送队列(就地追加);`items` 本次新标记为已发送的记录
+/// 说明:旧实现是覆盖写 —— 插件上一批还没 drain 完就再点发送,队列里未消费的记录会被整批丢掉。
+fn append_sent_records(queue: &mut Vec<serde_json::Value>, items: Vec<serde_json::Value>) {
+    for item in items {
+        let idx = item.get("index").and_then(serde_json::Value::as_u64);
+        // 同一批被重复 send 时按 index 去重:队列里已有的记录不再重复入队
+        let duplicated = idx.is_some_and(|i| {
+            queue
+                .iter()
+                .any(|q| q.get("index").and_then(serde_json::Value::as_u64) == Some(i))
+        });
+        if duplicated {
+            continue;
+        }
+        queue.push(item);
+    }
+    if queue.len() > SENT_QUEUE_MAX {
+        let dropped = queue.len() - SENT_QUEUE_MAX;
+        queue.drain(..dropped);
+        eprintln!("[send] sent_records overflow: dropped {dropped} oldest (cap {SENT_QUEUE_MAX})");
+    }
 }
 
 /// 发送未发送过的记录:快照入 sent_records 队列(插件侧 drain 消费),并把记录标记为已发送
@@ -1434,7 +1503,11 @@ pub fn send_all_records(app: &AppHandle) -> usize {
             .collect::<Vec<_>>()
     );
     drop(records);
-    *state.sent_records.lock().unwrap() = items;
+    // 追加进待发送队列(不再覆盖写):插件上一批还没 drain 时,未消费记录不会被冲掉
+    {
+        let mut queue = state.sent_records.lock().unwrap();
+        append_sent_records(&mut queue, items);
+    }
     // 面板刷新为空列表(记录仍在 Rust 侧保留,仅标记已发送)
     use tauri::Emitter;
     if let Some(panel) = panel_webview(app) {
@@ -1496,7 +1569,7 @@ pub fn open_new_tab(app: &AppHandle, url: &str) -> Result<(), String> {
     if let Some(cur) = active_page_webview(app) {
         let _ = cur.hide();
     }
-    // 优先复用预创建 webview,超出 MAX_TABS 则动态创建
+    // 优先复用预创建 webview(池成员 page-1..MAX_TABS),超出则动态创建
     let label = format!("{PAGE_WEBVIEW}-{id}");
     let wv = match app.get_webview(&label) {
         Some(w) => w,
@@ -1562,70 +1635,89 @@ pub fn switch_tab(app: &AppHandle, id: u32) -> Result<(), String> {
 }
 
 /// 关闭标签:销毁其 webview,切换到邻近标签(关闭最后一个则自动新建空白标签)
+///
+/// 锁纪律(1.10.0 死锁修复):`tabs` 锁只在更新标签表的块内持有,块结束即释放;
+/// 之后所有 `emit_tabs_changed` 调用都在**无锁**状态进行(`emit_tabs_changed` 内部会
+/// 再次 `tabs.lock()`,std::sync::Mutex 不可重入 —— 持锁调用即同线程自死锁)。
 pub fn close_tab(app: &AppHandle, id: u32) -> Result<(), String> {
     let state = app.state::<UiState>();
-    let mut tabs = state.tabs.lock().unwrap();
-    let pos = tabs.iter().position(|t| t.id == id);
-    let Some(pos) = pos else { return Err("tab not found".into()) };
-    let closed_label = tabs[pos].webview.clone();
-    tabs.remove(pos);
-    let active = *state.active_tab.lock().unwrap();
-    if active != id {
-        // 关闭非激活标签:仅移除记录,不切换
+    // 1) 更新标签表 + 计算新的激活标签(块结束即释放 tabs 锁)
+    //    元组第 2 项 = 新的激活标签 id;None 表示"关闭的是非激活标签,不切换"
+    let (closed_label, new_active) = {
+        let mut tabs = state.tabs.lock().unwrap();
+        let Some(pos) = tabs.iter().position(|t| t.id == id) else {
+            return Err("tab not found".into());
+        };
+        let closed_label = tabs[pos].webview.clone();
+        tabs.remove(pos);
+        let active = *state.active_tab.lock().unwrap();
+        if active != id {
+            // 关闭非激活标签:仅移除记录,不切换
+            (closed_label, None)
+        } else {
+            let new_active = if tabs.is_empty() {
+                // 关闭最后一个:自动新建空白标签
+                let nid = {
+                    let mut n = state.next_tab_id.lock().unwrap();
+                    let nid = *n;
+                    *n += 1;
+                    nid
+                };
+                tabs.push(TabState { id: nid, url: NEWTAB_URL.to_string(), title: "新标签页".into(), icon: String::new(), errored: false, webview: None });
+                nid
+            } else {
+                // 优先激活右侧标签,否则左侧
+                tabs[pos.min(tabs.len() - 1)].id
+            };
+            *state.active_tab.lock().unwrap() = new_active;
+            (closed_label, Some(new_active))
+        }
+    };
+
+    // 2) 释放被关闭标签的 webview(池内保留、动态创建的销毁;此时 tabs 锁已释放)
+    if let Some(label) = closed_label.as_deref() {
+        release_tab_webview(app, label);
+    }
+
+    let Some(new_active) = new_active else {
+        // 关闭非激活标签:不切换,只广播(tabs 锁已释放,emit 安全)
         emit_tabs_changed(app);
         return Ok(());
-    }
-    let new_active;
-    if tabs.is_empty() {
-        // 关闭最后一个:自动新建空白标签
-        let nid = {
-            let mut n = state.next_tab_id.lock().unwrap();
-            let nid = *n;
-            *n += 1;
-            nid
-        };
-        tabs.push(TabState { id: nid, url: NEWTAB_URL.to_string(), title: "新标签页".into(), icon: String::new(), errored: false, webview: None });
-        new_active = nid;
-    } else {
-        // 优先激活右侧标签,否则左侧
-        new_active = tabs[pos.min(tabs.len() - 1)].id;
-    }
-    *state.active_tab.lock().unwrap() = new_active;
-    let target_label = tabs.iter().find(|t| t.id == new_active).and_then(|t| t.webview.clone());
-    drop(tabs);
+    };
 
-    // 新建空白标签:优先复用预创建 webview,否则动态创建
-    if target_label.is_none() {
-        let label = format!("{PAGE_WEBVIEW}-{new_active}");
-        let wv = match app.get_webview(&label) {
-            Some(w) => w,
-            None => create_tab_webview(app, new_active)?,
-        };
-        show_webview(app, wv.label()).map_err(|e| format!("show webview failed: {e}"))?;
-        {
-            let mut tabs = state.tabs.lock().unwrap();
-            if let Some(t) = tabs.iter_mut().find(|t| t.id == new_active) {
-                t.webview = Some(label);
+    // 3) 目标标签的 webview label(新标签还没绑定 webview 时为空)
+    let target_label = state
+        .tabs
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|t| t.id == new_active)
+        .and_then(|t| t.webview.clone());
+
+    match target_label {
+        // 已存在的标签:直接显示(若未隐藏则无操作)
+        Some(label) => {
+            let _ = show_webview(app, &label);
+        }
+        // 新建空白标签:优先复用预创建 webview,否则动态创建;随后导航到新标签页
+        None => {
+            let label = format!("{PAGE_WEBVIEW}-{new_active}");
+            let wv = match app.get_webview(&label) {
+                Some(w) => w,
+                None => create_tab_webview(app, new_active)?,
+            };
+            show_webview(app, wv.label()).map_err(|e| format!("show webview failed: {e}"))?;
+            {
+                let mut tabs = state.tabs.lock().unwrap();
+                if let Some(t) = tabs.iter_mut().find(|t| t.id == new_active) {
+                    t.webview = Some(label);
+                }
             }
+            tokio::task::block_in_place(|| crate::control::navigate(app, NEWTAB_URL))?;
         }
     }
-    // 显示目标 webview(若未隐藏则无操作)
-    if let Some(l) = &target_label {
-        if let Some(w) = app.get_webview(l) {
-            let _ = show_webview(app, w.label());
-        }
-    }
-    // 隐藏被关闭标签的 webview(保留实例,避免 z 序变化影响 overlay/panel)
-    if let Some(l) = closed_label {
-        if let Some(w) = app.get_webview(&l) {
-            let _ = w.hide();
-        }
-    }
-    // 新建空白标签导航新标签页
-    if target_label.is_none() {
-        tokio::task::block_in_place(|| crate::control::navigate(app, NEWTAB_URL))?;
-    }
-    // 应用布局:确保激活标签 webview 尺寸正确
+
+    // 4) 应用布局:确保激活标签 webview 尺寸正确(内部会重新置顶 overlay/panel)
     if let Some(win) = app.get_window("main") {
         let size = win.inner_size().map_err(|e| e.to_string())?;
         let scale = win.scale_factor().unwrap_or(1.0);
@@ -1633,6 +1725,36 @@ pub fn close_tab(app: &AppHandle, id: u32) -> Result<(), String> {
     }
     emit_tabs_changed(app);
     Ok(())
+}
+
+/// 标签页 webview 的 label 是否属于预创建池(`page-1` .. `page-MAX_TABS`)
+///
+/// 说明:池成员由 `create_ui` 预创建、跨标签复用;关闭后保留实例回池,不销毁。
+fn is_pool_label(label: &str) -> bool {
+    let Some(rest) = label.strip_prefix(PAGE_WEBVIEW).and_then(|r| r.strip_prefix('-')) else {
+        return false;
+    };
+    rest.parse::<u32>().is_ok_and(|id| (1..=MAX_TABS).contains(&id))
+}
+
+/// 释放被关闭标签的 webview:池内保留(隐藏待复用),动态创建的真正 `close()` 销毁
+///
+/// 参数:`app` 应用句柄;`label` 被关闭标签的 webview label
+/// 说明:1.10.0 前只 `hide()`,标签 id 单调递增且池只有 `MAX_TABS` 个,
+/// 反复开关标签会让动态 webview 全部常驻(每个都是一个页面进程)→ 内存无界增长。
+fn release_tab_webview(app: &AppHandle, label: &str) {
+    let Some(w) = app.get_webview(label) else { return };
+    // 先隐藏:避免关闭瞬间在旧位置闪一帧
+    let _ = w.hide();
+    if is_pool_label(label) {
+        eprintln!("[tabs] closed {label}: kept in prewarmed pool");
+        return;
+    }
+    // 非池内:销毁 webview(释放宿主窗口与页面进程),使 webview 数量不随开关标签增长
+    match w.close() {
+        Ok(()) => eprintln!("[tabs] closed {label}: webview destroyed"),
+        Err(e) => eprintln!("[tabs] closed {label}: close failed: {e}"),
+    }
 }
 
 /// 规范化地址栏输入:裸域名/主机自动补 http:// 前缀
@@ -1676,4 +1798,60 @@ pub fn eval_page_timeout(app: &AppHandle, js: &str, timeout_ms: u64) -> Result<S
 pub fn eval_overlay(app: &AppHandle, js: &str) -> Result<(), String> {
     let overlay = overlay_webview(app).ok_or("overlay webview not ready")?;
     overlay.eval(js).map_err(|e| format!("overlay eval failed: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SENT_QUEUE_MAX, append_sent_records, is_pool_label};
+
+    /// 造一条最小待发送记录(只需 index 用于去重断言)
+    fn rec(index: u64) -> serde_json::Value {
+        serde_json::json!({ "index": index, "note": format!("n{index}") })
+    }
+
+    fn ids(queue: &[serde_json::Value]) -> Vec<u64> {
+        queue.iter().map(|v| v["index"].as_u64().unwrap()).collect()
+    }
+
+    /// 追加而非覆盖:第二次发送不得清掉上一批未消费记录
+    #[test]
+    fn sent_queue_appends_instead_of_overwrite() {
+        let mut queue: Vec<serde_json::Value> = Vec::new();
+        append_sent_records(&mut queue, vec![rec(1), rec(2)]);
+        append_sent_records(&mut queue, vec![rec(3)]);
+        assert_eq!(ids(&queue), vec![1, 2, 3]);
+    }
+
+    /// 同一批重复发送:按 index 去重,不重复入队
+    #[test]
+    fn sent_queue_dedupes_by_index() {
+        let mut queue: Vec<serde_json::Value> = Vec::new();
+        append_sent_records(&mut queue, vec![rec(1), rec(2)]);
+        append_sent_records(&mut queue, vec![rec(2), rec(3)]);
+        assert_eq!(ids(&queue), vec![1, 2, 3]);
+    }
+
+    /// 队列上限:超出丢最旧并保留最新 SENT_QUEUE_MAX 条
+    #[test]
+    fn sent_queue_caps_and_drops_oldest() {
+        let mut queue: Vec<serde_json::Value> = Vec::new();
+        let total = SENT_QUEUE_MAX as u64 + 3;
+        append_sent_records(&mut queue, (1..=total).map(rec).collect());
+        assert_eq!(queue.len(), SENT_QUEUE_MAX);
+        assert_eq!(queue.first().unwrap()["index"].as_u64(), Some(4));
+        assert_eq!(queue.last().unwrap()["index"].as_u64(), Some(total));
+    }
+
+    /// 池成员判定:仅 page-1..page-MAX_TABS 命中(决定关闭时保留还是销毁)
+    #[test]
+    fn pool_label_detection() {
+        use super::{MAX_TABS, PAGE_WEBVIEW};
+
+        assert!(is_pool_label(&format!("{PAGE_WEBVIEW}-1")));
+        assert!(is_pool_label(&format!("{PAGE_WEBVIEW}-{MAX_TABS}")));
+        assert!(!is_pool_label(&format!("{PAGE_WEBVIEW}-{}", MAX_TABS + 1)));
+        assert!(!is_pool_label(&format!("{PAGE_WEBVIEW}-0")));
+        assert!(!is_pool_label(PAGE_WEBVIEW));
+        assert!(!is_pool_label("toolbar"));
+    }
 }

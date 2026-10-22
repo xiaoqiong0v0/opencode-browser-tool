@@ -147,7 +147,10 @@ fn fill_fallback(
         sel = selector,
         val = value
     );
-    super::eval_with(app, &js, timeout_ms)?;
+    let v = super::eval_with(app, &js, timeout_ms)?;
+    // 降级路径同样必须校验:eval 正常返回但 JS 内部没找到元素/setter 时会带回 {error}
+    // (旧实现忽略该字段 → 元素不存在也报"填写成功")
+    check_error(&v)?;
     Ok(())
 }
 
@@ -203,7 +206,10 @@ fn fill_in_iframe_fallback(
         sel = selector,
         val = value
     );
-    super::eval_with(app, &js, timeout_ms)?;
+    let v = super::eval_with(app, &js, timeout_ms)?;
+    // 同 fill_fallback:iframe/元素缺失、跨域不可访问等都在返回体的 error 字段里,
+    // 不校验就会把"没填进去"当成功
+    check_error(&v)?;
     Ok(())
 }
 
@@ -311,7 +317,10 @@ fn select_all(app: &AppHandle, selector: &str, timeout_ms: Option<u64>) -> Contr
         }})()"#,
         sel = selector
     );
-    super::eval_with(app, &js, timeout_ms)?;
+    let v = super::eval_with(app, &js, timeout_ms)?;
+    // 元素不存在时 JS 返回 {error};不校验会让后续 insertText/Delete 落到别的元素上,
+    // 最终以"读回校验失败"的含糊文案报错(clear 也走这条路径)
+    check_error(&v)?;
     Ok(())
 }
 
@@ -491,7 +500,9 @@ fn select_all_in_iframe(
         iframe = iframe_selector,
         sel = selector
     );
-    super::eval_with(app, &js, timeout_ms)?;
+    let v = super::eval_with(app, &js, timeout_ms)?;
+    // iframe/元素缺失、跨域不可访问都在 error 字段(旧实现忽略 → 全选静默失败)
+    check_error(&v)?;
     Ok(())
 }
 

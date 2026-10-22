@@ -59,6 +59,7 @@ sha256 校验（**幂等**：sha 与当前 release 期望值一致即跳过；**
 - `BT_BROWSERS_PATH` — 浏览器缓存目录
 - `BT_SHELL_URL` — **附着模式**：连接到已运行的 shell（完整基地址，如 `http://127.0.0.1:18280`），优先级最高
 - `BT_SHELL_PORT` — **附着模式**：仅指定端口，等价于 `http://127.0.0.1:<port>`
+- `BT_SHELL_TOKEN` — **鉴权令牌**：本地 API 所有 `/api/*` 请求必须带 `x-bt-token`。**附着模式下必须设置**，且外部 shell 启动时要用同一值（`--token <token>` 或同值环境变量）；启动模式下由插件随机生成并通过 `--token` 传给 shell，无需手动设置
 - `BT_SHELL_PATH` — **启动模式**：指定要 spawn 的 Rust shell 二进制路径（开发用；优先级最高，覆盖自动下载与本地构建）
 - `BT_SHELL_NO_DOWNLOAD` — 设为 `1` 时不自动下载（状态 `disabled`；需自行放置二进制或配合 `BT_SHELL_PATH`）
 - `BT_SHELL_DOWNLOAD_BASE` — 覆盖下载根（默认 GitHub Release `https://github.com/xiaoqiong0v0/opencode-browser-tool/releases/download`），可指向镜像/自建
@@ -66,18 +67,24 @@ sha256 校验（**幂等**：sha 与当前 release 期望值一致即跳过；**
 - `BT_SHELL_NOTIFY_URL` — 插件通知地址（**推送式投递**；一般由插件自动通过 `--notify-url` / `/api/notify-url` 设置，仅在手动启动 shell 时需自行指定）
 
 > **附着模式 vs 启动模式**：设置了 `BT_SHELL_URL`（优先）或 `BT_SHELL_PORT` 时进入附着模式——插件**不 spawn** 任何进程，直接连接该地址的外部 shell；两者都未设置时按启动模式 spawn 本地二进制（`BT_SHELL_PATH` 可覆盖查找路径）。附着模式下 `bt_close` 只断开本地连接（**不关闭外部窗口、不结束外部进程**；进程不归插件管理）。
+>
+> **附着模式必须设置 `BT_SHELL_TOKEN`**：外部 shell 启动时的令牌必须与插件侧环境变量一致（见下方示例），否则插件启动即报 `client.attach_need_token`，不会去连一个注定 401 的端点。令牌未设置时 shell 会随机生成，因此手动启动的 shell 务必显式传 `--token`（或用同值环境变量）。
+
+**本地 API 语义**：`/api/*` 只监听 `127.0.0.1`，且只服务插件进程——所有请求必须带 `x-bt-token`（服务端常量时间比较）；**任何带 `Origin` 头的请求一律 403**（浏览器跨源必带，插件 Node `fetch` 不带），服务端**不返回任何 CORS 头**、`OPTIONS` 直接 405。令牌在 shell 实例创建期确定、运行期不可变；若提供了 `--user-data-dir`，令牌还会写到 `<user-data-dir>/bt-auth-token`（Unix `chmod 600`）供排查。日志只打印令牌前 4 位与长度。**同进程的两个合法调用方各有例外**：面板 Webview 通过 Tauri `invoke("api_token")` 读取本实例令牌（只存 JS 内存，不写 DOM/HTML/日志）后再带 `x-bt-token` 调用；页面注入脚本无法持有令牌，故服务端仅对**精确路径 `/api/page-event`** 豁免 `Origin` 与令牌校验（不做前缀匹配），该端点只更新标签 url/title/icon、不执行任何操作。
 
 **WSL / Linux 附着示例**（shell 跑在 WSL，插件跑在 Windows 宿主）：
 
 ```bash
-# WSL 内：构建并启动 Linux 版 shell，监听 18280
+# WSL 内：构建并启动 Linux 版 shell，监听 18280（令牌须与宿主 BT_SHELL_TOKEN 完全一致）
 cd rust && cargo build --release
-./target/release/bt-shell --port 18280
+BT_SHELL_TOKEN=my-secret-token ./target/release/bt-shell --port 18280
+# 等价：./target/release/bt-shell --port 18280 --token my-secret-token
 ```
 
 ```bash
 # Windows 宿主：设置环境变量后重启 opencode（WSL2 支持从宿主经 localhost 访问）
 set BT_SHELL_URL=http://127.0.0.1:18280
+set BT_SHELL_TOKEN=my-secret-token
 ```
 
 ⚠ WSL 内启动 shell 时**不要**设置 `WEBKIT_DISABLE_DMABUF_RENDERER` / `WEBKIT_DISABLE_COMPOSITING_MODE`——它们会破坏透明合成（覆盖层渲染成黑块/透出桌面），详见 [docs/linux-support.md](./docs/linux-support.md)。
@@ -97,10 +104,10 @@ opencode（Bun）
 
 - 浏览器渲染引擎（WebView2 / WebKitGTK / WKWebView，随平台）直接绘制到插件窗口
 - 页面零注入残留脚本，弹框类元素可正常批注
-- 所有工具调用通过 `POST http://127.0.0.1:PORT/api/{command}` 通信
-- 除 spawn 本地 shell 外，也可用 `BT_SHELL_URL` / `BT_SHELL_PORT` **附着到已运行的 shell**（不 spawn，适用于 shell 跑在 WSL/Linux、插件跑在 Windows）
+- 所有工具调用通过 `POST http://127.0.0.1:PORT/api/{command}` 通信，并统一带鉴权头 `x-bt-token`（无 CORS、拒绝任何带 `Origin` 的请求；唯一例外是页面事件桥 `/api/page-event`，见上）
+- 除 spawn 本地 shell 外，也可用 `BT_SHELL_URL` / `BT_SHELL_PORT` **附着到已运行的 shell**（不 spawn，适用于 shell 跑在 WSL/Linux、插件跑在 Windows；**必须同时设置 `BT_SHELL_TOKEN`**，外部 shell 用同一令牌启动）
 - 跨平台：Windows / Linux / macOS
-- 真多标签：每标签独立 page Webview，切换不重载；`target=_blank` / `window.open` 链接通过 WebView2 原生事件拦截并打开为新标签
+- 真多标签：每标签独立 page Webview，切换不重载；`target=_blank` / `window.open` 链接通过 WebView2 原生事件拦截并打开为新标签。**关闭标签会释放该标签的页面实例**（预创建池的 3 个 webview 保留复用，池外动态创建的实例直接销毁），反复开关标签不会累积页面进程
 - 地址栏/标题/图标**事件驱动同步（无轮询）**：导航用 `on_navigation`（请求即更新）+ `on_page_load`（完成后读真实 `location.href`/`title`）；站内 SPA（`pushState`/`replaceState`/`popstate`/`hashchange`）与标题/图标变化由注入脚本上报 `POST /api/page-event`。`TabState.url` 只反映**最后一次真实导航请求**，内部/错误 scheme（`chrome-error:`/`about:`/`tauri:`/`data:` 等）不覆盖地址栏
 - 刷新语义：标签处于错误页（`errored`）时，工具栏刷新 / `bt_reload` **重新导航原 URL**（而非刷错误页）；否则走原生 reload
 - 窗口无标题栏，自定义窗口按钮在标签行右侧；最小尺寸 360×432（逻辑像素；内容区最小 360×360，含 72px 工具栏）
@@ -120,7 +127,7 @@ opencode（Bun）
 
 ### 工具参数
 
-> **`--timeout ms`（可选，1.9.0 起）** —— 共 **17 条命令声明**带 `timeout` 参数（`src/index.ts:104-186`；其中 `bt_wait_for_selector` 原本就有该参数，其余 16 条为 1.9.0 起新增），均支持按次传 `--timeout`，钳制到 `[100, 60000]` 毫秒（`rust/src/service.rs:96-97,104-115`）；未传走服务端默认（15s），传小值可让慢操作**快失败**（如 `--timeout 800` 让卡住的 `evaluate` 在约 0.8s 返回 `eval timeout`），被钳制时输出会如实标注。
+> **`--timeout ms`（可选，1.9.0 起）** —— 共 **17 条命令声明**带 `timeout` 参数（`src/index.ts:106-193`；其中 `bt_wait_for_selector` 原本就有该参数，其余 16 条为 1.9.0 起新增），均支持按次传 `--timeout`，钳制到 `[100, 60000]` 毫秒（`rust/src/service.rs:96-97,104-115`）；未传走服务端默认（15s），传小值可让慢操作**快失败**（如 `--timeout 800` 让卡住的 `evaluate` 在约 0.8s 返回 `eval timeout`），被钳制时输出会如实标注。
 
 | 工具 | 参数（类型） | 说明 |
 |------|------|------|
@@ -142,7 +149,7 @@ opencode（Bun）
 | `bt_go_forward` | 无 | 浏览器前进，返回当前 URL |
 | `bt_resize` | `width`, `height`(number) 必填 | 调整**页面内容区（视口）**尺寸（非 OS 窗口；下限 360×360，低于下限被钳制并在返回标 `clamped`） |
 | `bt_set_device` | `name`(string) 可选 | 应用设备预设（空参数列出 14 种预设；**预设尺寸为内容区（视口）尺寸**） |
-| `bt_devtools` | `action`(string)：`toggle`/`open`/`close` | 开关开发者工具 |
+| `bt_devtools` | `action`(string)：`toggle`/`open`/`close` | 开关开发者工具。**Windows 无法真正关闭**（wry/WebView2 无关闭 API），`close` 会如实返回不支持并提示用 F12 手动切换；Linux 可正常开关 |
 | `bt_reload` | 无 | 刷新当前页面；若当前为错误页则**重新导航原 URL**（返回 `retried`） |
 | `bt_close` | 无 | 关闭浏览器外壳（`bt_close` 与手动关窗同一语义）。关闭后后续工具调用返回指引（`browser closed … call open_window`），**绝不自动重开**，需 `bt_open_window` 显式打开；attach 模式下只断开本地关联（不关闭外部窗口/进程） |
 | `bt_show_notification` | `message`(string), `type`(string)：`ok`/`bad`/`err` | 显示页面通知气泡 |
@@ -155,7 +162,7 @@ opencode（Bun）
 | `bt_list_tabs` | 无 | 列出标签页（索引+URL） |
 | `bt_switch_tab` | `index`(number) 必填 | 按位置（0 起）切换标签 |
 | `bt_new_tab` | `url`(string) 必填 | 新建独立标签页（真多标签）并导航 |
-| `bt_close_tab` | `index`(number) 可选 | 关闭指定标签；缺省关闭当前激活标签 |
+| `bt_close_tab` | `index`(number) 可选 | 关闭指定标签；缺省关闭当前激活标签。关闭会**释放该标签的页面实例**（池内 webview 回池复用，池外实例销毁） |
 | `bt_get_element_state` | `selector`(string) 必填 | 返回元素可见性/文本/位置 |
 | `bt_scroll_to_element` | `selector`(string) 必填 | 滚动到元素 |
 | `bt_get_dropdown_options` | `selector`(string) 必填 | 列出下拉框选项 |

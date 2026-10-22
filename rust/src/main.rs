@@ -1,6 +1,7 @@
 //! bt-shell 主入口:Tauri 应用(跨平台多 Webview)
 //! 单窗口:页面 Webview + 覆盖层 Webview + 面板 Webview
 //! 启动参数兼容旧协议:--browsers-path, --browser, --session-isolation, --port
+//! 1.10.0 新增 --token:HTTP API 鉴权令牌(缺省读 BT_SHELL_TOKEN,再缺省随机生成)
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 // MSVC link.exe 会把"正在创建库 .lib/.exp"打到 stdout,cargo 以 linker_messages 警告呈现——非代码问题,屏蔽以保持 0 警告
 #![allow(linker_messages)]
@@ -12,9 +13,19 @@ use bt_shell::ui::annotate::Annotator;
 use bt_shell::ui::{self, AnnotationRecord};
 use tauri::{Listener, Manager, State};
 
+/// 令牌落盘文件名(位于 --user-data-dir 内,仅用于排查)
+const TOKEN_FILE_NAME: &str = "bt-auth-token";
+
 /// 解析命令行参数(兼容旧 Node 服务协议)
-/// 返回 (browsers_path, port, user_data_dir, notify_url, title)
-fn parse_args() -> (String, u16, Option<String>, Option<String>, Option<String>) {
+/// 返回 (browsers_path, port, user_data_dir, notify_url, title, token)
+fn parse_args() -> (
+    String,
+    u16,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
     let args: Vec<String> = std::env::args().collect();
     let mut browsers_path = String::new();
     let mut port: u16 = 0;
@@ -23,6 +34,8 @@ fn parse_args() -> (String, u16, Option<String>, Option<String>, Option<String>)
     let mut notify_url: Option<String> = std::env::var("BT_SHELL_NOTIFY_URL").ok();
     // 窗口标题:插件传 --title "bt-shell · <会话标识>" 便于任务栏分辨多个会话实例
     let mut title: Option<String> = None;
+    // HTTP API 鉴权令牌:显式 --token 优先(缺省时由 resolve_auth_token 依次回落环境变量/随机)
+    let mut token: Option<String> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -56,11 +69,86 @@ fn parse_args() -> (String, u16, Option<String>, Option<String>, Option<String>)
                     title = Some(args[i].clone());
                 }
             }
+            "--token" => {
+                i += 1;
+                if i < args.len() {
+                    token = Some(args[i].clone());
+                }
+            }
             _ => {}
         }
         i += 1;
     }
-    (browsers_path, port, user_data_dir, notify_url, title)
+    (browsers_path, port, user_data_dir, notify_url, title, token)
+}
+
+/// 解析鉴权令牌,返回 (令牌, 来源标识)
+/// 优先级:命令行 --token → 环境变量 BT_SHELL_TOKEN → 随机生成(16 字节 → 32 hex)
+fn resolve_auth_token(cli_token: Option<String>) -> (String, &'static str) {
+    if let Some(t) = cli_token.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        return (t.to_string(), "cli");
+    }
+    if let Ok(env_token) = std::env::var("BT_SHELL_TOKEN") {
+        let t = env_token.trim();
+        if !t.is_empty() {
+            return (t.to_string(), "env");
+        }
+    }
+    (random_token(), "generated")
+}
+
+/// 生成 32 位十六进制随机令牌(16 字节)
+///
+/// 不引入新依赖:用 `RandomState`(进程启动时由 OS 熵初始化)对递增计数器做哈希,
+/// 拼够 128 bit。仅用于本机回环 API 鉴权,不需要密码学级 CSPRNG 实现。
+fn random_token() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let state = RandomState::new();
+    let mut out = String::with_capacity(32);
+    let mut counter: u8 = 0;
+    while out.len() < 32 {
+        let mut hasher = state.build_hasher();
+        hasher.write_u8(counter);
+        counter = counter.wrapping_add(1);
+        out.push_str(&format!("{:016x}", hasher.finish()));
+    }
+    out.truncate(32);
+    out
+}
+
+/// 日志里的令牌前缀:只留前 4 位;令牌本身不超过 4 位时完全打码
+fn token_prefix(token: &str) -> String {
+    if token.chars().count() <= 4 {
+        "****".to_string()
+    } else {
+        token.chars().take(4).collect()
+    }
+}
+
+/// 把令牌写入 `<user-data-dir>/bt-auth-token`(供排查;Unix 下 chmod 600),失败只记日志
+fn persist_auth_token(user_data_dir: Option<&str>, token: &str) {
+    let Some(dir) = user_data_dir.map(str::trim).filter(|d| !d.is_empty()) else {
+        eprintln!("[auth] user-data-dir not set; token file not written");
+        return;
+    };
+    let dir_path = std::path::Path::new(dir);
+    if let Err(e) = std::fs::create_dir_all(dir_path) {
+        eprintln!("[auth] create user-data-dir failed: {e}");
+        return;
+    }
+    let path = dir_path.join(TOKEN_FILE_NAME);
+    if let Err(e) = std::fs::write(&path, token) {
+        eprintln!("[auth] write token file failed: {e}");
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // 失败不阻断(部分文件系统不支持权限位)
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    eprintln!("[auth] token file written: {}", path.display());
 }
 
 /// 面板拉取批注记录
@@ -153,6 +241,18 @@ fn panel_mode(state: State<ui::UiState>) -> serde_json::Value {
 #[tauri::command]
 fn panel_service_port(state: State<ui::UiState>) -> u16 {
     *state.service_port.lock().unwrap()
+}
+
+/// 面板读取 API 令牌所用的受管状态(实例创建期确定,运行期只读)
+struct ApiToken(Arc<str>);
+
+/// 面板获取 HTTP API 令牌(面板 fetch /api/* 时带 `x-bt-token`)
+///
+/// 面板 Webview 与 shell 同进程,通过 Tauri IPC 读取,不经网络;
+/// 令牌只进入面板 JS 内存,不写入 DOM/HTML,也不写日志。
+#[tauri::command]
+fn api_token(state: State<'_, ApiToken>) -> String {
+    state.0.to_string()
 }
 
 /// 设置主题模式(auto/light/dark),广播给所有 webview 生效
@@ -340,16 +440,29 @@ fn main() {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
 
-    let (browsers_path, port, user_data_dir, notify_url, title) = parse_args();
+    let (browsers_path, port, user_data_dir, notify_url, title, cli_token) = parse_args();
+
+    // HTTP API 鉴权:令牌在实例创建期确定,随实例不可变(attach 模式由插件用同一环境变量提供)。
+    // 日志只打前 4 位 + 长度,绝不打印完整令牌。
+    let (auth_token, token_source) = resolve_auth_token(cli_token);
+    eprintln!(
+        "[auth] token source={token_source} prefix={} len={}",
+        token_prefix(&auth_token),
+        auth_token.chars().count()
+    );
+    persist_auth_token(user_data_dir.as_deref(), &auth_token);
 
     tauri::Builder::default()
         .manage(ui::UiState::new())
+        // 面板通过 invoke("api_token") 读取同一实例令牌(与 http::serve 的令牌同源)
+        .manage(ApiToken(Arc::from(auth_token.as_str())))
         .invoke_handler(tauri::generate_handler![
             panel_records,
             panel_set_note,
             panel_cmd,
             panel_mode,
             panel_service_port,
+            api_token,
             panel_set_theme,
             toolbar_state,
             toolbar_new_tab,
@@ -383,8 +496,9 @@ fn main() {
                 browsers_path,
             ));
             let http_app2 = http_app.clone();
+            let http_token = auth_token.clone();
             tauri::async_runtime::spawn(async move {
-                let _ = bt_shell::http::serve(http_app2, port).await;
+                let _ = bt_shell::http::serve(http_app2, port, http_token).await;
             });
 
             // 事件监听:覆盖层鼠标事件 → 批注状态机

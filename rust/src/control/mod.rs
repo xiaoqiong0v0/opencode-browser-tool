@@ -161,6 +161,72 @@ pub fn validate_selector_fields(body: &serde_json::Value) -> Result<(), String> 
     Ok(())
 }
 
+/// 只能出现在选择器**开头**的非 CSS 引擎前缀(这些片段作为 CSS 子串也有合法用法,
+/// 故只做前缀判定,不做任意位置扫描:避免误伤 `input[id=main]` 这类合法属性选择器)
+const ENGINE_PREFIXES: &[(&str, &str)] = &[
+    ("text=", "text="),
+    ("xpath=", "xpath="),
+    ("role=", "role="),
+    ("id=", "id="),
+    ("css=", "css="),
+    (">>", ">>"),
+];
+
+/// 出现**在任意位置**即判定为非 CSS 的 Playwright 片段(引号外才算)
+///
+/// `>>`(链式选择器)、`text=`/`xpath=`(引擎前缀出现在中段,如 `div >> text=foo`)、
+/// `:has-text(`(jQuery/Playwright 伪类)在合法 CSS 里不会作为裸子串出现;
+/// 但属性值里可能合法包含(如 `[data-x="a>>b"]`),因此扫描必须**跳过引号内内容**。
+const ENGINE_INFIX: &[(&str, &str)] = &[
+    (">>", ">>"),
+    ("text=", "text="),
+    ("xpath=", "xpath="),
+    (":has-text(", ":has-text("),
+];
+
+/// 引号感知扫描:返回选择器**引号外**首次出现的非 CSS 片段(及其标签)
+///
+/// 参数:`lower` 已全部转小写的选择器(ASCII 小写,字节下标与原串一致)
+/// 返回:`Some(标签)` 表示命中禁用片段;`None` 表示引号外没有命中
+///
+/// 规则:单/双引号内一律跳过(支持 `\'`/`\"` 转义),引号外按字节匹配 `ENGINE_INFIX`;
+/// 这样 `[data-x="a>>b"]` 合法放行,而 `div >> text=foo` / `:has-text("x")` 被拒。
+fn find_unquoted_engine(lower: &str) -> Option<&'static str> {
+    let bytes = lower.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match quote {
+            Some(q) => {
+                if b == b'\\' {
+                    // 转义:跳过下一个字节(引号内不参与匹配)
+                    i += 2;
+                    continue;
+                }
+                if b == q {
+                    quote = None;
+                }
+                i += 1;
+            }
+            None => {
+                if b == b'\'' || b == b'"' {
+                    quote = Some(b);
+                    i += 1;
+                    continue;
+                }
+                for (pattern, label) in ENGINE_INFIX {
+                    if bytes[i..].starts_with(pattern.as_bytes()) {
+                        return Some(label);
+                    }
+                }
+                i += 1;
+            }
+        }
+    }
+    None
+}
+
 /// 单个选择器入口校验:拒绝 Playwright 风格选择器,统一在**进入点击/解析链路前**快速明确报错
 ///
 /// 参数:`selector` 选择器(空串放行 —— 必填与否由各端点自己的校验决定)
@@ -168,6 +234,8 @@ pub fn validate_selector_fields(body: &serde_json::Value) -> Result<(), String> 
 ///
 /// 背景:`text=`/`xpath=`/以 `/` 开头等都不是合法 CSS,`querySelector` 会抛 SyntaxError,
 /// 原先会把晦涩的解析错误(甚至看似「卡住」后的超时)甩给用户;现入口拦截、不进链路。
+/// 1.10.0:`>>` 等也只查了开头,`div >> text=foo` 这类中段写法会漏到 querySelector →
+/// 现补引号感知的任意位置扫描(不误伤 `[data-x="a>>b"]`)。
 pub fn validate_selector(selector: &str) -> Result<(), String> {
     let s = selector.trim();
     if s.is_empty() {
@@ -175,20 +243,14 @@ pub fn validate_selector(selector: &str) -> Result<(), String> {
     }
     let lower = s.to_ascii_lowercase();
     // Playwright/其它引擎前缀:本项目只支持 CSS,统一拒绝并给出可执行的改法
-    const ENGINES: &[(&str, &str)] = &[
-        ("text=", "text="),
-        ("xpath=", "xpath="),
-        ("role=", "role="),
-        ("id=", "id="),
-        ("css=", "css="),
-        (">>", ">>"),
-    ];
-    for (prefix, label) in ENGINES {
+    for (prefix, label) in ENGINE_PREFIXES {
         if lower.starts_with(prefix) {
-            return Err(format!(
-                "不支持 {label} 选择器（Playwright 风格），请改用 CSS 选择器（如 div > a.btn）: {s}"
-            ));
+            return Err(engine_error(label, s));
         }
+    }
+    // 任意位置(引号外)出现的非 CSS 片段:如 `div >> text=foo`、`:has-text("x")`
+    if let Some(label) = find_unquoted_engine(&lower) {
+        return Err(engine_error(label, s));
     }
     // 以 `/` 开头 = XPath 路径(//div、/html/body 等)
     if s.starts_with('/') {
@@ -197,6 +259,13 @@ pub fn validate_selector(selector: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// 统一的"非 CSS 选择器"报错文案
+fn engine_error(label: &str, selector: &str) -> String {
+    format!(
+        "不支持 {label} 选择器（Playwright 风格），请改用 CSS 选择器（如 div > a.btn）: {selector}"
+    )
 }
 
 /// 导航到 URL
@@ -567,4 +636,59 @@ pub fn query_element(app: &AppHandle, x: i32, y: i32) -> ControlResult<Value> {
         app,
         &format!("window.__btPage ? __btPage.query({x},{y}) : null"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{find_unquoted_engine, validate_selector};
+
+    /// 合法 CSS 必须放行(含属性选择器里的 `>>`、CSS 相邻/子代组合符)
+    #[test]
+    fn accepts_valid_css() {
+        for sel in [
+            "div > a.btn",
+            "div a",
+            "input[id=main]",
+            "[data-x=\"a>>b\"]",
+            "[data-x='a>>b']",
+            "a[href$=\"text=foo\"]",
+            ":has(> img)",
+            "#main .item:first-child",
+        ] {
+            assert!(validate_selector(sel).is_ok(), "should accept: {sel}");
+        }
+    }
+
+    /// 中段 `>>`(引号外)必须拒绝
+    #[test]
+    fn rejects_infix_chain_selector() {
+        let err = validate_selector("div >> text=foo").expect_err("must reject");
+        assert!(err.contains(">>"), "unexpected message: {err}");
+        assert!(validate_selector("div.container>>span").is_err());
+    }
+
+    /// 中段 `text=` / `xpath=` / `:has-text(` 必须拒绝
+    #[test]
+    fn rejects_infix_engines() {
+        assert!(validate_selector("div > a text=foo").is_err());
+        assert!(validate_selector("div > a xpath=/html/body").is_err());
+        assert!(validate_selector("div:has-text(\"foo\")").is_err());
+    }
+
+    /// 前缀式 Playwright 选择器仍拒绝;XPath 路径仍拒绝
+    #[test]
+    fn rejects_prefix_engines_and_xpath() {
+        assert!(validate_selector("text=登录").is_err());
+        assert!(validate_selector("css=div > a").is_err());
+        assert!(validate_selector("//div[@id='a']").is_err());
+    }
+
+    /// 引号感知扫描的边界:引号内不命中、转义引号不提前结束引号
+    #[test]
+    fn unquoted_scan_respects_quotes() {
+        assert_eq!(find_unquoted_engine("div[data-x=\"a>>b\"]"), None);
+        assert_eq!(find_unquoted_engine("div[data-x='a>>b']"), None);
+        assert_eq!(find_unquoted_engine("div >> span"), Some(">>"));
+        assert_eq!(find_unquoted_engine("a[title=\"x\\\" >> y\"]"), None);
+    }
 }

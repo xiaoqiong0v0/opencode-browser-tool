@@ -104,6 +104,8 @@ const zh: LocaleStrings = {
     "cli.out.device_applied": "已应用设备预设: {name}（{w}x{h} 内容区）\nUser-Agent: {ua}",
     "cli.out.devtools_open": "开发者工具已打开",
     "cli.out.devtools_closed": "开发者工具已关闭",
+    // Windows(wry)无法真正关闭 DevTools:如实反馈,提示用 F12 手动切换
+    "cli.out.devtools_unsupported": "当前平台不支持关闭 DevTools（wry 限制）；可用 F12 手动切换",
     "cli.out.reload": "页面已刷新: {url}",
     // 后端返回体无 url(Rust 侧标签无最后导航 URL)时的降级文案,避免输出 undefined
     "cli.out.reload_nourl": "页面已刷新",
@@ -174,6 +176,8 @@ const zh: LocaleStrings = {
     "client.spawn_failed": "bt-shell 进程启动失败（请稍后经 bt_cli 重试；勿直接执行二进制文件）",
     "client.session_closed_during_start": "启动期间已收到关闭指令，该浏览器实例已终止。如需使用请调用 open_window。",
     "client.attach_gone": "附着的外部 bt-shell 在 {url} 已断开（附着模式不接管进程，请自行重启该 shell）。",
+    "client.attach_need_token": "附着模式需要鉴权令牌：请设置环境变量 BT_SHELL_TOKEN，并让外部 bt-shell 用同一令牌启动（启动参数 --token <token>，或设置同值的 BT_SHELL_TOKEN）。",
+    "client.attach_bad_token": "外部 shell 拒绝鉴权：BT_SHELL_TOKEN 与 shell 启动时的 --token/BT_SHELL_TOKEN 不一致。",
     "client.browser_closed": "浏览器已关闭。请先调用 open_window 打开后再试。",
 
     "tool.set_media_mode.desc":
