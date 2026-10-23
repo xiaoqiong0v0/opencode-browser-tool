@@ -9,7 +9,7 @@
 |---|---|---|
 | 编译 | ✅ | 平台专属模块用 `#[cfg(windows)]` 隔离（关键点：`control/responses.rs` 曾顶层 `use webview2_com`，是唯一编译阻塞点） |
 | 多 Webview 布局 | ✅ | 见 §2 垫片 |
-| 窗口缩放（四边/四角） | ✅ | 自绘热区 + `begin_resize_drag`（Wayland→`xdg_toplevel.resize`，X11→WM） |
+| 窗口缩放（四边/四角） | ✅ | 自绘热区 + `begin_resize_drag`（Wayland→`xdg_toplevel.resize`，X11→WM），实现见 §2 `install_resize_grips` |
 | 覆盖层透明 / 面板遮罩 / 批注 | ✅ | 依赖窗口 `transparent`，见 §3.1 |
 | 页面截图 | ✅ | WebKitGTK `WebView::snapshot`（见 §4） |
 | 开发者工具 | ✅ | 开关状态用 wry 的真实 `is_devtools_open()`（Windows 上 wry 该值为恒 false，需另用本地标记） |
@@ -35,6 +35,7 @@
 | `logical_window_size(app, label)` | 读取该 webview 所属顶层 `GtkWindow::allocation()` 的**逻辑宽高**（GTK 逻辑像素，与 `move_`/`set_size_request` 同口径）；窗口尚未 map（`allocation` 为 0）或取不到时返回 `None` |
 | `raise(app, label)` | remove+put 置顶（**只在"显示浮层"时调用一次**，勿每帧调用） |
 | `poke(app, label)` | GTK 侧主动重排+重绘（`queue_resize`/`queue_draw`，含顶层） |
+| `install_resize_grips(app, label)` | §1「窗口缩放（四边/四角）」的实际实现：把 `Fixed` 包进 `gtk::Overlay`，叠加 4 条边缘 + 4 个角热区，按下时 `gtk::Window::begin_resize_drag`（Wayland→`xdg_toplevel.resize`，X11→WM）；**必须在 `reparent` 之后调用**（`Fixed` 不存在则直接返回），内部按线程标志幂等 |
 | `BtFixed` | `gtk::Fixed` 的 Rust 子类，**只把自身 preferred size 谎报为 (1,1)** —— 否则子控件的 `size_request` 会把容器 minimum 顶成"当前窗口尺寸"，导致窗口**只能放大不能缩小** |
 
 **配套约定（`ui/mod.rs`）**：
@@ -66,7 +67,13 @@ WebKitGTK：`WebViewExt::snapshot(region, SnapshotOptions::NONE, Cancellable::NO
 ## 5. 构建与环境
 
 - `rust/Cargo.toml` 增加 Linux target 依赖：`gtk = "0.18"`、`webkit2gtk = "2.0"`、`cairo-rs = { version = "0.18", features = ["png"] }`、`base64 = "0.22"`（版本需与 Cargo.lock 对齐）。
-- 系统依赖（Debian 系）：`libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev build-essential`，另需 `cmake clang libclang-dev`（aws-lc-sys 等绑定生成）。
+- 系统依赖（Debian 系，按 Cargo.lock 实际绑定取舍）：
+  - `libwebkit2gtk-4.1-dev` —— **必须是 4.1 系列**：`webkit2gtk = "2.0"` 的 `webkit2gtk-sys 2.0.2` 依赖 `soup3-sys`（Cargo.lock 同时锁了 `soup3`/`soup3-sys`），即链接 **libsoup3**；4.0 系列走 libsoup2，口径不符。`libsoup-3.0-dev` 通常随 `-dev` 包带入，若 pkg-config 报缺 `libsoup-3.0` 再显式补装。
+  - `libgtk-3-dev` —— `gtk = "0.18"` 是 GTK3 绑定（`gtk-sys` 走 `system-deps` 的 `gtk+-3.0`）。
+  - `libayatana-appindicator3-dev` —— Cargo.lock 存在 `tray-icon`，托盘需要 appindicator3。
+  - `librsvg2-dev` —— GTK 运行期 SVG pixbuf loader；Cargo.lock 无对应 crate，**是否必须待核实**（装不上时可先不装验证构建）。
+  - `build-essential`、`cmake clang libclang-dev` —— Cargo.lock 存在 `aws-lc-sys`，绑定生成需要 cmake + clang/libclang。
+  - **不再列** `libxdo-dev` / `libssl-dev`：Cargo.lock 无 `xdo`/`xdotool`（Linux 缩放走 §2 `install_resize_grips` + `begin_resize_drag`，不经 xdo），也无 `openssl`/`openssl-sys`（TLS 用 `rustls`，lock 里的 `openssl-probe` 只是 rustls 的证书探测，不需要 OpenSSL 头文件）。
 - 字体：精简发行版（Kali）默认无 emoji/CJK 字体；即便按 §3.3 改用 SVG 图标，**中文文本仍依赖系统 CJK 字体**（桌面发行版通常自带）。
 - WSLg 注意事项：应用走 Wayland 原生，**X11 抓屏工具（scrot/import/xwd）抓不到内容**（全黑），`xwininfo` 也看不到窗口；`xdotool` 无法验证 WM 动作（合成事件走 XWayland 内部，WM 动作在 Wayland 侧）；反复创建/销毁窗口后 WSLg/Weston 状态可能变脏（窗口已注册但 Windows 侧不显示）→ `wsl --shutdown` 复位。
 - 调试建议：任意可编程验证尽量走本项目自身的 HTTP API（`/api/status`、`/api/evaluate`、`/api/screenshot`），比截图/看界面可靠。

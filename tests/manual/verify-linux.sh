@@ -6,6 +6,13 @@
 #   --no-build   跳过构建（直接用已探测到的二进制）
 #   --keep       跑完保留实例（打印 PID 供人工查看）
 #
+# 令牌（1.10.0 起所有 /api/* 需请求头 x-bt-token，缺失/不匹配即 401）：
+#   本脚本自带令牌，两端同源——
+#     来源：优先环境变量 $BT_SHELL_TOKEN；否则用 bash 内建($$+$RANDOM)随机生成；
+#     用法：起实例时 --token "$T" 显式传入，请求时 -H "x-bt-token: $T" 携带；
+#     为何不读 bt-auth-token 文件：实例刚起时落盘有竞态，且令牌本就由脚本控制，读它反引入不一致。
+#   唯一精确豁免路径 /api/page-event（页面注入脚本无法持有令牌）——本脚本不调用它。
+#
 # 仅依赖 bash + curl（判据用页面返回的 "VERDICT ok/fail: ..." + grep，不解析外层 JSON、不用 jq）。
 # 清理只针对本脚本记录的 PID（trap EXIT），绝不按进程名批量杀。
 
@@ -21,10 +28,13 @@ while [ $# -gt 0 ]; do
     --port) PORT="$2"; shift 2;;
     --no-build) DO_BUILD=0; shift;;
     --keep) KEEP=1; shift;;
-    -h|--help) sed -n '2,9p' "$0"; exit 0;;
+    -h|--help) sed -n '2,16p' "$0"; exit 0;;
     *) echo "未知参数: $1"; exit 2;;
   esac
 done
+
+# ---- 令牌（见头部说明）：env 优先，否则纯 bash 内建随机；两端同源，绝不明文入日志 ----
+T="${BT_SHELL_TOKEN:-btverify-$$-$RANDOM$RANDOM}"
 
 TS="$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$SCRATCH"
@@ -35,6 +45,7 @@ PASS=0
 FAIL=0
 FAILED=""
 PID=""
+UD=""
 
 log() { echo "$*" | tee -a "$LOG"; }
 
@@ -51,6 +62,8 @@ cleanup() {
       log "[cleanup] 已停止自起实例 PID $PID"
     fi
   fi
+  # 删除本脚本自建的 user-data-dir（含令牌文件），仅当非空且不保留实例
+  if [ -n "$UD" ] && [ "$KEEP" != "1" ] && [ -d "$UD" ]; then rm -rf "$UD" 2>/dev/null; fi
 }
 trap cleanup EXIT INT TERM
 
@@ -75,7 +88,7 @@ case_from_verdict() { # case_from_verdict <num> <name> <response>
 
 # ---- JSON / API 辅助（不依赖 jq）----
 json_escape() { local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; printf '%s' "$s"; }
-api() { curl -s --max-time 25 -X POST "http://127.0.0.1:$PORT/api/$1" -H 'Content-Type: application/json' -d "$2"; }
+api() { curl -s --max-time 25 -X POST "http://127.0.0.1:$PORT/api/$1" -H "x-bt-token: $T" -H 'Content-Type: application/json' -d "$2"; }
 evaljs() { local js="$1" esc; esc="$(json_escape "$js")"; api evaluate "{\"script\":\"$esc\"}"; }
 
 # ---- 二进制探测 ----
@@ -112,15 +125,16 @@ if port_in_use; then
   log "[error] 端口 $PORT 已被占用，换一个 --port"; exit 1
 fi
 
-# ---- 起实例 ----
-"$BIN" --port "$PORT" --user-data-dir "/tmp/bt-verify-ud-$$" >"$APP_LOG" 2>&1 &
+# ---- 起实例（--token 显式传入，与后续请求同源；令牌不写日志，仅记 prefix 前 4 位）----
+UD="/tmp/bt-verify-ud-$$"
+"$BIN" --port "$PORT" --token "$T" --user-data-dir "$UD" >"$APP_LOG" 2>&1 &
 PID=$!
-log "[start] $BIN --port $PORT (PID $PID)  日志: $APP_LOG"
+log "[start] $BIN --port $PORT --token <${T:0:4}…len=${#T}> (PID $PID)  日志: $APP_LOG"
 
 READY=0
 i=0
 while [ "$i" -lt 40 ]; do
-  if curl -s --max-time 2 -X POST "http://127.0.0.1:$PORT/api/status" -H 'Content-Type: application/json' -d '{}' | grep -q '"success":true'; then READY=1; break; fi
+  if curl -s --max-time 2 -X POST "http://127.0.0.1:$PORT/api/status" -H "x-bt-token: $T" -H 'Content-Type: application/json' -d '{}' | grep -q '"success":true'; then READY=1; break; fi
   sleep 0.5; i=$((i + 1))
 done
 if [ "$READY" != "1" ]; then log "[error] 实例未就绪（见 $APP_LOG）"; exit 1; fi

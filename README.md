@@ -1,6 +1,6 @@
 # opencode-browser-tool
 
-opencode 插件：Tauri 多 Webview 浏览器外壳 + 零注入视觉元素选取面板，提供 40+ 个浏览器自动化工具。
+opencode 插件：Tauri 多 Webview 浏览器外壳 + 零注入视觉元素选取面板。对外只注册 **2 个工具**：`bt_cli`（命令行式分发器，内含 **47 条**浏览器自动化命令）与 `bt_set_media_mode`（摄像头/麦克风真伪切换），见下文「工具」。
 
 > 架构演进：V1-V3 使用 Playwright 注入式面板（存在弹框类元素无法批注的问题）；V4 改为 Rust Shell + 原始调试协议；V5 迁移到 Tauri 2 多 Webview（跨平台）。
 
@@ -15,12 +15,12 @@ opencode 插件：Tauri 多 Webview 浏览器外壳 + 零注入视觉元素选�
 
 ## 二进制获取（bt-shell）
 
-插件依赖 Rust 外壳 `bt-shell`。默认**首次使用时后台自动下载**对应平台的 Release 资产到
+插件依赖 Rust 外壳 `bt-shell`。默认在**插件加载时（opencode 启动）就后台自动下载**对应平台的 Release 资产到
 `~/.opencode/plugins-data/opencode-browser-tool/<平台三元组>/bt-shell[.exe]`（Windows 即
 `%USERPROFILE%\.opencode\plugins-data\opencode-browser-tool\<triple>\bt-shell.exe`），并**就地覆盖**同一路径
 （不按插件版本建目录）；同目录另有 `bt-shell.version.json` 记录该可执行文件的来源
-（`tag` / `asset` / `sha256` / `size` / `downloadedAt` / `sourceUrl`）。下载用 Release 的 `SHA256SUMS` 做
-sha256 校验（**幂等**：sha 与当前 release 期望值一致即跳过；**原子**替换；跨进程 `.lock`；Linux 下载后 `chmod 755`）。下载后台进行、**不阻塞 opencode 启动**；未就绪时工具调用会给出
+（`tag` / `pluginVersion` / `asset` / `sha256` / `size` / `downloadedAt` / `sourceUrl`，`src/binary.ts:69-79`）。下载用 Release 的 `SHA256SUMS` 做
+sha256 校验（**幂等**：sha 与当前 release 期望值一致即跳过；**原子**替换；跨进程 `.lock`；Linux 下载后 `chmod 755`）。下载在插件初始化时即发起、后台进行、**不阻塞 opencode 启动**（`src/index.ts:342-343`）；未就绪时工具调用会给出
 明确提示（下载进度 / 失败原因），不会假装成功。
 
 平台支持与系统依赖：
@@ -43,20 +43,29 @@ sha256 校验（**幂等**：sha 与当前 release 期望值一致即跳过；**
 
 ## 配置
 
-配置文件：`~/.config/opencode/browser-tool.jsonc`（首次运行自动生成）
+配置文件：`~/.config/opencode/browser-tool.jsonc`（首次运行自动生成，默认值均为 `en`）
 
 ```jsonc
 {
-  "panelLang": "zh",
+  "panelLang": "en",
   "toolLang": "en"
 }
 ```
 
 项目级配置放 `<项目根目录>/.opencode/browser-tool.jsonc`，会覆盖全局。
 
-环境变量（优先级最高）：
+生成的配置还支持（可选项，见 `src/config/index.ts:27-35,246-274`）：
+
+- `browsersPath` — 浏览器缓存目录（等价 `BT_BROWSERS_PATH`）
+- `cacheDir` — 插件缓存根（默认 `~/.opencode/plugins-cache/opencode-browser-tool`，下设 `sessions/<profile>/<sid>`、`user-data/<profile>`、`exports`、`tmp`）
+- `nodePath` — Node.js 可执行路径（等价 `BT_NODE_PATH`）
+- `disabledTools` — **按已注册工具名**禁用工具。bt_cli 合并后注册的工具名只有 `bt_cli` 与 `bt_set_media_mode`（`src/index.ts:376-463`、过滤逻辑 `src/index.ts:493-500`），因此只有写这两个名字才生效；旧的 47 个分工具名（`close`、`custom_user_agent`…）或不带前缀的命令名**不再有效、会被静默忽略**（自动生成配置的注释示例同样偏旧，以本节为准）。禁用 `bt_cli` 等于没有命令入口，慎用。
+
+环境变量（优先级最高，`src/config/index.ts:223-240`）：
 - `BT_LANG` — 同时设置 panelLang 和 toolLang
+- `BT_PANEL_LANG` / `BT_TOOL_LANG` — 分别只设置面板 UI 语言 / 工具描述语言
 - `BT_BROWSERS_PATH` — 浏览器缓存目录
+- `BT_NODE_PATH` — Node.js 可执行路径
 - `BT_SHELL_URL` — **附着模式**：连接到已运行的 shell（完整基地址，如 `http://127.0.0.1:18280`），优先级最高
 - `BT_SHELL_PORT` — **附着模式**：仅指定端口，等价于 `http://127.0.0.1:<port>`
 - `BT_SHELL_TOKEN` — **鉴权令牌**：本地 API 所有 `/api/*` 请求必须带 `x-bt-token`。**附着模式下必须设置**，且外部 shell 启动时要用同一值（`--token <token>` 或同值环境变量）；启动模式下由插件随机生成并通过 `--token` 传给 shell，无需手动设置
@@ -66,7 +75,7 @@ sha256 校验（**幂等**：sha 与当前 release 期望值一致即跳过；**
 - `BT_SHELL_VERSION` — 显式指定**二进制发布版本**（形如 `1.2.0`，即 `x.Y.0` 的 Release；**原样使用、不做归 0 推导**；不设时由插件版本自动推导）
 - `BT_SHELL_NOTIFY_URL` — 插件通知地址（**推送式投递**；一般由插件自动通过 `--notify-url` / `/api/notify-url` 设置，仅在手动启动 shell 时需自行指定）
 
-> **附着模式 vs 启动模式**：设置了 `BT_SHELL_URL`（优先）或 `BT_SHELL_PORT` 时进入附着模式——插件**不 spawn** 任何进程，直接连接该地址的外部 shell；两者都未设置时按启动模式 spawn 本地二进制（`BT_SHELL_PATH` 可覆盖查找路径）。附着模式下 `bt_close` 只断开本地连接（**不关闭外部窗口、不结束外部进程**；进程不归插件管理）。
+> **附着模式 vs 启动模式**：设置了 `BT_SHELL_URL`（优先）或 `BT_SHELL_PORT` 时进入附着模式——插件**不 spawn** 任何进程，直接连接该地址的外部 shell；两者都未设置时按启动模式 spawn 本地二进制（`BT_SHELL_PATH` 可覆盖查找路径）。附着模式下 `close` 命令只断开本地连接（**不关闭外部窗口、不结束外部进程**；进程不归插件管理）。
 >
 > **附着模式必须设置 `BT_SHELL_TOKEN`**：外部 shell 启动时的令牌必须与插件侧环境变量一致（见下方示例），否则插件启动即报 `client.attach_need_token`，不会去连一个注定 401 的端点。令牌未设置时 shell 会随机生成，因此手动启动的 shell 务必显式传 `--token`（或用同值环境变量）。
 
@@ -106,82 +115,106 @@ opencode（Bun）
 - 页面零注入残留脚本，弹框类元素可正常批注
 - 所有工具调用通过 `POST http://127.0.0.1:PORT/api/{command}` 通信，并统一带鉴权头 `x-bt-token`（无 CORS、拒绝任何带 `Origin` 的请求；唯一例外是页面事件桥 `/api/page-event`，见上）
 - 除 spawn 本地 shell 外，也可用 `BT_SHELL_URL` / `BT_SHELL_PORT` **附着到已运行的 shell**（不 spawn，适用于 shell 跑在 WSL/Linux、插件跑在 Windows；**必须同时设置 `BT_SHELL_TOKEN`**，外部 shell 用同一令牌启动）
-- 跨平台：Windows / Linux / macOS
+- 跨平台代码：Windows / Linux / macOS；**预编译二进制只发 Windows x64 与 Linux x64**，macOS 需自行构建（`cargo build --release`）且功能不完整：截图待实现（`rust/src/control/screenshot.rs:4`）、DevTools 无法真正关闭（`close_supported = cfg!(target_os = "linux")`，`rust/src/service.rs:1063`）、自定义 UA 未实现
 - 真多标签：每标签独立 page Webview，切换不重载；`target=_blank` / `window.open` 链接通过 WebView2 原生事件拦截并打开为新标签。**关闭标签会释放该标签的页面实例**（预创建池的 3 个 webview 保留复用，池外动态创建的实例直接销毁），反复开关标签不会累积页面进程
 - 地址栏/标题/图标**事件驱动同步（无轮询）**：导航用 `on_navigation`（请求即更新）+ `on_page_load`（完成后读真实 `location.href`/`title`）；站内 SPA（`pushState`/`replaceState`/`popstate`/`hashchange`）与标题/图标变化由注入脚本上报 `POST /api/page-event`。`TabState.url` 只反映**最后一次真实导航请求**，内部/错误 scheme（`chrome-error:`/`about:`/`tauri:`/`data:` 等）不覆盖地址栏
-- 刷新语义：标签处于错误页（`errored`）时，工具栏刷新 / `bt_reload` **重新导航原 URL**（而非刷错误页）；否则走原生 reload
+- 刷新语义：标签处于错误页（`errored`）时，工具栏刷新 / `reload` 命令**重新导航原 URL**（而非刷错误页）；否则走原生 reload
 - 窗口无标题栏，自定义窗口按钮在标签行右侧；最小尺寸 360×432（逻辑像素；内容区最小 360×360，含 72px 工具栏）
 
 ## 工具
 
-| 类别 | 工具 |
-|------|------|
-| **导航** | `bt_navigate`, `bt_go_back`, `bt_go_forward`, `bt_reload`, `bt_open_window`, `bt_close` |
-| **交互** | `bt_click`, `bt_fill`, `bt_clear`, `bt_select`, `bt_hover`, `bt_drag`, `bt_press_key`, `bt_upload_file`, `bt_iframe_click`, `bt_iframe_fill` |
-| **标签页** | `bt_list_tabs`, `bt_switch_tab`, `bt_new_tab`, `bt_close_tab`, `bt_click_and_switch_tab` |
-| **信息** | `bt_screenshot`, `bt_evaluate`, `bt_get_visible_text`, `bt_get_visible_html`, `bt_console_logs`, `bt_get_browser_status`, `bt_get_element_state`, `bt_get_dropdown_options`, `bt_list_records`, `bt_expect_response`, `bt_assert_response`, `bt_get_accessibility_tree` |
-| **滚动/等待** | `bt_scroll`, `bt_scroll_to_element`, `bt_wait_for_selector`, `bt_resize`, `bt_set_device` |
-| **设备/工具** | `bt_custom_user_agent`, `bt_devtools`（开发者工具开关） |
-| **媒体/本地** | `bt_fake_audio`, `bt_fake_video`, `bt_profile`, `bt_exports`, `bt_lookup` |
-| **其他** | `bt_show_notification`, `bt_read_record_content` |
+插件**只注册 2 个工具**（`src/index.ts:376-463`）：
 
-### 工具参数
-
-> **`--timeout ms`（可选，1.9.0 起）** —— 共 **17 条命令声明**带 `timeout` 参数（`src/index.ts:106-193`；其中 `bt_wait_for_selector` 原本就有该参数，其余 16 条为 1.9.0 起新增），均支持按次传 `--timeout`，钳制到 `[100, 60000]` 毫秒（`rust/src/service.rs:96-97,104-115`）；未传走服务端默认（15s），传小值可让慢操作**快失败**（如 `--timeout 800` 让卡住的 `evaluate` 在约 0.8s 返回 `eval timeout`），被钳制时输出会如实标注。
-
-| 工具 | 参数（类型） | 说明 |
+| 工具 | 参数 | 说明 |
 |------|------|------|
-| `bt_navigate` | `url`(string) 必填 | 导航到指定地址（裸域名自动补 http://） |
-| `bt_click` | `selector`(string) 必填 | 点击 CSS 选择器匹配的元素 |
-| `bt_fill` | `selector`, `value`(string) 必填 | 向输入框填入文本 |
-| `bt_clear` | `selector`(string) 必填 | 清空输入框 |
-| `bt_select` | `selector`, `value`(string) 必填 | 选择下拉框选项 |
-| `bt_hover` | `selector`(string) 必填 | 悬停在元素上 |
-| `bt_drag` | `sourceSelector`, `targetSelector`(string) 必填 | 从源元素拖到目标元素 |
-| `bt_press_key` | `key`(string) 必填, `selector`(string) 可选 | 按键（如 Enter/Escape）；可指定聚焦元素 |
-| `bt_upload_file` | `selector`, `filePath`(string) 必填 | 向文件输入框上传文件 |
-| `bt_screenshot` | `selector`(string) 可选 | 截取视口；指定 `selector` 时先滚动到可见再截该元素区域，**元素比视口还大也能整块截全**（PNG 图片附件） |
-| `bt_evaluate` | `script`(string) 必填 | 在页面执行 JS 并返回 JSON 结果 |
-| `bt_get_visible_text` | `selector`(string) 可选 | 返回页面/元素可见文本 |
-| `bt_get_visible_html` | `selector`, `removeScripts`(boolean), `removeComments`(boolean), `maxLength`(number) | 返回页面/元素 HTML |
-| `bt_console_logs` | `type`(string), `search`(string), `limit`(number), `clear`(boolean) | 读取页面控制台日志 |
-| `bt_go_back` | 无 | 浏览器后退，返回当前 URL |
-| `bt_go_forward` | 无 | 浏览器前进，返回当前 URL |
-| `bt_resize` | `width`, `height`(number) 必填 | 调整**页面内容区（视口）**尺寸（非 OS 窗口；下限 360×360，低于下限被钳制并在返回标 `clamped`） |
-| `bt_set_device` | `name`(string) 可选 | 应用设备预设（空参数列出 14 种预设；**预设尺寸为内容区（视口）尺寸**） |
-| `bt_devtools` | `action`(string)：`toggle`/`open`/`close` | 开关开发者工具。**Windows 无法真正关闭**（wry/WebView2 无关闭 API），`close` 会如实返回不支持并提示用 F12 手动切换；Linux 可正常开关 |
-| `bt_reload` | 无 | 刷新当前页面；若当前为错误页则**重新导航原 URL**（返回 `retried`） |
-| `bt_close` | 无 | 关闭浏览器外壳（`bt_close` 与手动关窗同一语义）。关闭后后续工具调用返回指引（`browser closed … call open_window`），**绝不自动重开**，需 `bt_open_window` 显式打开；attach 模式下只断开本地关联（不关闭外部窗口/进程） |
-| `bt_show_notification` | `message`(string), `type`(string)：`ok`/`bad`/`err` | 显示页面通知气泡 |
-| `bt_scroll` | `direction`(string)：`up`/`down`/`left`/`right`, `amount`(number) | 滚动页面 |
-| `bt_wait_for_selector` | `selector`, `timeout`(number, ms) | 等待元素出现 |
-| `bt_click_and_switch_tab` | `selector`(string) 必填 | 点击元素；若触发新标签则自动切换，返回当前 URL |
-| `bt_iframe_click` | `iframeSelector`, `selector`(string) 必填 | 在 iframe 中点击（仅同源可访问） |
-| `bt_iframe_fill` | `iframeSelector`, `selector`, `value`(string) 必填 | 在 iframe 中输入（仅同源可访问） |
-| `bt_get_browser_status` | 无 | **纯查询、不启动浏览器**：运行中返回 open/url/title/tabs 数量；未运行时返回未运行提示 + bt-shell 二进制状态（下载中/就绪/失败/禁用） |
-| `bt_list_tabs` | 无 | 列出标签页（索引+URL） |
-| `bt_switch_tab` | `index`(number) 必填 | 按位置（0 起）切换标签 |
-| `bt_new_tab` | `url`(string) 必填 | 新建独立标签页（真多标签）并导航 |
-| `bt_close_tab` | `index`(number) 可选 | 关闭指定标签；缺省关闭当前激活标签。关闭会**释放该标签的页面实例**（池内 webview 回池复用，池外实例销毁） |
-| `bt_get_element_state` | `selector`(string) 必填 | 返回元素可见性/文本/位置 |
-| `bt_scroll_to_element` | `selector`(string) 必填 | 滚动到元素 |
-| `bt_get_dropdown_options` | `selector`(string) 必填 | 列出下拉框选项 |
-| `bt_custom_user_agent` | `userAgent`(string) 必填 | 设置自定义 User-Agent（Windows/Linux 支持；macOS 未实现） |
-| `bt_open_window` | 无 | 打开浏览器窗口（未启动则启动；已启动幂等） |
-| `bt_fake_audio` | `kind`(string) 必填，`data`/`freq`/`durMs`/`notes`/`digits`(string)，`loop`(boolean) | 向页面注入模拟麦克风音频 |
-| `bt_fake_video` | `kind`(string) 必填，`data`/`url`(string)，`loop`(boolean) | 向页面注入模拟摄像头画面 |
-| `bt_profile` | `set` / `delete`(string) 可选 | user-data 配置管理：空参列出；`--set` 切换默认配置（影响**后续新会话**的数据根，不重启浏览器）；`--delete` 删除（默认/激活项除外） |
-| `bt_exports` | 无 | 显示导出目录与 Edge/Chrome 导出指引 |
-| `bt_lookup` | `csv`, `url`(string) 必填 | 从密码 CSV 按站点匹配并返回凭据（写入临时文件，不进上下文） |
-| `bt_expect_response` | `url`(string) 必填 | 记录期望匹配的响应模式，清空响应历史后重新捕获 |
-| `bt_assert_response` | `id`(string) 必填 | 断言是否存在匹配的响应（返回 `url` + `status` 码） |
-| `bt_get_accessibility_tree` | `selector`, `maxDepth`(number) | 返回页面可访问性树（role/name/value 嵌套结构） |
-| `bt_list_records` | 无 | 列出批注/截图记录（索引/标签/说明；截图带 `+img`，已发送带 `[sent]`） |
-| `bt_read_record_content` | `id`(number) 必填 | 读取单条记录详情（截图附带图片大小与落盘路径） |
+| `bt_cli` | `args`(string，可选) | 唯一入口：命令行式分发器，一条命令字符串执行一项浏览器操作；`args` 省略或为 `help` / `--help` / `-h` 时返回完整帮助（命令名、用法、说明、示例） |
+| `bt_set_media_mode` | `mode`(string)：`simulate` \| `real`，可选 | 切换摄像头/麦克风设备：`simulate`=模拟设备（默认，配合 `fake_audio` / `fake_video`）；`real`=真实设备（不可用时回落 simulate）。省略 `mode` 只查询当前模式。切真实设备属敏感操作，单独保留工具以维持 `ask` 权限 |
+
+### bt_cli 调用语法
+
+```
+bt_cli({ args: "<command> [--flag value ...]" })
+```
+
+- **命令名不带 `bt_` 前缀**：写 `click`、`navigate`、`list_tabs`，**不是** `bt_click` / `bt_navigate` / `bt_list_tabs`（旧文档里的 `bt_*` 名称既不是工具名也不是命令名）
+- **分词**：按 shell 风格切分（`string-argv` 0.3.2，`src/index.ts:3` 引入、`:388-390` 使用），含空格的值用引号包裹，如 `fill --selector #q --value "hello world"`；**只按引号配对切分、不处理反斜杠转义**——值里要出现引号就改用**另一种引号**包外层（如 `get_visible_text --selector "[title='a b']"`），写成 `--value "a\"b"` 会把 `\` 原样带进值里
+- **flag 解析**：第一个 token 为命令名，其余交给 `node:util.parseArgs`（`src/index.ts:285-291`）；**未知 flag 直接报错并回显该命令用法**（输出可自愈，不必先调 help）
+- **敏感值 `@file:`**：值写成 `@file:<路径>` 时由插件读取文件内容作为实际值，**内容不进模型上下文**（`src/index.ts:404-435`）。只允许读插件临时目录（全局 tmp 或本会话 tmp）内的文件，其余路径一律拒绝；`lookup` 生成的密码临时文件即用于 `fill --value @file:...`，位于全局 tmp 的用完即删
+- 会话归属由插件自动透传（每会话独立浏览器实例，见「多会话」），`args` 里**不需要**也**不支持**传会话 id
+
+示例：
+
+```text
+bt_cli({ args: "help" })
+bt_cli({ args: "navigate --url https://example.com" })
+bt_cli({ args: "click --selector #submit" })
+bt_cli({ args: "fill --selector #q --value \"hello world\"" })
+bt_cli({ args: "screenshot --selector .chart" })
+```
+
+### `--timeout`（下表标 ⏱ 的 17 条命令支持）
+
+- 单位**毫秒**，`--timeout 800` 可让卡住的操作约 0.8s 返回（快失败）；**未列出的命令不接受该 flag**
+- 钳制区间 `[100, 60000]`：插件侧（`src/index.ts:80-81,96-98`）与 Rust 服务端（`rust/src/service.rs:96-97,104-116`）**同口径二次钳制**（直连 HTTP 也安全）；非正整数直接报错拒绝；被钳制时输出如实标注 `(clamped to …ms)`，服务端响应体带 `timeoutMs` / `timeoutClamped`
+- **未传时走各命令自己的默认，并非统一 15s**：eval / CDP / 截图 / `wait_for_selector` 默认 **15s**（`rust/src/ui/mod.rs:35`、`rust/src/control/cdp.rs:27`、`rust/src/control/screenshot.rs:23`、`rust/src/service.rs:609`）；点击类（click / hover / drag / press_key 等）的稳定等待默认 **700ms**（`rust/src/control/mouse.rs:19,177-178`）；`fill` / `select` 的读回校验默认 **2500ms**（`rust/src/control/input.rs:343`）
+
+### 命令参考（47 条）
+
+> 唯一真源：`src/index.ts:101-268` 的 `COMMANDS`（本表与之逐条对应，条数、flag 名、可选性均以代码为准）。说明取自 `src/i18n/en.ts` 的 `cli.cmd.*`（`src/i18n/en.ts:24-70`，中文对照见 `src/i18n/zh.ts`）。参数列中**不带 `[]` 者为必填**；⏱ = 支持 `--timeout ms`。完整命令/参数/help 以 `bt_cli({ args: "help" })` 的实际输出为准。
+
+| 命令 | 参数（usage 原文） | 说明 |
+|------|------|------|
+| `navigate` | `--url <地址>` 必填 | 导航浏览器到 URL（裸域名自动补 `http://`） |
+| `click` ⏱ | `--selector` 必填 | 点击页面元素 |
+| `fill` ⏱ | `--selector --value` 必填 | 填写输入框（`--value` 可传 `@file:` 路径） |
+| `clear` ⏱ | `--selector` 必填 | 清空输入框 |
+| `select` ⏱ | `--selector --value` 必填 | 选择下拉框选项 |
+| `hover` ⏱ | `--selector` 必填 | 悬停到元素 |
+| `drag` ⏱ | `--sourceSelector --targetSelector` 必填 | 拖拽元素到目标 |
+| `press_key` ⏱ | `--key` 必填，`[--selector]` | 按下键盘按键；`--selector` 指定先聚焦的元素 |
+| `upload_file` ⏱ | `--selector --filePath` 必填 | 上传文件到输入框 |
+| `screenshot` ⏱ | `[--selector]` | 截取页面/元素截图（返回图片附件；带 `--selector` 先滚动到元素再截） |
+| `evaluate` ⏱ | `--script` 必填 | 在页面执行 JS，返回结果 |
+| `get_visible_text` | `[--selector]` | 获取页面可见文本 |
+| `get_visible_html` | `[--selector --removeScripts --removeComments --maxLength]` | 获取页面 HTML 结构（`--removeScripts` / `--removeComments` 为布尔开关；`--maxLength` 超出时输出标注截断） |
+| `console_logs` | `[--type --search --limit --clear]` | 获取浏览器控制台日志（`--clear` 读取后清空） |
+| `go_back` | 无 | 浏览器后退，返回当前 URL |
+| `go_forward` | 无 | 浏览器前进，返回当前 URL |
+| `resize` | `--width --height` 必填 | 调整页面内容区尺寸（视口，非 OS 窗口；窗口高 = 内容高 + 工具栏 72px；下限 360×360，低于下限被钳制并标 `clamped`） |
+| `set_device` | `[--name]` | 应用设备预设（不传 `--name` 列出预设；预设尺寸为内容区（视口）尺寸） |
+| `devtools` | `[--action]` | 打开/关闭开发者工具：`open`/`close`/`toggle`（缺省 `toggle`）。Windows 无法真正关闭，`close` 如实返回不支持并提示用 F12 手动切换；Linux 可正常开关 |
+| `reload` | 无 | 刷新当前页面；当前为错误页时**重新导航原 URL**（返回 `retried`） |
+| `open_window` | 无 | 打开浏览器窗口（未启动则启动；已启动幂等） |
+| `close` | 无 | 关闭浏览器（与手动关窗同一语义）。关闭后其它命令返回指引（`Browser is closed. Call open_window…`），**绝不自动重开**，需 `open_window` 显式打开；attach 模式只断开本地关联（不关外部窗口/进程） |
+| `show_notification` | `--message` 必填，`[--type]` | 页面显示通知气泡（`--type`：`ok`/`bad`/`err`） |
+| `scroll` | `[--direction --amount]` | 滚动页面（`--direction`：`up`/`down`/`left`/`right`，缺省 `down`；`--amount` 缺省 300px） |
+| `wait_for_selector` ⏱ | `--selector` 必填 | 等待元素出现 |
+| `click_and_switch_tab` | `--selector` 必填 | 点击元素；若触发新标签则自动切换，返回当前 URL |
+| `iframe_click` ⏱ | `--iframeSelector --selector` 必填 | 在 iframe 内点击元素（仅同源可访问） |
+| `iframe_fill` ⏱ | `--iframeSelector --selector --value` 必填 | 在 iframe 内填写输入框（仅同源可访问） |
+| `get_browser_status` | 无 | **纯查询、不启动浏览器**：运行中返回 open/url/title/tabs 数量；未运行时返回未运行提示 + bt-shell 二进制状态（下载中/就绪/失败/禁用） |
+| `list_tabs` | 无 | 列出所有打开的标签（索引+URL） |
+| `switch_tab` | `--index` 必填 | 按索引（0 起）切换标签 |
+| `new_tab` | `--url` 必填 | 打开新标签并导航（真多标签） |
+| `close_tab` | `[--index]` | 关闭标签；省略则关当前激活标签。关闭会**释放该标签的页面实例**（池内 webview 回池复用，池外实例销毁） |
+| `get_element_state` ⏱ | `--selector` 必填 | 元素存在/可见/文本/位置（rect） |
+| `scroll_to_element` ⏱ | `--selector` 必填 | 滚动到元素可见；未到达/未稳定不吞错，输出带 `reached`/`stable`/`waitedMs` |
+| `get_dropdown_options` ⏱ | `--selector` 必填 | 列出下拉框选项（当前选中项标 `*`） |
+| `custom_user_agent` | `--userAgent` 必填 | 设置自定义 User-Agent（Windows/Linux 支持；macOS 未实现） |
+| `expect_response` | `--url` 必填 | 记录期望匹配的响应模式，清空响应历史后重新捕获 |
+| `assert_response` | `--id` 必填 | 断言是否存在匹配的响应（返回 `url` + `status` 码） |
+| `get_accessibility_tree` ⏱ | `[--selector --maxDepth]` | 获取可访问性树（role/name/value 嵌套）。`--maxDepth` 缺省 8；服务端硬上限 **depth 64 / 节点 5000**，超出静默截断并记日志（`rust/src/control/accessibility.rs:355,359,551`） |
+| `list_records` | 无 | 列出面板批注/截图记录（索引/选择器/rect/说明；截图带 `+img`，已发送带 `[sent]`）。记录上限 **200** 条，超出丢最旧（`rust/src/ui/annotate.rs:395,403-406`） |
+| `read_record_content` | `--id` 必填 | 按 id 读取单条记录详情（截图落盘为临时 PNG 并给出大小与路径） |
+| `fake_audio` | `--kind` 必填，`[--data --freq --durMs --notes --digits --loop]` | 向 fake 麦克风注入音频（`kind`：tone/seq/dtmf/noise/audio/ambient/stop） |
+| `fake_video` | `--kind` 必填，`[--data --url --loop]` | 向 fake 摄像头注入画面（`kind`：image/video/auto/stop） |
+| `profile` | `[--set <name> \| --delete <name>]` | user-data 配置管理：空参列出；`--set` 切换默认配置（影响**后续新会话**的数据根，不重启运行中的浏览器）；`--delete` 删除（default/激活项除外） |
+| `exports` | 无 | 显示导出目录与 Edge/Chrome 密码/书签导出指引 |
+| `lookup` | `--csv <path> --url <site>` 必填 | 从密码 CSV 按站点匹配并返回 `@file:` 临时文件路径（密码不进上下文，用完即删） |
 
 ### 元素截图行为（v1.7.0 起统一）
 
-`bt_screenshot --selector <css>` 固定流程：
+`screenshot --selector <css>` 固定流程：
 
 1. **先滚动**：复用 `scroll_to_element`（立即 `scrollIntoView` 居中 + 轮询等滚动稳定）；未到达/未稳定**不吞错**，结果带 `reached`/`stable`/`waitedMs`，工具输出追加对应提示
 2. **重测 rect**：滚动稳定后重新取元素视口矩形（覆盖懒加载/布局变化后的真位置）
@@ -193,7 +226,11 @@ opencode（Bun）
 
 **坐标系（实测，v1.7.0）**：CDP `clip` **恒为文档坐标**（`captureBeyondViewport` true/false 均如此）——传视口坐标会在滚动后的页面截到错误区域（旧版元素截图在滚动页面上即踩此坑）；截图层内部统一做 视口坐标 + `scrollX/Y` 换算，调用方一律传视口坐标。
 
-错误口径不变：`element not found: <sel>` / `element has zero size: <sel>`。**输出图片尺寸**：元素/区域截图（Windows CDP `clip` 固定 `scale:1`，`rust/src/control/screenshot.rs:148`；Linux cairo 裁剪不缩放，`rust/src/control/screenshot.rs:277`）为**选区 CSS 像素 1:1**（插件不额外乘 DPR；Linux 实现按「CSS 像素 = 设备像素」的 1:1 假设，WSLg dpr=1 实测）；无 `selector` 的整视口截图**不带 `clip`/`scale`**（`rust/src/control/screenshot.rs:150`），由平台默认整屏捕获、插件不做缩放（具体像素尺寸取决于 WebView2/CDP 默认；Linux `Visible` 快照按上述 1:1 假设输出）。
+错误口径不变：`element not found: <sel>` / `element has zero size: <sel>`。**输出图片尺寸**：
+
+- **Windows**：元素/区域截图走 CDP `clip`，`scale` 固定 `1`（`rust/src/control/screenshot.rs:148`）→ 输出为**选区 CSS 像素 1:1**，插件不额外乘 DPR；无 `--selector` 的整视口截图**不带 `clip`/`scale`**（`rust/src/control/screenshot.rs:150`），由 WebView2/CDP 默认整屏捕获、插件不做缩放
+- **Linux**（v1.10.0 起）：WebKitGTK 快照面按**设备像素**输出，裁剪前用 webview 的 `scale_factor` 做 CSS→设备像素换算——`设备像素 = round(CSS 像素 × k)`，`k` 取 `WidgetExt::scale_factor`（非有限或 ≤0 时回退 `1.0`）（`rust/src/control/screenshot.rs:196-199,228-233,293-294,305-314`）。因此 **HiDPI（k>1）下输出尺寸 = 选区 CSS 尺寸 × k，不再是 1:1**；旧文档「CSS 像素 = 设备像素」的 1:1 假设（仅 WSLg dpr=1 时恰好成立）已作废。无 `--selector` 的 `Visible` 整视口快照同样按该缩放输出
+
 
 **已知限制**
 
@@ -203,12 +240,12 @@ opencode（Bun）
 
 ## 设备预设 / 尺寸语义
 
-> ⚠️ **行为变更（v1.8.0）**：`bt_resize` 与 `bt_set_device` 的宽高一律指**页面内容区（视口）**尺寸，不再是 OS 窗口尺寸。窗口高 = 内容区高 + 工具栏 72px。**旧脚本若按窗口尺寸理解，高度会偏 72px**。API 返回同时给出 `content` 与 `window` 两组尺寸便于核对。
+> ⚠️ **行为变更（v1.8.0）**：`resize` 与 `set_device` 的宽高一律指**页面内容区（视口）**尺寸，不再是 OS 窗口尺寸。窗口高 = 内容区高 + 工具栏 72px。**旧脚本若按窗口尺寸理解，高度会偏 72px**。API 返回同时给出 `content` 与 `window` 两组尺寸便于核对。
 
-- **内容区下限 360×360**：`bt_resize` 低于下限会被钳制，返回 `clamped:true`（工具输出也标注）；窗口 `min_inner_size` 同步为 360×432（= 360 内容高 + 72 工具栏）
+- **内容区下限 360×360**：`resize` 低于下限会被钳制，返回 `clamped:true`（工具输出也标注）；窗口 `min_inner_size` 同步为 360×432（= 360 内容高 + 72 工具栏）
 - **窄模式（窗口逻辑宽 < 480）**：面板改为**填满整个窗口**（覆盖式，x=0；页面 webview 保持全宽在下层，关闭面板即见完整页面）；工具栏的批注/截图/面板三按钮**去文字只留图标**（媒体查询 `@media (max-width: 479px)`，与 Rust `ui::NARROW_MODE_MAX_W=480` 同步维护）。手机类预设（360~412 宽）天然落入窄模式，避免按钮溢出
 
-内置 14 种设备预设（**内容区尺寸** + User-Agent），可通过 `bt_set_device` 或右侧面板下拉框一键切换：
+内置 14 种设备预设（**内容区尺寸** + User-Agent），可通过 `set_device`（不带 `--name` 即列出清单）或右侧面板下拉框一键切换：
 
 | 分类 | 预设（内容区尺寸） |
 |------|------|
@@ -225,11 +262,11 @@ opencode（Bun）
 
 - **批注模式** — 悬停高亮元素（覆盖层自绘），点击元素弹出输入框填写说明；引擎层拦截，弹框/下拉类元素不失焦
 - **截图模式** — 点击立即截全屏；也可进入截图模式后拖动框选区域（选区可拖拽手柄调整大小），保存时可按需裁剪（遮罩式选区，默认整图，双击还原）
-- **记录列表** — 面板「AI 功能」区：批注/截图记录卡片（截图带缩略图），显示所属标签 URL 与说明
-- **发送** — 面板底部「发送」按钮：所有记录（批注文字 + 截图图片）推送到 opencode 对话；发送后**面板列表清空**（与旧 Playwright 工具一致，仅列表为空），但**记录本身保留**并标记 `[sent]`（`bt_list_records` 仍可读取，截图也可通过 `bt_read_record_content` 取到）。投递为**推送式**：shell 发送后主动通知插件（`POST /notify/<sid>`，按会话归属），插件收到即拉取并推送到对话（无轮询、无 2s 延迟）
+- **记录列表** — 面板「AI 功能」区：批注/截图记录卡片（截图带缩略图），显示所属标签 URL 与说明。**记录上限 200 条**，超出丢最旧（`rust/src/ui/annotate.rs:395,403-406`）
+- **发送** — 面板底部「发送」按钮：所有记录（批注文字 + 截图图片）推送到 opencode 对话；发送后**面板列表清空**（与旧 Playwright 工具一致，仅列表为空），但**记录本身保留**并标记 `[sent]`（`list_records` 仍可读取，截图也可通过 `read_record_content` 取到）。投递为**推送式**：shell 发送后主动通知插件（`POST /notify/<sid>`，按会话归属），插件收到即拉取并推送到对话（无轮询、无 2s 延迟）。**待发送队列上限 500 条**，超出丢最旧（`rust/src/ui/mod.rs:1369,1464-1466`）
 - 批注和截图**必须填写说明**才能保存/发送，否则弹出提示
 
-面板「配置」区：外观主题（跟随系统/浅色/深色）、设备预设下拉（等价 `bt_set_device`）、开发者工具按钮（等价 `bt_devtools`）。
+面板「配置」区：外观主题（跟随系统/浅色/深色）、设备预设下拉（等价 `set_device`）、开发者工具按钮（等价 `devtools`）。
 
 ## 多会话
 
@@ -242,7 +279,8 @@ opencode（Bun）
 ```bash
 # 1) 定版本（动 Rust 用 minor；纯插件用 patch）
 npm version <x.y.z> --no-git-tag-version
-# 2) 构建插件产物（清空 dist 再建，避免孤儿 .js）
+# 2) 构建插件产物（npm run build = tsc，src/**/*.ts → dist/，增量、**不清空 dist**）
+#    改过文件名/删过源文件时先手动清 dist 再建，避免孤儿 .js（Windows：Remove-Item -Recurse -Force dist）
 npm run build
 # 3) 提交 + 打 tag + 建 Release（tag = v<x.y.z>）
 #    只有动 Rust 时才需要为 x.Y.0 上传各平台二进制 + SHA256SUMS：
@@ -254,7 +292,7 @@ npm publish
 
 - `SHA256SUMS` 每行 `<sha256>  <文件名>`（两空格），文件名不带路径。
 - npm 包只带 `dist/`（`files: ["dist"]`）；原生二进制由运行时从 Release 下载（见「二进制获取」）。
-- **先本地自测**：可用 `.tmp/publish-local.ps1` 覆盖到 opencode 插件缓存后重启验证（做法与脚本模板见技能 `xqv-plugin-release`）。
+- **先本地自测**：需覆盖安装到 opencode 插件缓存后重启验证；**本地覆盖安装的脚本需自备**（`.tmp/` 被 gitignore、仓库不含该文件），做法与脚本模板见技能 `xqv-plugin-release`。
 - **部署顺序（exe 文件锁）**：若已有 opencode 实例在跑，`cargo build --release` 会在最后一步报 `failed to remove file ... (os error 5)`（产物不可信）→ 先**退出 opencode**（确认 shell 也退出）→ 构建 → 重新启动。TS 改动需 `npm run build` 重建 `dist/`。
 
 ## 开发

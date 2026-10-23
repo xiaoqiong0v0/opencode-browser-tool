@@ -22,13 +22,14 @@ Rust 工具链与固定构建目录（避免污染默认 target）：
 
 ```bash
 rustc --version && cargo --version
-export CARGO_TARGET_DIR=/home/afubek/bt-target     # 可按需改
+export CARGO_TARGET_DIR="$HOME/bt-target"   # 指向你自己的构建目录,勿写死他人本机绝对路径
 ```
 
 ## 2. 构建
 
 ```bash
-cd /mnt/d/WorkSpace/my_open/opencode-browser-tool/rust   # 或你 clone 的实际路径
+export REPO="$(git rev-parse --show-toplevel)"   # 你的 clone 根目录(Linux 路径),后续示例都用它,勿写死本机绝对路径
+cd "$REPO/rust"
 CARGO_TARGET_DIR=$CARGO_TARGET_DIR cargo build --release
 # 期望：Finished，0 warning 0 error；产物 $CARGO_TARGET_DIR/release/bt-shell
 ```
@@ -38,35 +39,55 @@ CARGO_TARGET_DIR=$CARGO_TARGET_DIR cargo build --release
 
 ## 3. 启动 shell
 
+### 3.1 前置：令牌（1.10.0 起，缺失即 401）
+
+1.10.0 起所有 `/api/*` 请求必须带请求头 **`x-bt-token`**，缺失或不匹配返回 `401 {"success":false,"error":"unauthorized"}`。令牌来源优先级（实现见 `rust/src/main.rs` 的 `resolve_auth_token`）：
+
+1. 命令行 **`--token <hex>`**；
+2. 环境变量 **`BT_SHELL_TOKEN`**；
+3. 都没有 → shell 随机生成 16 字节（32 hex），并在提供 `--user-data-dir` 时写入 **`<user-data-dir>/bt-auth-token`**（Unix `chmod 600`，仅供排查；日志只打前 4 位，绝不打印全文）。
+
+**唯一精确豁免路径**：`/api/page-event`——页面注入脚本运行在远程页面源下、无法持有令牌，故该路径跳过令牌与 `Origin` 两项校验（其余带 `Origin` 的请求一律 `403`）。本清单的手动 `curl` 均非 page-event，**必须带令牌**；给 page-event 带 header 无害。
+
+复验时先固定一个令牌，起 shell 与后续请求共用同一值：
+
+```bash
+export T="${BT_SHELL_TOKEN:-$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')}"
+```
+
+> `verify-linux.sh` 自带令牌:纯 bash 内建(`$$`+`$RANDOM`)生成、`--token "$T"` 起实例、请求 `-H "x-bt-token: $T"`,两端同源且不读 token 文件(避免刚起时落盘竞态);上面 `head/od/tr` 只用于手动照抄本清单。
+
+### 3.2 起实例并等就绪
+
 在带图形会话的终端里（需能访问 `$WAYLAND_DISPLAY` 或 `$DISPLAY`）：
 
 ```bash
-cd /mnt/d/WorkSpace/my_open/opencode-browser-tool
-$CARGO_TARGET_DIR/release/bt-shell --port 8790 --user-data-dir /tmp/bt-verify-ud \
+cd "$REPO"
+$CARGO_TARGET_DIR/release/bt-shell --port 8790 --token "$T" --user-data-dir /tmp/bt-verify-ud \
   > .tmp/scratch/verify.log 2>&1 &
 ```
 
-等就绪（最多几秒）：
+等就绪（最多几秒；`/api/status` 同样要带令牌）：
 
 ```bash
 for i in $(seq 1 20); do
-  curl -sf -X POST http://127.0.0.1:8790/api/status -H 'Content-Type: application/json' -d '{}' && break
+  curl -sf -X POST http://127.0.0.1:8790/api/status -H "x-bt-token: $T" -H 'Content-Type: application/json' -d '{}' && break
   sleep 0.5
 done
 ```
 
 ## 4. HTTP 驱动命令（两种写法）
 
-服务只监听 `127.0.0.1`：WSL 内用 `curl`；Windows 侧经 WSL2 localhost 转发用 `Invoke-RestMethod`。
+服务只监听 `127.0.0.1`：WSL 内用 `curl`；Windows 侧经 WSL2 localhost 转发用 `Invoke-RestMethod`。两者所有 `/api/*` 调用都须带 `x-bt-token`（令牌见 §3.1，沿用同一 `$T`）。
 
 **curl（Linux 内）**
 
 ```bash
 API=http://127.0.0.1:8790/api
-post() { curl -s -X POST "$API/$1" -H 'Content-Type: application/json' -d "$2"; }
+post() { curl -s -X POST "$API/$1" -H "x-bt-token: $T" -H 'Content-Type: application/json' -d "$2"; }
 
-# 打开测试页（路径按实际仓库位置）
-post navigate '{"url":"file:///mnt/d/WorkSpace/my_open/opencode-browser-tool/tests/manual/input-test.html"}'
+# 打开测试页（$REPO 见 §2；随 clone 位置变化，勿写死本机绝对路径）
+post navigate "{\"url\":\"file://$REPO/tests/manual/input-test.html\"}"
 # 清空事件缓冲
 post evaluate '{"script":"(window.__events.length=0, true)"}'
 # 取判据
@@ -77,11 +98,14 @@ post evaluate '{"script":"JSON.stringify({n:__events.length,trusted:__events.fil
 
 ```powershell
 $API = "http://127.0.0.1:8790/api"
+$T   = "<与 §3.1 起 shell 时同一个令牌>"   # 若 shell 用随机生成,可从 <user-data-dir>/bt-auth-token 读取
+$Repo = "<clone 在 WSL 内的 Linux 路径>"   # 与 bash 的 $REPO 同值(浏览器在 WSL 内跑,file:// 走 Linux 路径)
 function Post($ep, $obj) {
   Invoke-RestMethod -Uri "$API/$ep" -Method Post -ContentType 'application/json' `
+    -Headers @{ "x-bt-token" = $T } `
     -Body ($obj | ConvertTo-Json) -TimeoutSec 15
 }
-Post navigate @{ url = "file:///mnt/d/WorkSpace/my_open/opencode-browser-tool/tests/manual/input-test.html" }
+Post navigate @{ url = "file:///$Repo/tests/manual/input-test.html" }
 Post evaluate @{ script = "(window.__events.length=0, true)" }
 Post evaluate @{ script = "JSON.stringify({n:__events.length,trusted:__events.filter(function(e){return e.isTrusted}).length,value:document.querySelector('#text').value,submit:__events.filter(function(e){return e.type==='submit'}).length})" }
 ```
