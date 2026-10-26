@@ -679,7 +679,8 @@ impl App {
     }
 
     /// 页面事件上报(SPA 路由/标题/图标变化;注入脚本以 no-cors 简单 POST 到此。
-    /// http.rs 已移除 CORS 与 OPTIONS(一律 405),此路径是鉴权的唯一精确路径豁免(免令牌、免 Origin 校验))
+    /// 1.11.0 / bt-shell 0.11.0 起 http.rs 只对面板自身 origin 放行 CORS(其它路径的非面板 Origin 403、
+    /// 非面板 OPTIONS 405),此路径仍是唯一的「令牌 + Origin」双豁免(精确匹配))
     async fn page_event(&self, body: &Value) -> Result<Value, String> {
         let label = body.get("label").and_then(|v| v.as_str()).unwrap_or("");
         if label.is_empty() {

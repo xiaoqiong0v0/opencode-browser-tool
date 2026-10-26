@@ -79,7 +79,7 @@ sha256 校验（**幂等**：sha 与当前 release 期望值一致即跳过；**
 >
 > **附着模式必须设置 `BT_SHELL_TOKEN`**：外部 shell 启动时的令牌必须与插件侧环境变量一致（见下方示例），否则插件启动即报 `client.attach_need_token`，不会去连一个注定 401 的端点。令牌未设置时 shell 会随机生成，因此手动启动的 shell 务必显式传 `--token`（或用同值环境变量）。
 
-**本地 API 语义**：`/api/*` 只监听 `127.0.0.1`，且只服务插件进程——所有请求必须带 `x-bt-token`（服务端常量时间比较）；**任何带 `Origin` 头的请求一律 403**（浏览器跨源必带，插件 Node `fetch` 不带），服务端**不返回任何 CORS 头**、`OPTIONS` 直接 405。令牌在 shell 实例创建期确定、运行期不可变；若提供了 `--user-data-dir`，令牌还会写到 `<user-data-dir>/bt-auth-token`（Unix `chmod 600`）供排查。日志只打印令牌前 4 位与长度。**同进程的两个合法调用方各有例外**：面板 Webview 通过 Tauri `invoke("api_token")` 读取本实例令牌（只存 JS 内存，不写 DOM/HTML/日志）后再带 `x-bt-token` 调用；页面注入脚本无法持有令牌，故服务端仅对**精确路径 `/api/page-event`** 豁免 `Origin` 与令牌校验（不做前缀匹配），该端点只更新标签 url/title/icon、不执行任何操作。
+**本地 API 语义**：`/api/*` 只监听 `127.0.0.1`，且只服务插件进程——所有请求必须带 `x-bt-token`（服务端常量时间比较）。**`Origin` 规则（1.11.0 起）**：只有**面板自身 origin 白名单**（`http://tauri.localhost` / `https://tauri.localhost` / `tauri://localhost`，精确匹配、不带端口/子域）放行；**其它任何 `Origin`（`null`、外部站点、子域变体、带端口）仍一律 403**，插件 Node `fetch` 不带 `Origin` 不受影响。**CORS 只对面板 origin 最小恢复**：预检 `OPTIONS` 回 204 + 精确回显该 origin 的 `Access-Control-Allow-Origin`（允许 `POST, OPTIONS` 与 `content-type, x-bt-token` 头），实际响应（含 401）也带精确 ACAO + `Vary: Origin`，**永不通配 `*`**；非面板来源的响应不带任何 CORS 头、`OPTIONS` 仍 405。令牌在 shell 实例创建期确定、运行期不可变；若提供了 `--user-data-dir`，令牌还会写到 `<user-data-dir>/bt-auth-token`（Unix `chmod 600`）供排查。日志只打印令牌前 4 位与长度。**同进程的两个合法调用方各有例外**：面板 Webview 通过 Tauri `invoke("api_token")` 读取本实例令牌（只存 JS 内存，不写 DOM/HTML/日志）后再带 `x-bt-token` 调用，其 origin 也在白名单内（**令牌仍是最终闸门**）；页面注入脚本无法持有令牌，故服务端仅对**精确路径 `/api/page-event`** 豁免 `Origin` 与令牌校验（不做前缀匹配），该端点只更新标签 url/title/icon、不执行任何操作。
 
 **WSL / Linux 附着示例**（shell 跑在 WSL，插件跑在 Windows 宿主）：
 
@@ -113,7 +113,7 @@ opencode（Bun）
 
 - 浏览器渲染引擎（WebView2 / WebKitGTK / WKWebView，随平台）直接绘制到插件窗口
 - 页面零注入残留脚本，弹框类元素可正常批注
-- 所有工具调用通过 `POST http://127.0.0.1:PORT/api/{command}` 通信，并统一带鉴权头 `x-bt-token`（无 CORS、拒绝任何带 `Origin` 的请求；唯一例外是页面事件桥 `/api/page-event`，见上）
+- 所有工具调用通过 `POST http://127.0.0.1:PORT/api/{command}` 通信，并统一带鉴权头 `x-bt-token`（**除面板 origin 白名单外拒绝任何带 `Origin` 的请求**；面板 origin 走最小 CORS 预检，见上。唯一鉴权豁免是页面事件桥 `/api/page-event`）
 - 除 spawn 本地 shell 外，也可用 `BT_SHELL_URL` / `BT_SHELL_PORT` **附着到已运行的 shell**（不 spawn，适用于 shell 跑在 WSL/Linux、插件跑在 Windows；**必须同时设置 `BT_SHELL_TOKEN`**，外部 shell 用同一令牌启动）
 - 跨平台代码：Windows / Linux / macOS；**预编译二进制只发 Windows x64 与 Linux x64**，macOS 需自行构建（`cargo build --release`）且功能不完整：截图待实现（`rust/src/control/screenshot.rs:4`）、DevTools 无法真正关闭（`close_supported = cfg!(target_os = "linux")`，`rust/src/service.rs:1063`）、自定义 UA 未实现
 - 真多标签：每标签独立 page Webview，切换不重载；`target=_blank` / `window.open` 链接通过 WebView2 原生事件拦截并打开为新标签。**关闭标签会释放该标签的页面实例**（预创建池的 3 个 webview 保留复用，池外动态创建的实例直接销毁），反复开关标签不会累积页面进程

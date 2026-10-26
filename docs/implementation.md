@@ -2,7 +2,7 @@
 
 ## 当前架构（V5：跨平台 Tauri 2 多 Webview）
 
-**当前版本**：插件 **1.10.2**（`package.json`）/ bt-shell **0.10.0**（`rust/Cargo.toml`）。1.10.1 只动插件 TS：`httpCall` 统一原语、模型可见文本脱敏、状态文案去重；1.10.2 为文档一致性 + `read_record_content` 传 `includeImages:true` + Linux 复验脚本补令牌（零 Rust 改动，复用 1.10.0 二进制）。本文所有 `src/client.ts`、`src/index.ts` 行号均按 **1.10.2** 代码核对。
+**当前版本**：插件 **1.11.0**（`package.json`）/ bt-shell **0.11.0**（`rust/Cargo.toml`）。1.10.1 只动插件 TS：`httpCall` 统一原语、模型可见文本脱敏、状态文案去重；1.10.2 为文档一致性 + `read_record_content` 传 `includeImages:true` + Linux 复验脚本补令牌（零 Rust 改动，复用 1.10.0 二进制）。**1.11.0 动 Rust（→ 新二进制 `0.11.0`）**：修 1.10.0 引入的回归——面板 webview 的 `fetch` 带 `Origin: http://tauri.localhost`，被「带 `Origin` 一律 403」挡死，面板 `/api/device/list` 取不到、设备预设下拉只剩「默认」；现改为面板 origin 白名单 + 最小 CORS（预检 204/精确 ACAO），其它 Origin 仍 403。本文所有 `src/client.ts`、`src/index.ts` 行号均按 **1.10.2** 代码核对（1.11.0 无 TS 改动），`rust/src/http.rs` 行号按 **0.11.0**。
 
 单窗口 + 多 Webview（toolbar / page-1..N 真多标签 / overlay / panel / newtab），前端 TS 工程化，详见 [v5-tauri-architecture.md](./v5-tauri-architecture.md)。
 
@@ -126,9 +126,11 @@
 
 - **内存随会话数增长**:每会话一个 WebView2 进程组(主进程 + GPU + 渲染 + 实用工具进程),约数十 MB~百 MB 量级。并发会话多时需关注任务管理器。缓解手段(未实现):idle TTL 回收、会话数上限。
 
-## 本地 API 鉴权（1.10.0 / shell 0.10.0 引入，1.10.1 收敛到 `httpCall`）
+## 本地 API 鉴权（1.10.0 / shell 0.10.0 引入，1.10.1 收敛到 `httpCall`，1.11.0 恢复面板最小 CORS）
 
 **动机**：HTTP API 此前只绑 `127.0.0.1` 且返回 `Access-Control-Allow-Origin: *`，本机任何网页都能跨源调用（读页面内容、驱动浏览器）。1.10.0 起改为「回环 + 共享令牌 + 拒绝浏览器来源」。
+
+**1.11.0 修正**：1.10.0 的「带 `Origin` 一律 403」把**自家面板**也挡在门外——面板 webview 的 `fetch` 运行在 `tauri.localhost` 源下，必然带 `Origin`，于是面板所有 `/api/*` 全 403（`/api/device/list` 取不到，设备预设下拉只剩「默认」）。现改为「**面板 origin 白名单 + 最小 CORS**，其它来源仍 403」，令牌闸门不变。
 
 ### 令牌来源与生命周期
 
@@ -139,23 +141,31 @@
 
 ### 请求校验（`rust/src/http.rs`）
 
-- **非豁免路径带 `Origin` → 一律 `403`**（`http.rs:64`），且**先于 `OPTIONS` 与令牌判定**（`http.rs:64` → `:68` → `:71`）；浏览器跨源必带 `Origin`，插件 `fetch` 不带。
-- `OPTIONS` 一律 `405` + `{error:"method_not_allowed"}`（`http.rs:68`，**移除全部 CORS 响应头**，豁免路径也不放宽）。
-- 所有非豁免 `/api/*` 必须带请求头 `x-bt-token`（`http.rs:71`）；缺失或不匹配 → `401` + `{success:false,error:"unauthorized"}`（不回显期望值）。比较用自实现的常量时间比较 `constant_time_eq`（`http.rs:107`）。
-- **鉴权矩阵（按代码判定顺序）**：
+- **Origin 规则（1.11.0 起）**：只有**面板自身 origin 白名单**放行，其余任何带 `Origin` 的请求仍 **403**。
+  - 白名单 `PANEL_ORIGINS`（`http.rs:40-44`）为**精确字节比较**（`is_panel_origin`，`http.rs:144`，不做大小写/端口/子域归一化）：`http://tauri.localhost`、`https://tauri.localhost`（Windows WebView2 的 tauri 自定义协议源）、`tauri://localhost`（Linux/macOS WebKit 自定义协议源）。
+  - `null`、任意 http(s) 站点（`http://evil.com`）、子域变体（`http://tauri.localhost.evil.com`）、带端口（`http://tauri.localhost:3000`）、大写形式（`HTTP://TAURI.LOCALHOST`）**一律 403**。
+- **面板最小 CORS**：仅面板 origin 享受 CORS，**永不通配 `*`**、永远原样回显该 origin。
+  - 预检 `OPTIONS` → **204**（`preflight_response`，`http.rs:196`）：`Access-Control-Allow-Origin: <该 origin>`、`Access-Control-Allow-Methods: POST, OPTIONS`、`Access-Control-Allow-Headers: content-type, x-bt-token`、`Access-Control-Max-Age: 600`、`Vary: Origin`；若请求带 `Access-Control-Request-Private-Network: true` 再补 `Access-Control-Allow-Private-Network: true`（Chromium 私有网络预检，`http.rs:29-34`）。
+  - 实际响应（200，以及面板 origin 的 **401**）也回精确 ACAO + `Vary: Origin`（`attach_cors`，`http.rs:214`；成功路径 `http.rs:140`）。401 带 ACAO 是必需的，否则前端读不到错误体、只会看到 CORS 失败。
+  - **非面板 origin / 无 `Origin` 的响应一律不带任何 CORS 头**；非面板 origin（或无 `Origin`）的 `OPTIONS` → `405` + `{error:"method_not_allowed"}`（`method_not_allowed`，`http.rs:259`）。
+- 所有非豁免 `/api/*` 必须带请求头 `x-bt-token`（令牌判定在 `decide_auth`，`http.rs:186-188`；取值比较 `token_matches`，`http.rs:227`）；缺失或不匹配 → `401` + `{success:false,error:"unauthorized"}`（`auth_error`，`http.rs:248`，不回显期望值）。比较用自实现的常量时间比较 `constant_time_eq`（`http.rs:235`）。
+- **鉴权矩阵（按代码判定顺序，`decide_auth` `http.rs:167-190`）**：
 
   | 请求形态 | 结果 | 位置 |
   |---|---|---|
-  | `POST /api/page-event`（精确路径，含带 `Origin`、无令牌） | **200**（豁免两项校验后照常分发） | `http.rs:61` |
-  | 非豁免路径 + 带 `Origin`（无论是否带令牌、是否 OPTIONS） | **403** | `http.rs:64` |
-  | 非豁免路径 + 无 `Origin` + `OPTIONS` | **405** | `http.rs:68` |
-  | 非豁免路径 + 无 `Origin` + 无/错令牌 | **401** | `http.rs:71` |
-  | 非豁免路径 + 无 `Origin` + 正确令牌 | 进入 `App::handle` | `http.rs:71` 之后 |
+  | `POST /api/page-event`（精确路径，含带**任意** `Origin`、无令牌） | **200**（豁免 `Origin` 与令牌两项校验后照常分发） | `http.rs:174-176` |
+  | 非豁免路径 + **非面板** `Origin`（无论是否带令牌、是否 `OPTIONS`） | **403** | `http.rs:176` → `:101` |
+  | 面板 origin + `OPTIONS` | **204** 预检（精确 ACAO + 允许方法/头） | `http.rs:179-185` → `:196` |
+  | 非面板 / 无 `Origin` + `OPTIONS` | **405** | `http.rs:179-185` → `:259` |
+  | 无 `Origin`（插件 Node `fetch`）+ 无/错令牌 | **401** | `http.rs:186-188` → `:248` |
+  | 面板 origin + 非 `OPTIONS` + 无/错令牌 | **401**（带精确 ACAO） | `http.rs:186-188` → `:103-104` |
+  | 无 `Origin` 或面板 origin + 正确令牌 | 进入 `App::handle`（面板 origin 的响应带 ACAO） | `http.rs:189` 之后 / `:140` |
 
-   注一：`/api/page-event/extra` **不是**豁免路径（精确匹配，非前缀）——带 `Origin` 走 403，无 `Origin` 无令牌才落 401。
-   注二：401 与 403 **共用同一个响应体** `auth_error`（`http.rs:120-128`，`{success:false,error:"unauthorized"}`，不回显期望令牌）；区分只体现在状态码上。TS 侧把 401/403 一并归入 `HttpOutcome.auth`（`client.ts:681-682`）。
-- **唯一豁免：精确路径 `/api/page-event`**。页面注入脚本运行在远程页面源下、拿不到令牌，浏览器又必带 `Origin`，故该路径跳过 `Origin` 与令牌两项校验。残余风险：该端点只把 url/title/icon 写进 `TabState` 提示、不执行操作、无敏感回读，被同机页面伪造最多导致地址栏/标题错乱；若未来给它加敏感字段或副作用，必须重新评估豁免。
-- 校验顺序：`page-event` 精确判定 → `Origin`（豁免路径跳过）→ `OPTIONS` → 令牌（豁免路径跳过）→ 读 body → `App::handle`。
+   注一：`/api/page-event/extra` **不是**豁免路径（精确匹配，非前缀）——带非面板 `Origin` 走 403，无 `Origin` 无令牌才落 401。
+   注二：401 与 403 **共用同一个响应体** `auth_error`（`http.rs:248`，`{success:false,error:"unauthorized"}`，不回显期望令牌）；区分只体现在状态码上。TS 侧把 401/403 一并归入 `HttpOutcome.auth`（`client.ts:681-682`）。
+- **唯一豁免：精确路径 `/api/page-event`**，且该豁免**最先判定、先于 `Origin`**。页面注入脚本运行在远程页面源下、拿不到令牌，浏览器又必带 `Origin`，故该路径跳过 `Origin` 与令牌两项校验；但 `OPTIONS` 不豁免（非面板 origin 仍 405）。残余风险：该端点只把 url/title/icon 写进 `TabState` 提示、不执行操作、无敏感回读，被同机页面伪造最多导致地址栏/标题错乱；若未来给它加敏感字段或副作用，必须重新评估豁免。
+- **面板 origin 放行的边界**：外部网页无法伪造 `Origin`（浏览器强制写入），`null`（沙箱 iframe / `file://`）、带端口、子域变体都不在白名单，故放行不扩大对"其它站点"的攻击面；**令牌仍是最终闸门**（面板 origin 同样必须有正确 `x-bt-token`），Origin 只做纵深防御。残余风险：同机进程可自带任意 `Origin` 构造请求（绕过 Origin 语义），但同机进程本就能读到实例令牌，故非新增风险。
+- 校验顺序：`page-event` 精确判定 → `Origin`（豁免路径跳过）→ `OPTIONS` → 令牌（豁免路径跳过）→ 读 body → `App::handle`（`http.rs:70` 头注释同步）。
 
 ### TS 侧（`src/client.ts`）
 
@@ -166,8 +176,8 @@
 
 ### 注意 / 已知边界
 
-- **页面 webview 的 `/api/page-event` 上报通道**（`rust/src/ui/mod.rs` 注入脚本，跨源 beacon 必带 `Origin` 且无法持有令牌）：服务端按**精确路径**豁免校验后恢复可用（见上），SPA 路由/标题/图标的即时上报不再退化。注：代码侧「http.rs 已开 CORS」的过时注释（`ui/mod.rs` 已更正，`service.rs` 的 `page_event` 于本次清理更正）均已改为准确表述——CORS 与 OPTIONS 已移除，`/api/page-event` 为唯一精确路径豁免。
-- **面板 Webview 的 `/api/*` 调用**：通过 Tauri 命令 `api_token` 读取本实例令牌（`rust/src/main.rs` 的 `ApiToken` 受管状态，与 `http::serve` 同源），前端启动后首次 `api()` 时缓存并带 `x-bt-token`；读取失败只打面板控制台错误、不阻断面板，令牌不写入 DOM/HTML/日志。
+- **页面 webview 的 `/api/page-event` 上报通道**（`rust/src/ui/mod.rs` 注入脚本，跨源 beacon 必带 `Origin` 且无法持有令牌）：服务端按**精确路径**豁免校验后可用（见上），SPA 路由/标题/图标的即时上报不退化。注意：`rust/src/ui/mod.rs:215`、`rust/src/service.rs:682` 的注释仍写「CORS 已移除、OPTIONS 一律 405」，那是 1.10.0 口径，**1.11.0 起已过时**（面板 origin 恢复最小 CORS；非面板来源的 CORS/OPTIONS 语义未变）——Rust 注释尚未同步，以本文与 `http.rs:1-9` 头注释为准。
+- **面板 Webview 的 `/api/*` 调用**：通过 Tauri 命令 `api_token` 读取本实例令牌（`rust/src/main.rs` 的 `ApiToken` 受管状态，与 `http::serve` 同源），前端启动后首次 `api()` 时缓存并带 `x-bt-token`；读取失败只打面板控制台错误、不阻断面板，令牌不写入 DOM/HTML/日志。**面板 origin（`http(s)://tauri.localhost` / `tauri://localhost`）自 1.11.0 起在白名单内**：预检走 204 + 精确 ACAO，实际请求照常校验令牌；外部站点仍 403。
 - 令牌是**单实例共享秘密**，不做多用户/多会话区分；附着模式下所有 sid 共用同一个外部 shell 与同一令牌。
 
 ## 1.10.1 HTTP 调用统一原语与文本脱敏（插件侧，零 Rust 改动）

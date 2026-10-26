@@ -212,7 +212,9 @@ const PAGE_BRIDGE_JS: &str = r##"
 "##;
 
 /// 页面事件上报脚本(注入页面 Webview):SPA 路由 / 标题 / 图标变化时**主动上报**给 shell。
-/// 通道:HTTP POST 到 127.0.0.1:<port>/api/page-event(http.rs 已移除 CORS、OPTIONS 一律 405,该路径是鉴权的唯一精确路径豁免(免令牌、免 Origin 校验),故只能走 no-cors 简单 POST;
+/// 通道:HTTP POST 到 127.0.0.1:<port>/api/page-event(1.11.0 / bt-shell 0.11.0 起 http.rs 只对面板自身
+/// origin 放行 CORS,其它路径的非面板 Origin 403、非面板 OPTIONS 405;该路径仍是唯一的「令牌 + Origin」
+/// 双豁免(精确匹配),故页面侧只能走 no-cors 简单 POST;
 /// Tauri 自带 IPC 在远程页面被能力门禁挡住,实测 invoke 一直 pending,故不用)。
 /// 端口/label 由 Rust 逐 webview 注入(window.__btEventPort / window.__btPageLabel)。
 const PAGE_EVENT_JS: &str = r##"

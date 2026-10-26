@@ -28,7 +28,7 @@ const PORT_START_ATTEMPTS = 5;
 const TITLE_RESOLVE_TIMEOUT_MS = 250;
 /** HTTP 401 Unauthorized:shell 明确判定令牌不匹配(rust/src/http.rs 的 auth_error) */
 const HTTP_UNAUTHORIZED = 401;
-/** HTTP 403 Forbidden:shell 明确拒绝该请求(带 Origin 的跨源请求) */
+/** HTTP 403 Forbidden:shell 明确拒绝该请求(Origin 不在面板白名单;1.11.0 起面板自身 origin 已放行) */
 const HTTP_FORBIDDEN = 403;
 
 /** 二进制来源(用于日志一眼判断用的是哪份) */
