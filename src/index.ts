@@ -21,6 +21,7 @@ import { sanitizeForModel } from "./util/sanitize.js";
 import { tool, type Plugin } from "@opencode-ai/plugin";
 import { log } from "./logger.js";
 import { createSessionIDCache, extractSessionIDFromEvent } from "./session-id.js";
+import { createSessionTree } from "./session-tree.js";
 
 /** 取 i18n 文案(tf 的快捷别名;vars 可选,替换 {name} 占位符) */
 const _t = (k: string, vars?: Record<string, string | number>) => tf(k, vars);
@@ -28,6 +29,15 @@ const _t = (k: string, vars?: Record<string, string | number>) => tf(k, vars);
 /** 当前会话 id(工具调用的显式 _sessionId 优先,否则用钩子缓存兜底) */
 function sidOf(a: any): string {
   return resolveSessionId(typeof a?._sessionId === "string" ? a._sessionId : "");
+}
+
+/** 取 raw 会话最终归属的浏览器 key(私有=自身;否则沿 parentID 归并到根;失败回退 raw,不抛) */
+async function browserKeyOf(raw: string): Promise<string> {
+  try {
+    return await sessionTree.browserKey(raw);
+  } catch {
+    return raw || "default";
+  }
 }
 
 /** 构造只带会话 id 的请求体(用于无参但需按会话路由的命令,如 list_tabs / reload) */
@@ -132,8 +142,8 @@ const COMMANDS: Record<string, CmdDef> = {
     return r?.truncated ? `${html}\n${_t("cli.out.html_truncated", { n: html.length })}` : html;
   } },
   console_logs: { usage: "[--type --search --limit --clear]", descKey: "cli.cmd.console_logs", args: [{ flag: "type" }, { flag: "search" }, { flag: "limit" }, { flag: "clear", type: "boolean" }], run: async (a) => { const r = await service.consoleLogs(a); return (r.logs || []).join("\n") || _t("cli.out.no_logs"); } },
-  go_back: { usage: "", descKey: "cli.cmd.go_back", run: async () => { const r = await service.goBack(); return _t("cli.out.go_back", { url: r.url }) + readyNote(r); } },
-  go_forward: { usage: "", descKey: "cli.cmd.go_forward", run: async () => { const r = await service.goForward(); return _t("cli.out.go_forward", { url: r.url }) + readyNote(r); } },
+  go_back: { usage: "", descKey: "cli.cmd.go_back", run: async (a) => { const r = await service.goBack(sidArgs(a)); return _t("cli.out.go_back", { url: r.url }) + readyNote(r); } },
+  go_forward: { usage: "", descKey: "cli.cmd.go_forward", run: async (a) => { const r = await service.goForward(sidArgs(a)); return _t("cli.out.go_forward", { url: r.url }) + readyNote(r); } },
   // resize:宽高=内容区(视口)尺寸;被钳到下限时如实标注(服务端返回 clamped/content/window)
   resize: { usage: "--width --height", descKey: "cli.cmd.resize", args: [{ flag: "width" }, { flag: "height" }], run: async (a) => {
     const r = await service.resize(a);
@@ -145,11 +155,11 @@ const COMMANDS: Record<string, CmdDef> = {
       const list = await service.deviceList(sidArgs(a));
       return [_t("cli.out.device_list_header"), "", ...(list.devices || []).map((d: any) => `  ${d.name}  ${d.width}x${d.height}${d.ua ? `  ${d.ua.slice(0, 60)}...` : "  (default UA)"}`)].join("\n");
     }
-    const r = await service.device({ name: a.name });
+    const r = await service.device({ name: a.name, ...sidArgs(a) });
     return _t("cli.out.device_applied", { name: r.device, w: r.width, h: r.height, ua: r.ua });
   } },
   devtools: { usage: "[--action]", descKey: "cli.cmd.devtools", args: [{ flag: "action" }], run: async (a) => {
-    const r = await service.devtools({ action: a.action || "toggle" });
+    const r = await service.devtools({ action: a.action || "toggle", ...sidArgs(a) });
     // supported=false:该平台无法真正关闭(Windows/wry 空实现)→ 如实提示,不接受误导性的「已关闭」
     if (r?.supported === false) return _t("cli.out.devtools_unsupported");
     return r.open ? _t("cli.out.devtools_open") : _t("cli.out.devtools_closed");
@@ -189,8 +199,8 @@ const COMMANDS: Record<string, CmdDef> = {
   scroll_to_element: { usage: "--selector [--timeout ms]", descKey: "cli.cmd.scroll_to_element", args: [{ flag: "selector" }, { flag: "timeout" }], run: async (a) => { const tn = timeoutNote(a); const r = await service.scrollToElement(a); return _t("cli.out.scroll_to_element") + reachedNote(r) + tn; } },
   get_dropdown_options: { usage: "--selector [--timeout ms]", descKey: "cli.cmd.get_dropdown_options", args: [{ flag: "selector" }, { flag: "timeout" }], run: async (a) => { const tn = timeoutNote(a); const r: any = await service.dropdownOptions(a); const opts: any[] = r?.options ?? []; if (!opts.length) return _t("cli.out.dropdown_none", { sel: a.selector }); return opts.map((o: any) => `${o.selected ? "* " : "  "}${o.value}: ${o.text}`).join("\n") + tn; } },
   custom_user_agent: { usage: "--userAgent", descKey: "cli.cmd.custom_user_agent", args: [{ flag: "userAgent" }], run: async (a) => { await service.userAgent(a); return _t("cli.out.ua_set"); } },
-  expect_response: { usage: "--url", descKey: "cli.cmd.expect_response", args: [{ flag: "url" }], run: async (a) => { await service.expectResponse({ urlPattern: a.url }); return _t("cli.out.expect_response", { url: a.url }); } },
-  assert_response: { usage: "--id", descKey: "cli.cmd.assert_response", args: [{ flag: "id" }], run: async (a) => { const r = await service.assertResponse({ id: a.id }); return r.matched ? _t("cli.out.assert_matched", { url: r.url, status: r.status }) : r.error || _t("cli.out.assert_none"); } },
+  expect_response: { usage: "--url", descKey: "cli.cmd.expect_response", args: [{ flag: "url" }], run: async (a) => { await service.expectResponse({ urlPattern: a.url, ...sidArgs(a) }); return _t("cli.out.expect_response", { url: a.url }); } },
+  assert_response: { usage: "--id", descKey: "cli.cmd.assert_response", args: [{ flag: "id" }], run: async (a) => { const r = await service.assertResponse({ id: a.id, ...sidArgs(a) }); return r.matched ? _t("cli.out.assert_matched", { url: r.url, status: r.status }) : r.error || _t("cli.out.assert_none"); } },
   get_accessibility_tree: { usage: "[--selector --maxDepth] [--timeout ms]", descKey: "cli.cmd.get_accessibility_tree", args: [{ flag: "selector" }, { flag: "maxDepth" }, { flag: "timeout" }], run: async (a) => { const tn = timeoutNote(a); const s = await service.accessibility(a); return (s ? formatNode(s, 0, a.maxDepth ?? 8) : _t("cli.out.no_ax")) + tn; } },
   list_records: { usage: "", descKey: "cli.cmd.list_records", run: async (a) => { try { const records = await service.annotateRecords(sidArgs(a)); if (!records || !records.length) return _t("cli.out.no_records"); return records.map((r: any) => { const rect = r.rect ? ` rect=(${r.rect[0]},${r.rect[1]},${r.rect[2]},${r.rect[3]})` : ""; const img = r.image ? " +img" : ""; const sent = r.sent ? " [sent]" : ""; return `[${r.index}] ${r.selector}${rect}${img}${sent}${r.note ? ` note="${r.note}"` : ""}`; }).join("\n"); } catch { return _t("cli.out.no_records"); } } },
   read_record_content: { usage: "--id", descKey: "cli.cmd.read_record_content", args: [{ flag: "id" }], run: async (a) => { try { const records = await service.annotateRecords({ ...sidArgs(a), includeImages: true }); const rec = (records || []).find((r: any) => r.index === a.id); if (!rec) return _t("cli.out.record_not_found", { id: a.id }); let img = ""; if (rec.image) { const p = saveShotImage(log, sidOf(a), rec.index, rec.image); const kb = Math.round(rec.image.length / 1024); img = p ? _t("cli.out.record_image_saved", { kb, path: p }) : _t("cli.out.record_image", { kb }); } return `#${rec.index} ${rec.selector}\nrect: ${JSON.stringify(rec.rect)}${img}\nnote: ${rec.note || _t("cli.out.record_note_none")}`; } catch { return _t("cli.out.no_records"); } } },
@@ -275,20 +285,40 @@ function buildHelp(): string {
   const examples = [_t("cli.example.1"), _t("cli.example.2"), _t("cli.example.3"), _t("cli.example.4")]
     .map((e) => `  ${e}`)
     .join("\n");
-  return `${_t("cli.header")}\n\n${_t("cli.usage")}\n\n${_t("cli.commands")}\n${lines.join("\n")}\n\n${_t("cli.examples")}\n${examples}`;
+  return `${_t("cli.header")}\n\n${_t("cli.usage")}\n\n${_t("cli.usage.flags")}\n\n${_t("cli.commands")}\n${lines.join("\n")}\n\n${_t("cli.examples")}\n${examples}`;
 }
 
 /** 描述内嵌的紧凑命令索引(模型无需先调 help 即可用) */
 const DESC_INDEX = Object.entries(COMMANDS).map(([k, v]) => `${k} ${v.usage}`).join(" | ");
 
-/** 解析 --flag 风格参数(基于 node:util.parseArgs,未知 flag 报错;tokens 已由 string-argv 正确分词) */
+/** 解析 --flag 风格参数(基于 node:util.parseArgs,未知 flag 报错;tokens 已由 string-argv 正确分词)
+ * 全局 flag `--private-session` 对所有命令可用,由调用方消费(不进入命令业务参数)。
+ *
+ * `parseArgs` 默认把值解析成字符串,而 Rust 端对下列 flag 用 `as_i64`/`as_f64` 读取
+ * (取不到就落默认值/0):不转换会静默失效(如 `resize --width 800` 被钳到下限)。
+ * 因此这里对已知数值 flag 统一转 number;非数字直接报错,不带着坏值进浏览器。 */
 function parseFlagArgs(tokens: string[], def: CmdDef): Record<string, any> {
   if (tokens.length === 0) return {};
-  const options: Record<string, any> = {};
+  // 全局 boolean flag 先声明,避免被当作未知参数;若它出现在某个 string flag 之后,
+  // parseArgs 会把它当成该 flag 的值(与用户显式传值一致,不会误判为私有会话)。
+  const options: Record<string, any> = { "private-session": { type: "boolean" } };
   for (const arg of def.args || []) options[arg.flag] = { type: arg.type || "string" };
   const { values } = parseArgs({ args: tokens, options, allowPositionals: true });
+  for (const key of Object.keys(values)) {
+    if (!NUMERIC_FLAGS.has(key)) continue;
+    const raw = values[key];
+    if (raw === undefined || raw === null || raw === "") continue;
+    const n = Number(String(raw).trim());
+    if (!Number.isFinite(n)) {
+      throw new Error(_t("cli.err.flag_not_number", { flag: key, v: String(raw) }));
+    }
+    (values as Record<string, any>)[key] = n;
+  }
   return values;
 }
+
+/** 需要转成 number 的 flag(Rust 端按数值读取;新增数值参数时必须同步登记) */
+const NUMERIC_FLAGS = new Set(["width", "height", "index", "freq", "durMs"]);
 
 /** 简单 CSV 行解析(处理引号包裹的字段,Edge/Chrome 密码导出格式) */
 function splitCsvLine(line: string): string[] {
@@ -327,8 +357,11 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree, directory 
       // 会话数据目录:sessions/<profile>/<sid>(profile 影响后续新会话的数据根)
       resolveDataDir: (sid: string) => getSessionDataDir(sid),
     });
-    // 会话 id 兜底解析器:工具调用没带 _sessionId 时用钩子缓存
-    setSessionIdResolver(() => sessionCache.get());
+    // 会话树归并的 client:父会话查询用 client.session.get({ path: { id } }).parentID
+    sessionTreeClient = client;
+    // 会话 id 兜底解析器:工具调用没带 _sessionId 时用钩子缓存;若该 raw 已解析过根,
+    // 返回归并后的 key(否则未显式透传 sid 的调用会落到子会话,另起实例)
+    setSessionIdResolver(() => sessionTree.knownKey(sessionCache.get()));
     // 可选会话标题解析器:client.session.get 之类;拿不到/超时回退 sid 后缀,不阻塞启动
     setTitleResolver(async (sid: string) => {
       try {
@@ -349,18 +382,31 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree, directory 
       event: async ({ event }) => {
         // 缓存最近会话 id:这是投递批注最可靠的 sessionID 来源
         if (event.type === "session.deleted") {
-          // 删除会话(1.9.0 语义升级):清钩子缓存 + **回收该会话自己的浏览器实例**。
+          // 删除会话(1.9.0 语义升级 + 会话树归并):清钩子缓存 + **回收该会话自己的浏览器实例**。
           // 仍是「绝不因删除而 spawn」:closeSession 只在注册表里有该 sid 时才动进程,
           // 没有实例就直接返回(不会再走 callApi → ensureInstance 那条会弹窗的老路)。
+          // 归并语义:删除**子会话**时不得关闭根实例、不得删根数据目录(子会话与根共用一份)。
           const delId = extractSessionIDFromEvent(event);
           if (delId) {
+            // 先取归并 key(删除后 session.get 可能失败 → 回退 raw;此前工具调用已缓存根)
+            const key = await browserKeyOf(delId);
             sessionCache.clearIf(delId);
-            await closeSession(delId);
-            clearClosedState(delId);
-            // 清该 sid 的附着 notify 记录(附着模式共享 shell,避免残留 key 无限增长)
-            clearAttachNotifyForSid(delId);
-            // 回收该会话的数据目录(P1:否则退出后磁盘目录永不释放)
-            removeSessionDataDir(delId);
+            sessionTree.forget(delId);
+            if (key === delId) {
+              // 根会话 / 无父会话 / 私有会话:回收它自己的实例与数据目录
+              await closeSession(delId);
+              clearClosedState(delId);
+              // 清该 sid 的附着 notify 记录(附着模式共享 shell,避免残留 key 无限增长)
+              clearAttachNotifyForSid(delId);
+              // 回收该会话的数据目录(P1:否则退出后磁盘目录永不释放)
+              removeSessionDataDir(delId);
+              sessionCache.clearIf(key);
+            } else {
+              // 子会话:只清它自己的关闭标记/附着记录;根实例与根数据目录保持不动
+              clearClosedState(delId);
+              clearAttachNotifyForSid(delId);
+              log.info(`[session] child session deleted sid=${delId} (browserKey=${key}); root instance/data kept`);
+            }
           }
           return;
         }
@@ -376,7 +422,7 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree, directory 
       tool: filterDisabled(
         {
           bt_cli: tool({
-            description: _t("tool.cli.desc") + "\n" + DESC_INDEX,
+            description: _t("tool.cli.desc") + "\n" + DESC_INDEX + "\n" + _t("cli.usage.flags"),
             args: {
               // 单字符串命令行: "<command> [--flag value ...]", 如 "navigate --url https://..." / "help"
               args: tool.schema.string().optional().describe(_t("tool.cli.arg.args")),
@@ -401,16 +447,24 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree, directory 
                   return `${_t("cli.invalid_args").replace("{cmd}", cmdName).replace("{msg}", sanitizeForModel(e?.message || String(e)))}\n\nUsage: bt_cli({ args: "${cmdName} ${def.usage}" })`;
                 }
               }
+              // 全局 flag:`--private-session` 表示本次与后续调用都用调用者自己的 sid(不归并根会话)。
+              // parseFlagArgs 已声明该 boolean flag;这里消费掉,不进入命令业务参数。
+              const privateRequested = params["private-session"] === true;
+              delete params["private-session"];
+              // 刷新钩子缓存(兜底:即使钩子未触发也能拿到 sid),再按会话树取浏览器 key:
+              // raw = 调用者会话;browserKey = 私有会话?raw : 沿 parentID 回溯到的根会话。
+              sessionCache.updateFromHookInput(context);
+              const rawSid = resolveSessionId(context?.sessionID || "");
+              if (privateRequested) sessionTree.markPrivate(rawSid);
+              const browserSid = await browserKeyOf(rawSid);
               // @file: 引用解析:值以 @file:<path> 开头时读文件内容作为实际值
               // (密码等敏感值不进 LLM 上下文,如 fill --value @file:C:\...\secret.tmp)
-              // 安全边界:只允许读全局 tmp(getTmpDir)或**该会话** tmp(getSessionTmpDir)之内的文件;
+              // 安全边界:只允许读全局 tmp(getTmpDir)或**该会话(归并后 key)** tmp(getSessionTmpDir)之内的文件;
               // 其余路径一律拒绝(不读取),避免模型借助 @file: 读取任意本地文件。
-              // sid 形态校验:resolveSessionId 会原样返回外部传入的 sessionID,任意字符串(含 .. 、路径分隔符)
+              // sid 形态校验:归并 key 来自会话树/外部传入值,任意字符串(含 .. 、路径分隔符)
               // 会把 getSessionTmpDir 带到 sessions 目录之外,从而左右 allowed dirs。不匹配 SESSION_SID_RE
-              // 一律回退 "default" 桶(而非 resolveSessionId(""):后者仍可能返回同一个非法的钩子缓存值)。
-              // "default" 本身合法,getSessionTmpDir("default") = sessions/<profile>/default/tmp,必在 sessions 内。
-              const fileSidRaw = resolveSessionId(context?.sessionID || "");
-              const fileSid = SESSION_SID_RE.test(fileSidRaw) ? fileSidRaw : "default";
+              // 一律回退 "default" 桶("default" 本身合法,getSessionTmpDir("default") = sessions/<profile>/default/tmp,必在 sessions 内)。
+              const fileSid = SESSION_SID_RE.test(browserSid) ? browserSid : "default";
               const globalTmpDir = getTmpDir();
               const allowedTmpDirs = [globalTmpDir, getSessionTmpDir(fileSid)];
               for (const key of Object.keys(params)) {
@@ -433,10 +487,9 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree, directory 
                   }
                 }
               }
-              // 透传会话 ID(会话隔离用),并刷新钩子缓存(兜底:即使钩子未触发也能拿到 sid)
-              sessionCache.updateFromHookInput(context);
+              // 透传归并后的会话 key(会话隔离 + 子会话归并):后续 sidOf/sidArgs 优先用它
               setAppDirectory(context?.directory || "");
-              params._sessionId = context?.sessionID || "";
+              params._sessionId = browserSid;
               try {
                 return await def.run(params);
               } catch (e: any) {
@@ -454,7 +507,10 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree, directory 
             async execute(a: any, context: any) {
               sessionCache.updateFromHookInput(context);
               setAppDirectory(context?.directory || "");
-              const r = await service.mediaMode({ ...a, _sessionId: context?.sessionID || "" });
+              // 与 bt_cli 同口径:走归并后的 key(私有会话粘住自身)
+              const rawSid = resolveSessionId(context?.sessionID || "");
+              const key = await browserKeyOf(rawSid);
+              const r = await service.mediaMode({ ...a, _sessionId: key });
               return _t("cli.out.media_mode", { mode: r.mode });
             },
           }),
@@ -508,6 +564,24 @@ let annotateClient: any = null;
 const drainingSid = new Set<string>();
 /** 最近一次见到的会话 id 缓存(来自 event/chat.message/tool.execute.before 钩子) */
 const sessionCache = createSessionIDCache();
+
+/** 会话树归并所需的插件 client(插件初始化时赋值;未就绪时父查询按失败处理) */
+let sessionTreeClient: any = null;
+/**
+ * 会话树归并:子代理会话默认归并到根会话(共用实例/数据目录/标题);
+ * `--private-session` 的会话粘住自身。缓存与私有标记是**进程级**的,插件重载不丢。
+ */
+const sessionTree = createSessionTree({
+  fetchParent: async (sid: string) => {
+    if (!sessionTreeClient) return undefined;
+    const r = await sessionTreeClient.session.get({ path: { id: sid } });
+    // 包络异常(有 error / 无 data)按失败处理:绝不把子会话误判为根并长期缓存
+    if (!r || !r.data) return undefined;
+    const parent = r.data.parentID;
+    return typeof parent === "string" && parent.trim() ? parent.trim() : null;
+  },
+  onWarn: (m: string) => log.info(m),
+});
 
 /** 把截图 base64 落盘为临时 PNG,返回路径(失败返回 null);用于发送时保留图片与给出可读路径
  * 1.9.0:落盘到**该会话**的临时目录 sessions/<profile>/<sid>/tmp(不再与其它会话共享全局 tmp) */

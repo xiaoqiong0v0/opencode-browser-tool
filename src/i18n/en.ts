@@ -3,11 +3,12 @@ import type { LocaleStrings } from "./types.js";
 const en: LocaleStrings = {
   tool: {
     "tool.cli.desc":
-      "Browser automation via a CLI-style dispatcher: pass a single command string, e.g. \"navigate --url https://...\" or \"help\". Omit to list all commands. screenshot with --selector scrolls the element into view first. The browser process is managed automatically by this tool — do not run the bt-shell executable directly (it causes multiple instances and file-lock conflicts).",
+      "Browser automation via a CLI-style dispatcher: pass a single command string, e.g. \"navigate --url https://...\" or \"help\". Omit to list all commands. screenshot with --selector scrolls the element into view first. The browser process is managed automatically by this tool. Task sub-agent sessions share the root session's browser instance by default; add --private-session for an isolated instance (sticky for that sub-session).",
     "tool.cli.arg.args": "Command line string: \"<command> [--flag value ...]\", e.g. \"navigate --url https://...\" (\"help\" lists all)",
 
     "cli.header": "bt_cli — browser automation CLI",
     "cli.usage": "Usage: bt_cli({ args })\n  args  single command line string: \"<command> [--flag value ...]\"",
+    "cli.usage.flags": "Global flag:\n  --private-session  use the caller's own session instance (default: share the root session's instance and data dir; once used by a sub-session it stays private)",
     "cli.commands": "Commands:",
     "cli.examples": "Examples:",
     "cli.example.1": "bt_cli({ args: \"help\" })",
@@ -16,6 +17,7 @@ const en: LocaleStrings = {
     "cli.example.4": "bt_cli({ args: \"fill --selector #q --value \\\"hello world\\\"\" })",
     "cli.unknown": "Unknown command: {cmd}",
     "cli.invalid_args": "Invalid args for {cmd}: {msg}",
+    "cli.err.flag_not_number": "Flag --{flag} needs a number, got: {v}",
     "cli.err.timeout_invalid": "--timeout must be a positive integer in ms (100-60000), got: {v}",
     "cli.err.profile_invalid_name": "Invalid profile name: {name}. Use 1-64 chars, no / \\ : or < > \" | ? *, must not start with a dot, and must not be a Windows reserved name (CON/PRN/AUX/NUL/COM1-9/LPT1-9).",
     "cli.err.file_outside_tmp": "Refusing to read @file outside the plugin temp directory: {path}",
@@ -168,14 +170,14 @@ const en: LocaleStrings = {
     "bin.release_not_found": "No Release asset found for this version (tag={tag}); for a plugin-only change make sure the binary is still attached to the x.Y.0 Release, and for Rust changes bump the minor version and create/update that Release first",
 
     // ---- client-layer errors surfaced to the model ----
-    "client.service_timeout": "Browser service not ready (timed out). bt-shell is managed automatically by the plugin — do not run the executable directly. Retry via bt_cli later (e.g. open_window).",
+    "client.service_timeout": "Browser service not ready (timed out). bt-shell is managed automatically by the plugin. Retry via bt_cli later (e.g. open_window).",
     "client.attach_timeout": "External bt-shell at {url} is not ready (timed out). Check BT_SHELL_URL/BT_SHELL_PORT and that the shell is running.",
     "client.not_configured": "Service not configured",
     "client.service_error": "Service error",
     "client.auth_rejected": "Local browser API rejected authentication (HTTP 401/403). Call open_window to reopen the browser.",
     "client.bad_response": "Malformed response from the browser service (invalid JSON). The instance was not treated as closed; retry the call.",
     "client.bt_shell_path_missing": "BT_SHELL_PATH points to a binary that does not exist (path is in the environment variable)",
-    "client.spawn_failed": "Failed to start the bt-shell process (retry via bt_cli later; do not run the executable directly)",
+    "client.spawn_failed": "Failed to start the bt-shell process (retry via bt_cli later)",
     "client.session_closed_during_start": "A close request was received while the browser was starting; that instance was terminated. Call open_window if you need it again.",
     "client.attach_gone": "Attached external bt-shell at {url} is gone (attach mode does not own that process; restart the shell yourself).",
     "client.attach_need_token": "Attach mode requires an auth token: set BT_SHELL_TOKEN and start the external bt-shell with the same token (--token <token>, or the same environment variable).",

@@ -3,11 +3,12 @@ import type { LocaleStrings } from "./types.js";
 const zh: LocaleStrings = {
   tool: {
     "tool.cli.desc":
-      "CLI 风格的浏览器自动化控制：单个字符串命令行，如 \"navigate --url https://...\" 或 \"help\"。省略列出全部命令。screenshot 带 --selector 会先自动滚动到元素再截取。浏览器进程由本工具自动管理；请勿直接执行 bt-shell 可执行文件（会造成多实例与文件锁冲突）。",
+      "CLI 风格的浏览器自动化控制：单个字符串命令行，如 \"navigate --url https://...\" 或 \"help\"。省略列出全部命令。screenshot 带 --selector 会先自动滚动到元素再截取。浏览器进程由本工具自动管理。task 子代理会话默认与主会话共用同一浏览器实例；需要独立窗口/登录态时加 --private-session（对该子会话粘住）。",
     "tool.cli.arg.args": "命令行字符串：\"<command> [--flag 值 ...]\"，如 \"navigate --url https://...\"（\"help\" 列出全部）",
 
     "cli.header": "bt_cli — 浏览器自动化 CLI",
     "cli.usage": "用法: bt_cli({ args })\n  args  单个命令行字符串: \"<command> [--flag 值 ...]\"",
+    "cli.usage.flags": "全局 flag：\n  --private-session  使用调用者自己的会话实例（默认与根会话共用同一实例与数据目录；同一子会话首次使用后会保持私有）",
     "cli.commands": "子命令：",
     "cli.examples": "示例：",
     "cli.example.1": "bt_cli({ args: \"help\" })",
@@ -16,6 +17,7 @@ const zh: LocaleStrings = {
     "cli.example.4": "bt_cli({ args: \"fill --selector #q --value \\\"hello world\\\"\" })",
     "cli.unknown": "未知命令: {cmd}",
     "cli.invalid_args": "参数无效 {cmd}: {msg}",
+    "cli.err.flag_not_number": "参数 --{flag} 需要数字，收到：{v}",
     "cli.err.timeout_invalid": "--timeout 须为正整数（毫秒，100~60000），收到：{v}",
     "cli.err.profile_invalid_name": "配置名无效：{name}。要求 1~64 个字符，不含 / \\ : 及 < > \" | ? *，不以点开头，且不是 Windows 保留名（CON/PRN/AUX/NUL/COM1-9/LPT1-9）。",
     "cli.err.file_outside_tmp": "拒绝读取插件临时目录之外的 @file: {path}",
@@ -168,14 +170,14 @@ const zh: LocaleStrings = {
     "bin.release_not_found": "未找到该版本对应的 Release 资产（tag={tag}）；若这是纯插件改动请确认二进制产物仍在 x.Y.0 的 Release 中，若动了 Rust 需先升中间版本号并新开/更新对应 Release",
 
     // ---- client 层抛给模型的错误 ----
-    "client.service_timeout": "浏览器服务未就绪（超时）。bt-shell 由插件自动管理，请勿直接执行二进制文件；请稍后经 bt_cli 重试（如 open_window）。",
+    "client.service_timeout": "浏览器服务未就绪（超时）。bt-shell 由插件自动管理；请稍后经 bt_cli 重试（如 open_window）。",
     "client.attach_timeout": "外部 bt-shell 在 {url} 未就绪（超时）。请检查 BT_SHELL_URL/BT_SHELL_PORT，且 shell 正在运行。",
     "client.not_configured": "服务未配置",
     "client.service_error": "服务错误",
     "client.auth_rejected": "本地浏览器 API 拒绝鉴权（HTTP 401/403）。请调用 open_window 重新打开浏览器。",
     "client.bad_response": "浏览器服务返回了无法解析的响应（非 JSON）。未判定为已关闭，请重试该调用。",
     "client.bt_shell_path_missing": "BT_SHELL_PATH 指向的二进制不存在（路径见环境变量配置）",
-    "client.spawn_failed": "bt-shell 进程启动失败（请稍后经 bt_cli 重试；勿直接执行二进制文件）",
+    "client.spawn_failed": "bt-shell 进程启动失败（请稍后经 bt_cli 重试）",
     "client.session_closed_during_start": "启动期间已收到关闭指令，该浏览器实例已终止。如需使用请调用 open_window。",
     "client.attach_gone": "附着的外部 bt-shell 在 {url} 已断开（附着模式不接管进程，请自行重启该 shell）。",
     "client.attach_need_token": "附着模式需要鉴权令牌：请设置环境变量 BT_SHELL_TOKEN，并让外部 bt-shell 用同一令牌启动（启动参数 --token <token>，或设置同值的 BT_SHELL_TOKEN）。",

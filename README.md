@@ -138,9 +138,10 @@ bt_cli({ args: "<command> [--flag value ...]" })
 
 - **命令名不带 `bt_` 前缀**：写 `click`、`navigate`、`list_tabs`，**不是** `bt_click` / `bt_navigate` / `bt_list_tabs`（旧文档里的 `bt_*` 名称既不是工具名也不是命令名）
 - **分词**：按 shell 风格切分（`string-argv` 0.3.2，`src/index.ts:3` 引入、`:388-390` 使用），含空格的值用引号包裹，如 `fill --selector #q --value "hello world"`；**只按引号配对切分、不处理反斜杠转义**——值里要出现引号就改用**另一种引号**包外层（如 `get_visible_text --selector "[title='a b']"`），写成 `--value "a\"b"` 会把 `\` 原样带进值里
-- **flag 解析**：第一个 token 为命令名，其余交给 `node:util.parseArgs`（`src/index.ts:285-291`）；**未知 flag 直接报错并回显该命令用法**（输出可自愈，不必先调 help）
-- **敏感值 `@file:`**：值写成 `@file:<路径>` 时由插件读取文件内容作为实际值，**内容不进模型上下文**（`src/index.ts:404-435`）。只允许读插件临时目录（全局 tmp 或本会话 tmp）内的文件，其余路径一律拒绝；`lookup` 生成的密码临时文件即用于 `fill --value @file:...`，位于全局 tmp 的用完即删
-- 会话归属由插件自动透传（每会话独立浏览器实例，见「多会话」），`args` 里**不需要**也**不支持**传会话 id
+- **flag 解析**：第一个 token 为命令名，其余交给 `node:util.parseArgs`（`src/index.ts:296-304`）；**未知 flag 直接报错并回显该命令用法**（输出可自愈，不必先调 help）
+- **敏感值 `@file:`**：值写成 `@file:<路径>` 时由插件读取文件内容作为实际值，**内容不进模型上下文**（`src/index.ts:443-472`）。只允许读插件临时目录（全局 tmp 或本会话 tmp）内的文件，其余路径一律拒绝；`lookup` 生成的密码临时文件即用于 `fill --value @file:...`，位于全局 tmp 的用完即删
+- **全局 flag `--private-session`**（任何命令都可带，`src/index.ts:296-304,433-442`）：用**调用者自己的 sid** 建私有浏览器实例，不与根会话共用；并且对**同一子会话粘住**——首次用过之后，后续不带该 flag 也继续私有（根会话带它等价于自身）。典型场景：子代理需要**独立的浏览器环境做隔离测试**（自己的 cookie/登录态与窗口，不污染主会话）。根会话自己带它等价于自身（合法但无实际差别）。注意它紧跟某个 string flag 时会被当成该 flag 的值（`parseArgs` 行为），要写就写在命令名之后或命令末尾
+- **会话归属由插件自动透传**（见「多会话」）：实例按会话隔离，但 **task 子代理会话默认归并到根会话**——沿 `Session.parentID` 回溯到最顶层，用**根 sid** 作路由键，于是主会话与所有子会话共用同一 bt-shell 实例、同一数据目录 `sessions/<profile>/<根 sid>/`，窗口标题取根会话标题。`args` 里**不需要**也**不支持**传会话 id
 
 示例：
 
@@ -270,7 +271,14 @@ bt_cli({ args: "screenshot --selector .chart" })
 
 ## 多会话
 
-自 1.9.0 起**每个 opencode 会话独享一个浏览器窗口**：独立进程 / 独立端口 / 独立用户数据目录（`sessions/<profile>/<sid>`），窗口、标签、UA、批注与 cookie/存储全部互不共享（`sessionIsolation` / `browserType` 配置项及 `--session-isolation` / `--browser` 参数自 1.9.0 已删除，会话隔离是唯一行为；旧配置文件里的这两项会被忽略）。例外：附着模式（`BT_SHELL_URL` / `BT_SHELL_PORT`）连接外部单例 shell，放弃会话隔离。
+浏览器实例**按会话隔离**：独立进程 / 独立端口 / 独立用户数据目录，窗口、标签、UA、批注与 cookie/存储互不共享（`sessionIsolation` / `browserType` 配置项及 `--session-isolation` / `--browser` 参数自 1.9.0 已删除，会话隔离是唯一行为；旧配置文件里的这两项会被忽略）。
+
+**但「会话」不等于「窗口」**（1.11.1 起）：**task 子代理会话默认归并到根会话**。插件沿 `Session.parentID` 回溯到最顶层，用**根 sid** 作浏览器路由键（`browserKey`），主会话与它的**所有**子会话共用同一 bt-shell 实例、同一数据目录 `sessions/<profile>/<根 sid>/`，窗口标题取**根会话**标题——子代理调 `bt_cli` 不会再各开一个窗口。
+
+- **回溯限制**：单跳查询 `client.session.get` 超时 **1.5s**，最多回溯 **5 跳**；失败 / 超时 / 成环 / 超限都回退调用者自己的 raw sid 且**不缓存**（下次调用重试），只打 warn 日志——不会把子会话错认成根并长期钉住。
+- **主子默认共用，私有需显式**：要让某个子会话用自己的实例（独立 cookie/登录态/窗口做隔离测试），给它加全局 flag `--private-session`；该标志对**同一子会话粘住**（首次之后不带也保持私有）。
+- **删除会话**：删**子会话**只清该 sid 的关闭标记 / 附着记录，**不关根实例、不删根数据目录**（与根共用一份）；删**根会话 / 无父会话 / 私有会话**时才回收实例与数据目录。
+- 例外：附着模式（`BT_SHELL_URL` / `BT_SHELL_PORT`）连接外部单例 shell，放弃会话隔离。
 
 ## 发布
 
