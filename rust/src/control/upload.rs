@@ -11,9 +11,9 @@ use tauri::AppHandle;
 use super::ControlResult;
 
 #[cfg(windows)]
-use serde_json::{json, Value};
-#[cfg(windows)]
 use super::cdp;
+#[cfg(windows)]
+use serde_json::{Value, json};
 
 /// 上传本机文件到 `selector` 指向的 file input
 ///
@@ -119,7 +119,11 @@ fn verify_files(
     let names: Vec<String> = v
         .get("names")
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default();
     let expected = std::path::Path::new(file_path)
         .file_name()

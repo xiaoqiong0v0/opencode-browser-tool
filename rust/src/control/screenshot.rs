@@ -8,12 +8,12 @@
 use std::sync::mpsc;
 
 #[cfg(target_os = "linux")]
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD};
 #[cfg(target_os = "linux")]
 use gtk::cairo;
+use tauri::AppHandle;
 #[cfg(target_os = "linux")]
 use webkit2gtk::{SnapshotOptions, SnapshotRegion, WebViewExt};
-use tauri::AppHandle;
 
 use crate::ui;
 
@@ -35,13 +35,7 @@ pub fn screenshot_with_timeout(app: &AppHandle, timeout_ms: u64) -> Result<Strin
 /// 截取页面指定区域(**视口** CSS 像素坐标),返回 PNG base64
 ///
 /// 内部统一换算成文档坐标再交给平台实现(CDP clip 实测恒为文档坐标,见 `screenshot_impl` 注释)
-pub fn screenshot_clip(
-    app: &AppHandle,
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
-) -> Result<String, String> {
+pub fn screenshot_clip(app: &AppHandle, x: i32, y: i32, w: i32, h: i32) -> Result<String, String> {
     screenshot_impl(app, Some((x, y, w, h)), false, None)
 }
 
@@ -291,7 +285,11 @@ fn encode_surface_png_base64(
 /// 返回:`round(css × scale)`
 #[cfg(target_os = "linux")]
 fn css_to_device(css: i32, scale: f64) -> i32 {
-    let k = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+    let k = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
     (f64::from(css) * k).round() as i32
 }
 
@@ -310,18 +308,20 @@ fn crop_surface(
     h: i32,
     scale: f64,
 ) -> Result<cairo::ImageSurface, String> {
-    let (w, h) = (css_to_device(w.max(0), scale), css_to_device(h.max(0), scale));
+    let (w, h) = (
+        css_to_device(w.max(0), scale),
+        css_to_device(h.max(0), scale),
+    );
     let (dx, dy) = (css_to_device(x, scale), css_to_device(y, scale));
     let out = cairo::ImageSurface::create(cairo::Format::ARgb32, w, h)
         .map_err(|e| format!("create crop surface failed: {e}"))?;
     // 把源面按 (-dx, -dy) 偏移绘制到新面,等价于裁剪(均为设备像素)
     {
-        let cr = cairo::Context::new(&out)
-            .map_err(|e| format!("create cairo context failed: {e}"))?;
+        let cr =
+            cairo::Context::new(&out).map_err(|e| format!("create cairo context failed: {e}"))?;
         cr.set_source_surface(src, -f64::from(dx), -f64::from(dy))
             .map_err(|e| format!("set cairo source failed: {e}"))?;
-        cr.paint()
-            .map_err(|e| format!("cairo paint failed: {e}"))?;
+        cr.paint().map_err(|e| format!("cairo paint failed: {e}"))?;
     }
     Ok(out)
 }

@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use tauri::AppHandle;
 
-use super::{ControlResult, Outcome};
 use super::trusted_available;
+use super::{ControlResult, Outcome};
 use serde_json::Value;
 
 /// 滚动/布局稳定等待:超时与采样间隔(ms)
@@ -95,7 +95,9 @@ pub fn click_with(
         trusted_click_at(app, p.x, p.y, timeout_ms)?;
         return Ok(Outcome::trusted(Point { x: p.x, y: p.y }));
     }
-    Ok(Outcome::degraded(click_fallback(app, selector, timeout_ms)?))
+    Ok(Outcome::degraded(click_fallback(
+        app, selector, timeout_ms,
+    )?))
 }
 
 /// 悬停元素中心:可信 mouseMoved(触发 CSS `:hover`);否则降级到合成 mouseover/mouseenter
@@ -116,7 +118,9 @@ pub fn hover_with(
     if trusted_available() {
         let p = resolve_stable(app, None, selector, timeout_ms)?;
         ensure_reachable(&p, selector)?;
-        let poll_ms = timeout_ms.map(|v| v.min(HOVER_POLL_MS)).unwrap_or(HOVER_POLL_MS);
+        let poll_ms = timeout_ms
+            .map(|v| v.min(HOVER_POLL_MS))
+            .unwrap_or(HOVER_POLL_MS);
         for _ in 0..HOVER_RETRIES {
             trusted_move(app, p.x, p.y, timeout_ms)?;
             if wait_hovered(app, selector, poll_ms, timeout_ms)? {
@@ -127,7 +131,9 @@ pub fn hover_with(
             "hover verification failed: element did not become :hover after {HOVER_RETRIES} attempts: {selector}"
         ));
     }
-    Ok(Outcome::degraded(hover_fallback(app, selector, timeout_ms)?))
+    Ok(Outcome::degraded(hover_fallback(
+        app, selector, timeout_ms,
+    )?))
 }
 
 /// 点击 iframe 内元素:可信路径把内容坐标换算到顶层视口后注入;否则降级到 `el.click()`
@@ -245,7 +251,12 @@ fn trusted_click_at(app: &AppHandle, x: f64, y: f64, timeout_ms: Option<u64>) ->
 }
 
 #[cfg(target_os = "linux")]
-fn trusted_click_at(app: &AppHandle, x: f64, y: f64, _timeout_ms: Option<u64>) -> ControlResult<()> {
+fn trusted_click_at(
+    app: &AppHandle,
+    x: f64,
+    y: f64,
+    _timeout_ms: Option<u64>,
+) -> ControlResult<()> {
     super::gdk::inject(
         app,
         vec![
@@ -465,7 +476,10 @@ fn resolve_point(
         y,
         hit_ok: v.get("hitOk").and_then(Value::as_bool).unwrap_or(false),
         hit: v.get("hit").and_then(Value::as_str).map(str::to_string),
-        in_viewport: v.get("inViewport").and_then(Value::as_bool).unwrap_or(false),
+        in_viewport: v
+            .get("inViewport")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         disabled: v.get("disabled").and_then(Value::as_bool).unwrap_or(false),
     })
 }

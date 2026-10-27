@@ -47,7 +47,7 @@ CARGO_TARGET_DIR=$CARGO_TARGET_DIR cargo build --release
 2. 环境变量 **`BT_SHELL_TOKEN`**；
 3. 都没有 → shell 随机生成 16 字节（32 hex），并在提供 `--user-data-dir` 时写入 **`<user-data-dir>/bt-auth-token`**（Unix `chmod 600`，仅供排查；日志只打前 4 位，绝不打印全文）。
 
-**唯一精确豁免路径**：`/api/page-event`——页面注入脚本运行在远程页面源下、无法持有令牌，故该路径跳过令牌与 `Origin` 两项校验（其余带 `Origin` 的请求一律 `403`）。本清单的手动 `curl` 均非 page-event，**必须带令牌**；给 page-event 带 header 无害。
+**两个精确豁免路径**：`/api/page-event`（SPA 路由/标题/图标上报）与 `/api/console-log`（1.12.0，Linux console 注入回传）——页面注入脚本运行在远程页面源下、无法持有令牌，故这两条路径跳过令牌与 `Origin` 两项校验（其余带 `Origin` 的请求一律 `403`）；两者都**只写缓冲、无敏感回读**（`/api/console-log` 另有 body ≤ 256 KiB、> 200 条/秒丢弃的限制）。本清单的手动 `curl` 均非这两个路径，**必须带令牌**；给它们带 header 无害。
 
 复验时先固定一个令牌，起 shell 与后续请求共用同一值：
 

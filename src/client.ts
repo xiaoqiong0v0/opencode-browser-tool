@@ -12,6 +12,7 @@ import { fileURLToPath } from "url";
 import { log } from "./logger.js";
 import { getNotifyUrlForSession } from "./notify-server.js";
 import { tf } from "./i18n/index.js";
+import { getLogStreamEnv, getWebviewEnv } from "./config/index.js";
 
 import { cachedBinaryPath, describeBinaryStatus, ensureBinary } from "./binary.js";
 import { sanitizeForModel } from "./util/sanitize.js";
@@ -40,6 +41,11 @@ let appDirectory = "";
 /** 记录 opencode 目录(插件初始化 / 工具调用时调用) */
 export function setAppDirectory(dir: string): void {
   if (dir) appDirectory = dir;
+}
+
+/** 取已记录的应用/项目目录(即工作区目录;从未记录时返回空串) */
+export function getAppDirectory(): string {
+  return appDirectory;
 }
 
 // Rust 二进制查找:优先级 BT_SHELL_PATH → 本地开发构建(含 opencode 应用目录)→ 下载缓存(binary.ts)
@@ -352,7 +358,10 @@ async function spawnForSession(sid: string, shell: string): Promise<ShellInstanc
 
     let proc: any;
     try {
-      proc = spawn(shell, args, { stdio: ["ignore", "pipe", "pipe"] });
+      // 日志流配置(1.12.0)以 env 传给 shell:console/network 缓冲预算、network 聚合窗口、
+      // Linux 注入开关。附着模式不在本函数(不 spawn → 不传,配置由外部启动者负责)。
+      const env = { ...process.env, ...getLogStreamEnv(), ...getWebviewEnv() };
+      proc = spawn(shell, args, { stdio: ["ignore", "pipe", "pipe"], env });
     } catch (e) {
       // spawn 同步失败(如文件被锁):换不含路径的文案,避免绝对路径经错误消息回流模型
       log.error(`spawn bt-shell failed: ${(e as Error).message}`, e as Error);
@@ -872,10 +881,14 @@ export const service = {
   select: cmd("select"),
   hover: cmd("hover"),
   pressKey: cmd("press-key"),
+  typeText: cmd("type"),
   drag: cmd("drag"),
   uploadFile: cmd("upload-file"),
   screenshot: cmd("screenshot"),
   evaluate: cmd("evaluate"),
+  // 持久注入规则：/api/inject/rules（add/list/remove/clear/enable/disable）、/api/inject/test
+  injectRules: cmd("inject/rules"),
+  injectTest: cmd("inject/test"),
   visibleText: cmd("visible-text"),
   visibleHtml: cmd("visible-html"),
   elementState: cmd("element-state"),
@@ -904,6 +917,7 @@ export const service = {
   accessibility: cmd("accessibility"),
   notify: cmd("notify"),
   consoleLogs: cmd("console-logs"),
+  networkLogs: cmd("network-logs"),
   expectResponse: cmd("expect-response"),
   assertResponse: cmd("assert-response"),
   panelConfig: cmd("panel-config"),

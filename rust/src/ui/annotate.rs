@@ -1,7 +1,7 @@
 //! 批注/截图交互:Rust 侧状态机
 //! 覆盖层 Webview 上报鼠标事件 → 批注模式查询元素弹输入框,截图模式截取区域/全屏
 //! 覆盖层显示时拦截鼠标;隐藏时页面正常交互
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::ui::{self, AnnotationRecord, PendingShot, RECORD_ANNOTATE, RECORD_SCREENSHOT, UiState};
@@ -111,7 +111,10 @@ impl Annotator {
     pub fn emit_mode_state(app: &AppHandle, state: &State<UiState>) {
         let annotate = *state.annotate_mode.lock().unwrap();
         let shot = *state.shot_mode.lock().unwrap();
-        let _ = app.emit("annotate-state", json!({ "annotate": annotate, "shot": shot }));
+        let _ = app.emit(
+            "annotate-state",
+            json!({ "annotate": annotate, "shot": shot }),
+        );
     }
 
     /// 处理覆盖层上报的鼠标事件
@@ -193,21 +196,45 @@ impl Annotator {
             }
             "note-submit" => {
                 // 弹框确定:有说明文字才保存批注入列,无则丢弃
-                let text = ev.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                let text = ev
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let pending = state.pending_click.lock().unwrap().take();
                 if let Some(p) = pending {
                     if !text.trim().is_empty() {
-                        Self::push_record(app, state, RECORD_ANNOTATE, &p.selector, p.rect, &text, None);
+                        Self::push_record(
+                            app,
+                            state,
+                            RECORD_ANNOTATE,
+                            &p.selector,
+                            p.rect,
+                            &text,
+                            None,
+                        );
                     }
                 }
             }
             "note-send" => {
                 // 弹框发送:有说明先保存当前批注,再发送所有记录,随后退出批注模式
-                let text = ev.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                let text = ev
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let pending = state.pending_click.lock().unwrap().take();
                 if let Some(p) = pending {
                     if !text.trim().is_empty() {
-                        Self::push_record(app, state, RECORD_ANNOTATE, &p.selector, p.rect, &text, None);
+                        Self::push_record(
+                            app,
+                            state,
+                            RECORD_ANNOTATE,
+                            &p.selector,
+                            p.rect,
+                            &text,
+                            None,
+                        );
                     }
                 }
                 let count = ui::send_all_records(app);
@@ -239,18 +266,21 @@ impl Annotator {
                 let w = ev.get("w").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
                 let h = ev.get("h").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
                 let app2 = app.clone();
-                std::thread::spawn(move || {
-                    match crate::control::screenshot::screenshot(&app2) {
+                std::thread::spawn(
+                    move || match crate::control::screenshot::screenshot(&app2) {
                         Ok(img) => {
                             let rect = (0, 0, w, h);
                             Self::show_shot_preview(&app2, img, rect);
                         }
                         Err(e) => {
                             let msg = format!("截图失败:{e}");
-                            let _ = ui::eval_overlay(&app2, &format!("window.__btOverlay.notify({msg:?},'err')"));
+                            let _ = ui::eval_overlay(
+                                &app2,
+                                &format!("window.__btOverlay.notify({msg:?},'err')"),
+                            );
                         }
-                    }
-                });
+                    },
+                );
             }
             "shot-select" => {
                 // 拖动框选结束 → 截取选区区域
@@ -269,7 +299,10 @@ impl Annotator {
                         }
                         Err(e) => {
                             let msg = format!("截图失败:{e}");
-                            let _ = ui::eval_overlay(&app2, &format!("window.__btOverlay.notify({msg:?},'err')"));
+                            let _ = ui::eval_overlay(
+                                &app2,
+                                &format!("window.__btOverlay.notify({msg:?},'err')"),
+                            );
                         }
                     }
                 });
@@ -280,14 +313,29 @@ impl Annotator {
             }
             "shot-save" => {
                 // 保存截图记录:有说明文字才保存,无则丢弃,完成后单次截图
-                let text = ev.get("note").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                let text = ev
+                    .get("note")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 if !text.trim().is_empty() {
                     // 前端裁剪后的 base64(按选区裁剪),空则用整图
-                    let crop = ev.get("image").and_then(|i| i.as_str()).map(|s| s.to_string());
+                    let crop = ev
+                        .get("image")
+                        .and_then(|i| i.as_str())
+                        .map(|s| s.to_string());
                     let pending = state.pending_shot.lock().unwrap().take();
                     if let Some(p) = pending {
                         let image = crop.filter(|s| !s.is_empty()).unwrap_or(p.image);
-                        Self::push_record(app, state, RECORD_SCREENSHOT, "", p.rect, &text, Some(image));
+                        Self::push_record(
+                            app,
+                            state,
+                            RECORD_SCREENSHOT,
+                            "",
+                            p.rect,
+                            &text,
+                            Some(image),
+                        );
                     }
                 } else {
                     *state.pending_shot.lock().unwrap() = None;
@@ -296,13 +344,28 @@ impl Annotator {
             }
             "shot-send" => {
                 // 发送:有说明先保存当前截图,再发送所有记录,完成后单次截图
-                let text = ev.get("note").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                let text = ev
+                    .get("note")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 if !text.trim().is_empty() {
-                    let crop = ev.get("image").and_then(|i| i.as_str()).map(|s| s.to_string());
+                    let crop = ev
+                        .get("image")
+                        .and_then(|i| i.as_str())
+                        .map(|s| s.to_string());
                     let pending = state.pending_shot.lock().unwrap().take();
                     if let Some(p) = pending {
                         let image = crop.filter(|s| !s.is_empty()).unwrap_or(p.image);
-                        Self::push_record(app, state, RECORD_SCREENSHOT, "", p.rect, &text, Some(image));
+                        Self::push_record(
+                            app,
+                            state,
+                            RECORD_SCREENSHOT,
+                            "",
+                            p.rect,
+                            &text,
+                            Some(image),
+                        );
                     }
                 } else {
                     *state.pending_shot.lock().unwrap() = None;
@@ -324,7 +387,10 @@ impl Annotator {
     /// 截图完成:暂存待确认截图并显示预览(面板"立即截图"与截图模式共用)
     pub fn show_shot_preview(app: &AppHandle, image: String, rect: (i32, i32, i32, i32)) {
         let state = app.state::<UiState>();
-        *state.pending_shot.lock().unwrap() = Some(PendingShot { image: image.clone(), rect });
+        *state.pending_shot.lock().unwrap() = Some(PendingShot {
+            image: image.clone(),
+            rect,
+        });
         let _ = ui::eval_overlay(
             app,
             &format!(

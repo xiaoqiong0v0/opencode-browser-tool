@@ -13,3 +13,6 @@ rust/target-*/
 
 rust/gen/
 rust/icons/
+
+# 误在仓库根构建时产生的产物
+/target-*/

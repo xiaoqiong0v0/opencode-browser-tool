@@ -41,7 +41,11 @@ pub fn press_key_with(
     }
     let def = resolve_key(key).ok_or_else(|| format!("unsupported key: {key}"))?;
     // 有 text:keyDown 会生成 char 并触发默认行为;无 text:rawKeyDown
-    let down_type = if def.text.is_some() { "keyDown" } else { "rawKeyDown" };
+    let down_type = if def.text.is_some() {
+        "keyDown"
+    } else {
+        "rawKeyDown"
+    };
     dispatch(app, down_type, &def, true, timeout_ms)?;
     dispatch(app, "keyUp", &def, false, timeout_ms)?;
     Ok(())
@@ -86,11 +90,7 @@ pub fn insert_text(app: &AppHandle, text: &str) -> ControlResult<()> {
 
 /// 同 `insert_text`,`timeout_ms` 为 Some 时该步 CDP 等待用传入预算
 #[cfg(windows)]
-pub fn insert_text_with(
-    app: &AppHandle,
-    text: &str,
-    timeout_ms: Option<u64>,
-) -> ControlResult<()> {
+pub fn insert_text_with(app: &AppHandle, text: &str, timeout_ms: Option<u64>) -> ControlResult<()> {
     let params = serde_json::json!({ "text": text }).to_string();
     cdp::call_json_opt(app, "Input.insertText", &params, timeout_ms)?;
     Ok(())
@@ -133,6 +133,91 @@ pub fn insert_text_with(
     _timeout_ms: Option<u64>,
 ) -> ControlResult<()> {
     Err("insert_text: no trusted text channel on this platform".into())
+}
+
+// ---- `type`(向当前焦点插入文本,不清空) ----
+
+/// `type` 单次插入文本上限(字节;与插件侧 `TYPE_TEXT_MAX_BYTES` 同口径)
+pub const TYPE_TEXT_MAX_BYTES: usize = 8 * 1024;
+
+/// `type` 的执行计划(纯计算结果,不触达页面,便于单测)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TypePlan {
+    /// 是否先按 `selector` 聚焦;false 表示沿用页面当前焦点
+    pub focus: bool,
+    /// 插入文本后是否再按 Enter
+    pub enter: bool,
+    /// 待插入字符数(按 char 计,UTF-8 多字节字符算 1)
+    pub chars: usize,
+}
+
+/// 校验并规划一次 `type`:空文本 / 超过 `TYPE_TEXT_MAX_BYTES` 直接报错,不产生任何页面副作用
+///
+/// 参数:`text` 待插入文本;`selector` 目标元素选择器,空串表示不聚焦(用当前焦点);
+/// `enter` 是否在插入后补发 Enter
+pub fn plan_type(text: &str, selector: &str, enter: bool) -> ControlResult<TypePlan> {
+    if text.is_empty() {
+        return Err("type: text is required (empty text would insert nothing)".into());
+    }
+    if text.len() > TYPE_TEXT_MAX_BYTES {
+        return Err(format!(
+            "type: text too large ({} bytes, max {TYPE_TEXT_MAX_BYTES} bytes)",
+            text.len()
+        ));
+    }
+    Ok(TypePlan {
+        focus: !selector.is_empty(),
+        enter,
+        chars: text.chars().count(),
+    })
+}
+
+/// `type` 的执行结果
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TypedText {
+    /// 插入的字符数(按 char 计)
+    pub inserted: usize,
+    /// 本次是否显式聚焦了 `selector`(无 selector 时为 false,沿用当前焦点)
+    pub focused: bool,
+    /// 是否补发了 Enter
+    pub entered: bool,
+}
+
+/// 向当前焦点插入文本(不清空,与 `fill` 的「替换」语义互补)
+///
+/// Windows:聚焦 eval + CDP `Input.insertText` + 可选 Enter 键事件;
+/// Linux:聚焦 eval + GDK 逐字符注入 + 可选 GDK Return;其余平台无可信文本通道 → 明确报错
+pub fn type_text(
+    app: &AppHandle,
+    text: &str,
+    selector: &str,
+    enter: bool,
+) -> ControlResult<TypedText> {
+    type_text_with(app, text, selector, enter, None)
+}
+
+/// 同 `type_text`,`timeout_ms` 贯穿聚焦 eval、insertText、Enter 三次注入
+pub fn type_text_with(
+    app: &AppHandle,
+    text: &str,
+    selector: &str,
+    enter: bool,
+    timeout_ms: Option<u64>,
+) -> ControlResult<TypedText> {
+    // 先校验再动页面:空文本/超长不会留下「已聚焦但没输入」的半截副作用
+    let plan = plan_type(text, selector, enter)?;
+    if plan.focus {
+        focus_element_with(app, selector, timeout_ms)?;
+    }
+    insert_text_with(app, text, timeout_ms)?;
+    if plan.enter {
+        press_key_with(app, "Enter", "", timeout_ms)?;
+    }
+    Ok(TypedText {
+        inserted: plan.chars,
+        focused: plan.focus,
+        entered: plan.enter,
+    })
 }
 
 /// 聚焦目标元素,确保后续注入落到该元素而非 body(供键盘/文本输入复用)
@@ -419,4 +504,46 @@ fn function_keyval(n: u32) -> Option<u32> {
         12 => *key::F12,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TYPE_TEXT_MAX_BYTES, plan_type};
+
+    /// 空文本直接报错(不产生「已聚焦但没输入」的半截副作用)
+    #[test]
+    fn plan_type_rejects_empty_text() {
+        let err = plan_type("", "input", false).unwrap_err();
+        assert!(err.contains("text is required"), "got: {err}");
+    }
+
+    /// 上限按字节计:恰好 8192 字节通过,8193 字节报错并回显上限
+    #[test]
+    fn plan_type_rejects_text_over_limit() {
+        let at_limit = "a".repeat(TYPE_TEXT_MAX_BYTES);
+        assert!(plan_type(&at_limit, "", false).is_ok(), "8192 bytes must pass");
+        let over = "a".repeat(TYPE_TEXT_MAX_BYTES + 1);
+        let err = plan_type(&over, "", false).unwrap_err();
+        assert!(err.contains("too large"), "got: {err}");
+        assert!(err.contains("8192"), "错误文案须含上限: {err}");
+    }
+
+    /// enter 标志原样带入计划(是否需要补发 Enter 由服务层决定)
+    #[test]
+    fn plan_type_keeps_enter_flag() {
+        assert!(plan_type("abc", "", true).unwrap().enter);
+        assert!(!plan_type("abc", "", false).unwrap().enter);
+    }
+
+    /// 无 selector 时不聚焦(沿用页面当前焦点);字符数按 char 计,不受多字节长度影响
+    #[test]
+    fn plan_type_without_selector_uses_current_focus() {
+        let p = plan_type("hi", "", false).unwrap();
+        assert!(!p.focus, "空 selector 不得聚焦");
+        assert_eq!(p.chars, 2);
+
+        let p = plan_type("你好", "#editor", false).unwrap();
+        assert!(p.focus, "有 selector 必须先聚焦");
+        assert_eq!(p.chars, 2, "多字节字符按 char 计");
+    }
 }

@@ -226,16 +226,72 @@ pub fn install_resize_grips(app: &tauri::AppHandle, label: &str) {
         overlay.show();
         fixed.show();
         // 四边热区:先左右、后上下;后加者在更上层
-        add_grip(&overlay, gtk::gdk::WindowEdge::West, gtk::Align::Start, gtk::Align::Fill, GRIP, -1);
-        add_grip(&overlay, gtk::gdk::WindowEdge::East, gtk::Align::End, gtk::Align::Fill, GRIP, -1);
-        add_grip(&overlay, gtk::gdk::WindowEdge::North, gtk::Align::Fill, gtk::Align::Start, -1, GRIP);
-        add_grip(&overlay, gtk::gdk::WindowEdge::South, gtk::Align::Fill, gtk::Align::End, -1, GRIP);
+        add_grip(
+            &overlay,
+            gtk::gdk::WindowEdge::West,
+            gtk::Align::Start,
+            gtk::Align::Fill,
+            GRIP,
+            -1,
+        );
+        add_grip(
+            &overlay,
+            gtk::gdk::WindowEdge::East,
+            gtk::Align::End,
+            gtk::Align::Fill,
+            GRIP,
+            -1,
+        );
+        add_grip(
+            &overlay,
+            gtk::gdk::WindowEdge::North,
+            gtk::Align::Fill,
+            gtk::Align::Start,
+            -1,
+            GRIP,
+        );
+        add_grip(
+            &overlay,
+            gtk::gdk::WindowEdge::South,
+            gtk::Align::Fill,
+            gtk::Align::End,
+            -1,
+            GRIP,
+        );
         // 四角热区:必须在四边之后追加,后加者在更上层,四角才优先命中对角拖拽
         // (否则 North/South 为 Fill 且更靠上层,会盖住 West/East,角上只能垂直缩放)
-        add_grip(&overlay, gtk::gdk::WindowEdge::NorthWest, gtk::Align::Start, gtk::Align::Start, CORNER, CORNER);
-        add_grip(&overlay, gtk::gdk::WindowEdge::NorthEast, gtk::Align::End, gtk::Align::Start, CORNER, CORNER);
-        add_grip(&overlay, gtk::gdk::WindowEdge::SouthWest, gtk::Align::Start, gtk::Align::End, CORNER, CORNER);
-        add_grip(&overlay, gtk::gdk::WindowEdge::SouthEast, gtk::Align::End, gtk::Align::End, CORNER, CORNER);
+        add_grip(
+            &overlay,
+            gtk::gdk::WindowEdge::NorthWest,
+            gtk::Align::Start,
+            gtk::Align::Start,
+            CORNER,
+            CORNER,
+        );
+        add_grip(
+            &overlay,
+            gtk::gdk::WindowEdge::NorthEast,
+            gtk::Align::End,
+            gtk::Align::Start,
+            CORNER,
+            CORNER,
+        );
+        add_grip(
+            &overlay,
+            gtk::gdk::WindowEdge::SouthWest,
+            gtk::Align::Start,
+            gtk::Align::End,
+            CORNER,
+            CORNER,
+        );
+        add_grip(
+            &overlay,
+            gtk::gdk::WindowEdge::SouthEast,
+            gtk::Align::End,
+            gtk::Align::End,
+            CORNER,
+            CORNER,
+        );
         GRIPS_INSTALLED.with(|c| c.set(true));
     });
 }
@@ -288,7 +344,9 @@ pub fn logical_window_size(app: &tauri::AppHandle, label: &str) -> Option<(i32, 
         let _ = tx.send(size);
     });
     // 超时兜底:同步路径立即可得;异步路径约一个主循环周期即回。取不到则返回 None 由调用方回退。
-    rx.recv_timeout(std::time::Duration::from_millis(500)).ok().flatten()
+    rx.recv_timeout(std::time::Duration::from_millis(500))
+        .ok()
+        .flatten()
 }
 
 /// 读取当前主线程的 Fixed 句柄
@@ -338,7 +396,14 @@ fn ensure_fixed(wv: &webkit2gtk::WebView) -> Option<gtk::Fixed> {
 /// 在 Overlay 上叠加一条边缘拖拽热区
 /// 参数:overlay 目标 Overlay;edge 对应的窗口边缘;halign/valign 热区对齐方式;w/h 热区尺寸(负值表示自然尺寸)
 /// 按下热区时对顶层窗口发起 `begin_resize_drag`,Wayland(转 xdg_toplevel.resize)与 X11(交 WM)均原生生效
-fn add_grip(overlay: &gtk::Overlay, edge: gtk::gdk::WindowEdge, halign: gtk::Align, valign: gtk::Align, w: i32, h: i32) {
+fn add_grip(
+    overlay: &gtk::Overlay,
+    edge: gtk::gdk::WindowEdge,
+    halign: gtk::Align,
+    valign: gtk::Align,
+    w: i32,
+    h: i32,
+) {
     // 用 EventBox 而非 DrawingArea:DrawingArea 没有自己的 GdkWindow,而主子控件
     // WebKitWebView 自带 GdkWindow 且会盖在上面,导致热区收不到按压。
     // EventBox(visible_window=false) 拥有独立 input-only GdkWindow,
@@ -352,7 +417,10 @@ fn add_grip(overlay: &gtk::Overlay, edge: gtk::gdk::WindowEdge, halign: gtk::Ali
     area.set_size_request(w, h);
     let _ = area.connect_button_press_event(move |widget, event| {
         // 取顶层窗口发起拖拽缩放(坐标/时间戳用于 X11;Wayland 后端按当前事件序列处理)
-        if let Some(win) = widget.toplevel().and_then(|t| t.downcast::<gtk::Window>().ok()) {
+        if let Some(win) = widget
+            .toplevel()
+            .and_then(|t| t.downcast::<gtk::Window>().ok())
+        {
             win.begin_resize_drag(
                 edge,
                 event.button() as i32,

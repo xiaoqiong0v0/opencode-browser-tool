@@ -32,20 +32,112 @@ pub const DEFAULT_DEVICE: Device = Device {
 
 /// 内置设备预设表(首项 desktop-720p 为默认设备);宽高即内容区(视口)尺寸
 pub const DEVICES: &[Device] = &[
-    Device { name: "desktop-720p", width: 1024.0, height: 720.0, ua: None },
-    Device { name: "desktop-1080p", width: 1920.0, height: 1080.0, ua: None },
-    Device { name: "desktop-900p", width: 1440.0, height: 900.0, ua: None },
-    Device { name: "ipad-pro-11", width: 834.0, height: 1194.0, ua: Some("Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1") },
-    Device { name: "ipad-10", width: 820.0, height: 1180.0, ua: Some("Mozilla/5.0 (iPad; CPU OS 16_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Mobile/15E148 Safari/604.1") },
-    Device { name: "ipad-mini-6", width: 744.0, height: 1133.0, ua: Some("Mozilla/5.0 (iPad; CPU OS 15_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.5 Mobile/15E148 Safari/604.1") },
-    Device { name: "iphone-15-pro", width: 393.0, height: 852.0, ua: Some("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1") },
-    Device { name: "iphone-14", width: 390.0, height: 844.0, ua: Some("Mozilla/5.0 (iPhone; CPU iPhone OS 16_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Mobile/15E148 Safari/604.1") },
-    Device { name: "iphone-13", width: 390.0, height: 844.0, ua: Some("Mozilla/5.0 (iPhone; CPU iPhone OS 15_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.5 Mobile/15E148 Safari/604.1") },
-    Device { name: "iphone-12", width: 390.0, height: 844.0, ua: Some("Mozilla/5.0 (iPhone; CPU iPhone OS 14_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1 Mobile/15E148 Safari/604.1") },
-    Device { name: "iphone-se", width: 375.0, height: 667.0, ua: Some("Mozilla/5.0 (iPhone; CPU iPhone OS 15_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.5 Mobile/15E148 Safari/604.1") },
-    Device { name: "pixel-7", width: 412.0, height: 915.0, ua: Some("Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36") },
-    Device { name: "pixel-6", width: 411.0, height: 914.0, ua: Some("Mozilla/5.0 (Linux; Android 13; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36") },
-    Device { name: "galaxy-s23", width: 360.0, height: 780.0, ua: Some("Mozilla/5.0 (Linux; Android 13; SM-S911B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Mobile Safari/537.36") },
+    Device {
+        name: "desktop-720p",
+        width: 1024.0,
+        height: 720.0,
+        ua: None,
+    },
+    Device {
+        name: "desktop-1080p",
+        width: 1920.0,
+        height: 1080.0,
+        ua: None,
+    },
+    Device {
+        name: "desktop-900p",
+        width: 1440.0,
+        height: 900.0,
+        ua: None,
+    },
+    Device {
+        name: "ipad-pro-11",
+        width: 834.0,
+        height: 1194.0,
+        ua: Some(
+            "Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+        ),
+    },
+    Device {
+        name: "ipad-10",
+        width: 820.0,
+        height: 1180.0,
+        ua: Some(
+            "Mozilla/5.0 (iPad; CPU OS 16_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Mobile/15E148 Safari/604.1",
+        ),
+    },
+    Device {
+        name: "ipad-mini-6",
+        width: 744.0,
+        height: 1133.0,
+        ua: Some(
+            "Mozilla/5.0 (iPad; CPU OS 15_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.5 Mobile/15E148 Safari/604.1",
+        ),
+    },
+    Device {
+        name: "iphone-15-pro",
+        width: 393.0,
+        height: 852.0,
+        ua: Some(
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+        ),
+    },
+    Device {
+        name: "iphone-14",
+        width: 390.0,
+        height: 844.0,
+        ua: Some(
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Mobile/15E148 Safari/604.1",
+        ),
+    },
+    Device {
+        name: "iphone-13",
+        width: 390.0,
+        height: 844.0,
+        ua: Some(
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 15_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.5 Mobile/15E148 Safari/604.1",
+        ),
+    },
+    Device {
+        name: "iphone-12",
+        width: 390.0,
+        height: 844.0,
+        ua: Some(
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 14_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1 Mobile/15E148 Safari/604.1",
+        ),
+    },
+    Device {
+        name: "iphone-se",
+        width: 375.0,
+        height: 667.0,
+        ua: Some(
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 15_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.5 Mobile/15E148 Safari/604.1",
+        ),
+    },
+    Device {
+        name: "pixel-7",
+        width: 412.0,
+        height: 915.0,
+        ua: Some(
+            "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36",
+        ),
+    },
+    Device {
+        name: "pixel-6",
+        width: 411.0,
+        height: 914.0,
+        ua: Some(
+            "Mozilla/5.0 (Linux; Android 13; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36",
+        ),
+    },
+    Device {
+        name: "galaxy-s23",
+        width: 360.0,
+        height: 780.0,
+        ua: Some(
+            "Mozilla/5.0 (Linux; Android 13; SM-S911B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Mobile Safari/537.36",
+        ),
+    },
 ];
 
 /// 按名称查找设备(含特殊名 DEFAULT_DEVICE_NAME;设备列表只遍历 DEVICES,不含「默认」)
@@ -120,22 +212,36 @@ pub fn set_user_agent(app: &AppHandle, ua: Option<&str>) -> Result<(), String> {
             let controller = platform_webview.controller();
             let webview = match controller.CoreWebView2() {
                 Ok(w) => w,
-                Err(e) => { let _ = tx.send(Err(format!("get webview failed: {e}"))); return; }
+                Err(e) => {
+                    let _ = tx.send(Err(format!("get webview failed: {e}")));
+                    return;
+                }
             };
             let settings = match webview.Settings() {
                 Ok(s) => s,
-                Err(e) => { let _ = tx.send(Err(format!("get settings failed: {e}"))); return; }
+                Err(e) => {
+                    let _ = tx.send(Err(format!("get settings failed: {e}")));
+                    return;
+                }
             };
             // ICoreWebView2Settings2 提供 UserAgent 属性(运行时修改)
-            match settings.cast::<webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings2>() {
+            match settings
+                .cast::<webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings2>()
+            {
                 Ok(settings2) => {
                     let ua_wide = windows::core::HSTRING::from(&ua_owned);
                     match settings2.SetUserAgent(&ua_wide) {
-                        Ok(()) => { let _ = tx.send(Ok(())); }
-                        Err(e) => { let _ = tx.send(Err(format!("set user agent failed: {e}"))); }
+                        Ok(()) => {
+                            let _ = tx.send(Ok(()));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(format!("set user agent failed: {e}")));
+                        }
                     }
                 }
-                Err(e) => { let _ = tx.send(Err(format!("settings2 cast failed: {e}"))); }
+                Err(e) => {
+                    let _ = tx.send(Err(format!("settings2 cast failed: {e}")));
+                }
             }
         }
     })

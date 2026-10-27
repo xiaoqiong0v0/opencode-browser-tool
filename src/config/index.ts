@@ -20,6 +20,33 @@ const WINDOWS_RESERVED_NAMES = new Set([
 
 export type Lang = "en" | "zh";
 
+/** console / network 日志流的默认字节预算:8 MiB(1.12.0) */
+export const DEFAULT_LOG_BUFFER_BYTES = 8 * 1024 * 1024;
+/** network 同 key 合并窗口默认值(ms):间隔 ≤ 此值才累加 count(1.12.0) */
+export const DEFAULT_NETWORK_BURST_MS = 2000;
+/** console 注入默认开关:Linux 开、其它平台关(Windows 走 CDP,无需注入)(1.12.0) */
+export const DEFAULT_CONSOLE_INJECT: boolean = process.platform === "linux";
+
+/**
+ * WebView2 额外启动参数默认值(仅 Windows 生效)。
+ *
+ * 背景:RDP 会话断开/切后台时,DWM 合成暂停;WebView2 若依赖 GPU 合成会阻塞,
+ * 进而卡死 UI 线程(我们的同步 UI 调用再把整个进程拖死)。
+ * - `--disable-gpu-compositing`:改用 CPU 合成,断开会话不阻塞
+ * - `--disable-features=CalculateNativeWinOcclusion`:关闭窗口遮挡计算(后台/隐藏窗口卡死常见诱因)
+ *
+ * 可用配置 `webview2Args` 或 env `BT_WEBVIEW2_ARGS` 覆盖;设为空串表示不加任何参数。
+ */
+export const DEFAULT_WEBVIEW2_ARGS = [
+  // 关闭窗口遮挡计算(隐藏/后台窗口卡死常见诱因;前台渲染不受影响)
+  "--disable-features=CalculateNativeWinOcclusion",
+  // 关键:窗口被遮挡/后台时不要节流或挂起 renderer,
+  // 否则 ExecuteScript 可能永不回调 → 同步等 UI 的调用会永久阻塞
+  "--disable-background-timer-throttling",
+  "--disable-renderer-backgrounding",
+  "--disable-backgrounding-occluded-windows",
+].join(" ");
+
 // 1.9.0:移除 browserType / sessionIsolation —— 二者透传给 bt-shell 的 --browser / --session-isolation
 // 从不被 Rust 解析(main.rs parse_args 静默丢弃),是**死参数**;1.9.0 起每会话独立 shell 实例成为
 // 唯一行为,继续保留会误导用户。旧配置文件里若仍有这两项,applyConfigFile 会忽略(见函数注释)。
@@ -32,9 +59,27 @@ export interface PluginConfig {
   disabledTools?: string[];
   /** 缓存根目录(默认 ~/.opencode/plugins-cache/opencode-browser-tool) */
   cacheDir?: string;
+  /** console 流字节预算(默认 8 MiB;等价 env `BT_CONSOLE_BUFFER_MB`) */
+  consoleBufferBytes?: number;
+  /** network 流字节预算(默认 8 MiB;等价 env `BT_NETWORK_BUFFER_MB`) */
+  networkBufferBytes?: number;
+  /** network 聚合窗口(默认 2000ms;等价 env `BT_NETWORK_BURST_MS`) */
+  networkBurstWindowMs?: number;
+  /** Linux console 注入猴补开关(默认 Linux true / Windows false;等价 env `BT_CONSOLE_INJECT`) */
+  consoleInject?: boolean;
+  /** WebView2 额外启动参数(Windows;默认抗 RDP/遮挡卡死的一组;空串=不加;等价 env `BT_WEBVIEW2_ARGS`) */
+  webview2Args?: string;
 }
 
-const defaults: PluginConfig = { panelLang: "en", toolLang: "en" };
+const defaults: PluginConfig = {
+  panelLang: "en",
+  toolLang: "en",
+  consoleBufferBytes: DEFAULT_LOG_BUFFER_BYTES,
+  networkBufferBytes: DEFAULT_LOG_BUFFER_BYTES,
+  networkBurstWindowMs: DEFAULT_NETWORK_BURST_MS,
+  consoleInject: DEFAULT_CONSOLE_INJECT,
+  webview2Args: DEFAULT_WEBVIEW2_ARGS,
+};
 let _config: PluginConfig = { ...defaults };
 let _worktree: string = "";
 
@@ -217,7 +262,32 @@ function applyConfigFile(config: PluginConfig, filePath: string): void {
     if (fileConfig.toolLang && isValidLang(fileConfig.toolLang)) config.toolLang = fileConfig.toolLang;
     if (fileConfig.disabledTools) config.disabledTools = fileConfig.disabledTools;
     if (fileConfig.cacheDir !== undefined) config.cacheDir = fileConfig.cacheDir;
+    // 日志流配置:非法值(非正数/类型不对)静默忽略,保留默认(配置解析本身不抛错)
+    if (typeof fileConfig.webview2Args === "string") config.webview2Args = fileConfig.webview2Args;
+  const consoleBytes = toPositiveInt(fileConfig.consoleBufferBytes);
+    if (consoleBytes !== undefined) config.consoleBufferBytes = consoleBytes;
+    const networkBytes = toPositiveInt(fileConfig.networkBufferBytes);
+    if (networkBytes !== undefined) config.networkBufferBytes = networkBytes;
+    const burstMs = toPositiveInt(fileConfig.networkBurstWindowMs);
+    if (burstMs !== undefined) config.networkBurstWindowMs = burstMs;
+    if (typeof fileConfig.consoleInject === "boolean") config.consoleInject = fileConfig.consoleInject;
   } catch {}
+}
+
+/** 取正整数字面值(字符串数字也接受);非法返回 undefined(配置/环境变量共用) */
+function toPositiveInt(raw: unknown): number | undefined {
+  if (raw === undefined || raw === null || raw === "") return undefined;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+}
+
+/** 解析布尔开关:`1/true/on/yes` → true,`0/false/off/no` → false,其它 → undefined */
+function parseBoolFlag(raw: string | undefined): boolean | undefined {
+  if (raw === undefined) return undefined;
+  const v = raw.trim().toLowerCase();
+  if (["1", "true", "on", "yes"].includes(v)) return true;
+  if (["0", "false", "off", "no"].includes(v)) return false;
+  return undefined;
 }
 
 function applyEnv(config: PluginConfig): void {
@@ -237,6 +307,74 @@ function applyEnv(config: PluginConfig): void {
   if (process.env.BT_NODE_PATH) {
     config.nodePath = process.env.BT_NODE_PATH;
   }
+  // 日志流配置:环境变量按 MB 传入(与传给 shell 的 env 同名同单位),内部统一存字节
+  const consoleMb = toPositiveInt(process.env.BT_CONSOLE_BUFFER_MB);
+  if (consoleMb !== undefined) config.consoleBufferBytes = consoleMb * 1024 * 1024;
+  const networkMb = toPositiveInt(process.env.BT_NETWORK_BUFFER_MB);
+  if (networkMb !== undefined) config.networkBufferBytes = networkMb * 1024 * 1024;
+  const burstMs = toPositiveInt(process.env.BT_NETWORK_BURST_MS);
+  if (burstMs !== undefined) config.networkBurstWindowMs = burstMs;
+  const inject = parseBoolFlag(process.env.BT_CONSOLE_INJECT);
+  if (inject !== undefined) config.consoleInject = inject;
+}
+
+/**
+ * 字节预算 → 传给 shell 的 MB 字符串。
+ *
+ * shell 侧 `BT_*_BUFFER_MB` 只接受**整数** u64（小数会被判非法并回退默认），
+ * 因此这里向上取整到整数 MB（至少 1），宁可多给预算也不静默缩水：8 MiB → "8"，
+ * 1.5 MiB → "2"。
+ */
+export function bytesToMbString(bytes: number): string {
+  return String(Math.max(1, Math.ceil(bytes / (1024 * 1024))));
+}
+
+/**
+ * 构造传给 shell 的日志流环境变量(spawn 模式专用)。
+ *
+ * 键名与 Rust 侧读取口径一致:`BT_CONSOLE_BUFFER_MB` / `BT_NETWORK_BUFFER_MB` 为 MB,
+ * `BT_NETWORK_BURST_MS` 为毫秒,`BT_CONSOLE_INJECT` 为 `1`/`0`。
+ * **附着模式不传**:外部 shell 的缓冲配置由外部启动者负责(见 README「附着模式」)。
+ *
+ * @param cfg 生效配置(已合并文件与环境变量)
+ * @returns 仅新增/覆盖这 4 个键的环境变量表
+ */
+export function buildLogStreamEnv(cfg: PluginConfig): Record<string, string> {
+  // 非正数视为未配置（配置层已过滤；这里兜底直接调用方传入的坏值）
+  const bytes = (v?: number): number =>
+    typeof v === "number" && Number.isFinite(v) && v > 0 ? v : DEFAULT_LOG_BUFFER_BYTES;
+  const ms = (v?: number): number =>
+    typeof v === "number" && Number.isFinite(v) && v > 0 ? v : DEFAULT_NETWORK_BURST_MS;
+  return {
+    BT_CONSOLE_BUFFER_MB: bytesToMbString(bytes(cfg.consoleBufferBytes)),
+    BT_NETWORK_BUFFER_MB: bytesToMbString(bytes(cfg.networkBufferBytes)),
+    BT_NETWORK_BURST_MS: String(Math.floor(ms(cfg.networkBurstWindowMs))),
+    BT_CONSOLE_INJECT: (cfg.consoleInject ?? DEFAULT_CONSOLE_INJECT) ? "1" : "0",
+  };
+}
+
+/** 取当前生效配置对应的 shell 日志流环境变量 */
+export function getLogStreamEnv(): Record<string, string> {
+  return buildLogStreamEnv(getConfig());
+}
+
+/**
+ * 取 spawn shell 时需追加的 WebView2 环境变量(仅 Windows)。
+ *
+ * 优先级:env `BT_WEBVIEW2_ARGS` > 配置 `webview2Args` > `DEFAULT_WEBVIEW2_ARGS`;
+ * 结果与进程已有 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` 合并(已包含则不重复)。
+ * 返回空对象表示不加任何参数(空串显式关闭)。
+ */
+export function getWebviewEnv(): Record<string, string> {
+  if (process.platform !== "win32") return {};
+  const cfg = getConfig();
+  const fromEnv = process.env.BT_WEBVIEW2_ARGS;
+  const raw = fromEnv !== undefined ? fromEnv : (cfg.webview2Args ?? DEFAULT_WEBVIEW2_ARGS);
+  const args = String(raw).trim();
+  if (!args) return {};
+  const existing = (process.env.WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS || "").trim();
+  const merged = !existing ? args : existing.includes(args) ? existing : `${existing} ${args}`;
+  return { WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: merged };
 }
 
 function isValidLang(lang: string): lang is Lang {
@@ -265,6 +403,16 @@ function generateDefaultConfig(filePath: string): void {
 
   // 禁用的工具列表（可选，工具名不加 bt_ 前缀）
   // "disabledTools": ["close", "custom_user_agent"],
+
+  // console / network 日志流缓冲字节预算（可选，默认各 8 MiB；等价 BT_CONSOLE_BUFFER_MB / BT_NETWORK_BUFFER_MB）
+  // "consoleBufferBytes": 8388608,
+  // "networkBufferBytes": 8388608,
+
+  // network 聚合窗口毫秒（可选，默认 2000；同期同 key 的请求才合并计数；等价 BT_NETWORK_BURST_MS）
+  // "networkBurstWindowMs": 2000,
+
+  // Linux console 注入猴补（可选，默认 Linux true / Windows false；Windows 走 CDP 无需注入；等价 BT_CONSOLE_INJECT）
+  // "consoleInject": false,
 
   // 1.9.0 起「每会话独立浏览器实例」为唯一行为（原 sessionIsolation 开关从未生效，已移除）；
   // browserType 同理移除（--browser 从不被 bt-shell 解析）。旧配置里若仍写着这两项会被忽略。

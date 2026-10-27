@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tauri::AppHandle;
 
-use super::{ControlResult, Outcome, trusted_available};
 use super::keyboard;
+use super::{ControlResult, Outcome, trusted_available};
 
 /// 填写输入框:可信通道失败时报错,降级路径标注 degraded
 pub fn fill(app: &AppHandle, selector: &str, value: &str) -> ControlResult<Outcome<()>> {
@@ -176,7 +176,10 @@ fn select_fallback(
     );
     let v = super::eval_with(app, &js, timeout_ms)?;
     check_error(&v)?;
-    Ok(v.get("value").and_then(Value::as_str).unwrap_or("").to_string())
+    Ok(v.get("value")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string())
 }
 
 /// iframe 内 DOM 赋值 + 派发 input/change(untrusted)
@@ -287,8 +290,13 @@ fn fill_in_iframe_trusted(
     } else {
         keyboard::insert_text_with(app, value, timeout_ms)?;
     }
-    let actual =
-        wait_value_in_iframe(app, iframe_selector, selector, value, verify_budget(timeout_ms))?;
+    let actual = wait_value_in_iframe(
+        app,
+        iframe_selector,
+        selector,
+        value,
+        verify_budget(timeout_ms),
+    )?;
     if actual != value {
         return Err(format!(
             "iframe fill verification failed: expected {value:?}, got {actual:?}"
@@ -336,7 +344,10 @@ fn read_value(app: &AppHandle, selector: &str, timeout_ms: Option<u64>) -> Contr
     );
     let v = super::eval_with(app, &js, timeout_ms)?;
     check_error(&v)?;
-    Ok(v.get("value").and_then(Value::as_str).unwrap_or("").to_string())
+    Ok(v.get("value")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string())
 }
 
 /// 输入事件异步处理(WebKitGTK 跨进程)时,读回校验的最长等待时间
@@ -528,7 +539,10 @@ fn read_value_in_iframe(
     );
     let v = super::eval_with(app, &js, timeout_ms)?;
     check_error(&v)?;
-    Ok(v.get("value").and_then(Value::as_str).unwrap_or("").to_string())
+    Ok(v.get("value")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string())
 }
 
 /// JS 返回值里带 error 字段则转 Err

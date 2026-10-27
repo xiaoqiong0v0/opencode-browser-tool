@@ -10,8 +10,8 @@ use std::sync::Mutex;
 #[cfg(windows)]
 use webview2_com::Microsoft::Web::WebView2::Win32::{
     COREWEBVIEW2_PERMISSION_KIND, COREWEBVIEW2_PERMISSION_KIND_CAMERA,
-    COREWEBVIEW2_PERMISSION_KIND_MICROPHONE, COREWEBVIEW2_PERMISSION_STATE_ALLOW,
-    ICoreWebView2, ICoreWebView2PermissionRequestedEventArgs,
+    COREWEBVIEW2_PERMISSION_KIND_MICROPHONE, COREWEBVIEW2_PERMISSION_STATE_ALLOW, ICoreWebView2,
+    ICoreWebView2PermissionRequestedEventArgs,
 };
 #[cfg(windows)]
 use webview2_com::PermissionRequestedEventHandler;
@@ -33,7 +33,7 @@ pub fn setup(app: &AppHandle, webview: &tauri::webview::Webview) {
                     let handler = PermissionRequestedEventHandler::create(Box::new(
                         move |_sender: Option<ICoreWebView2>,
                               args: Option<ICoreWebView2PermissionRequestedEventArgs>|
-                         -> windows::core::Result<()> {
+                              -> windows::core::Result<()> {
                             if let Some(args) = args {
                                 let mut kind = COREWEBVIEW2_PERMISSION_KIND::default();
                                 // 摄像头/麦克风权限一律允许
@@ -69,8 +69,7 @@ pub fn setup(app: &AppHandle, webview: &tauri::webview::Webview) {
         let wv = platform_webview.inner();
         wv.connect_permission_request(|_wv, request| {
             // 媒体类请求(摄像头/麦克风):allow 并返回 true 表示已处理
-            if let Some(req) =
-                request.dynamic_cast_ref::<webkit2gtk::UserMediaPermissionRequest>()
+            if let Some(req) = request.dynamic_cast_ref::<webkit2gtk::UserMediaPermissionRequest>()
             {
                 req.allow();
                 return true;

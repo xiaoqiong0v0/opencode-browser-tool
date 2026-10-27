@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use bt_shell::control;
+use bt_shell::streams;
 use bt_shell::ui::annotate::Annotator;
 use bt_shell::ui::{self, AnnotationRecord};
 use tauri::{Listener, Manager, State};
@@ -82,10 +83,58 @@ fn parse_args() -> (
     (browsers_path, port, user_data_dir, notify_url, title, token)
 }
 
+/// 解析事件流配置(1.12.0):env 为底,命令行 `--console-buffer-mb/--network-buffer-mb/
+/// --network-burst-ms/--console-inject` 覆盖。命令行与 env 都由插件启动时传入(契约:
+/// consoleBufferBytes / networkBufferBytes / networkBurstWindowMs / consoleInject)。
+fn streams_config_from_args() -> streams::StreamsConfig {
+    let mut cfg = streams::config_from_env();
+    let args: Vec<String> = std::env::args().collect();
+    let mut i = 1;
+    while i < args.len() {
+        let val = args.get(i + 1).map(String::as_str);
+        match args[i].as_str() {
+            "--console-buffer-mb" => {
+                if let Some(n) = val.and_then(|s| s.trim().parse::<u64>().ok()) {
+                    cfg.console_bytes = ((n as usize).saturating_mul(1024 * 1024)).max(64 * 1024);
+                }
+                i += 1;
+            }
+            "--network-buffer-mb" => {
+                if let Some(n) = val.and_then(|s| s.trim().parse::<u64>().ok()) {
+                    cfg.network_bytes = ((n as usize).saturating_mul(1024 * 1024)).max(64 * 1024);
+                }
+                i += 1;
+            }
+            "--network-burst-ms" => {
+                if let Some(n) = val.and_then(|s| s.trim().parse::<u64>().ok()) {
+                    cfg.burst_window_ms = n;
+                }
+                i += 1;
+            }
+            "--console-inject" => {
+                if let Some(v) = val {
+                    cfg.console_inject = matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "on" | "yes"
+                    );
+                }
+                i += 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    cfg
+}
+
 /// 解析鉴权令牌,返回 (令牌, 来源标识)
 /// 优先级:命令行 --token → 环境变量 BT_SHELL_TOKEN → 随机生成(16 字节 → 32 hex)
 fn resolve_auth_token(cli_token: Option<String>) -> (String, &'static str) {
-    if let Some(t) = cli_token.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+    if let Some(t) = cli_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
         return (t.to_string(), "cli");
     }
     if let Ok(env_token) = std::env::var("BT_SHELL_TOKEN") {
@@ -155,7 +204,14 @@ fn persist_auth_token(user_data_dir: Option<&str>, token: &str) {
 #[tauri::command]
 fn panel_records(state: State<ui::UiState>) -> Vec<AnnotationRecord> {
     // 面板列表只显示"未发送"记录(与参考实现一致:发送后列表清空;记录本身保留供工具读取)
-    state.records.lock().unwrap().iter().filter(|r| !r.sent).cloned().collect()
+    state
+        .records
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| !r.sent)
+        .cloned()
+        .collect()
 }
 
 /// 更新批注说明(面板输入框 → Rust)
@@ -200,21 +256,25 @@ fn panel_cmd(
                 match crate::control::screenshot::screenshot(&app2) {
                     Ok(img) => {
                         // 取 viewport 尺寸作为截图区域记录
-                        let (w, h) = ui::eval_page(&app2, "JSON.stringify({w: innerWidth, h: innerHeight})")
-                            .ok()
-                            .and_then(|s| {
-                                let v: serde_json::Value = serde_json::from_str(&s).ok()?;
-                                Some((
-                                    v["w"].as_i64().unwrap_or(0) as i32,
-                                    v["h"].as_i64().unwrap_or(0) as i32,
-                                ))
-                            })
-                            .unwrap_or((0, 0));
+                        let (w, h) =
+                            ui::eval_page(&app2, "JSON.stringify({w: innerWidth, h: innerHeight})")
+                                .ok()
+                                .and_then(|s| {
+                                    let v: serde_json::Value = serde_json::from_str(&s).ok()?;
+                                    Some((
+                                        v["w"].as_i64().unwrap_or(0) as i32,
+                                        v["h"].as_i64().unwrap_or(0) as i32,
+                                    ))
+                                })
+                                .unwrap_or((0, 0));
                         Annotator::show_shot_preview(&app2, img, (0, 0, w, h));
                     }
                     Err(e) => {
                         let msg = format!("截图失败:{e}");
-                        let _ = ui::eval_overlay(&app2, &format!("window.__btOverlay.notify({msg:?},'err')"));
+                        let _ = ui::eval_overlay(
+                            &app2,
+                            &format!("window.__btOverlay.notify({msg:?},'err')"),
+                        );
                     }
                 }
             });
@@ -257,7 +317,11 @@ fn api_token(state: State<'_, ApiToken>) -> String {
 
 /// 设置主题模式(auto/light/dark),广播给所有 webview 生效
 #[tauri::command]
-fn panel_set_theme(app: tauri::AppHandle, state: State<'_, ui::UiState>, theme: String) -> Result<(), String> {
+fn panel_set_theme(
+    app: tauri::AppHandle,
+    state: State<'_, ui::UiState>,
+    theme: String,
+) -> Result<(), String> {
     if !matches!(theme.as_str(), "auto" | "light" | "dark") {
         return Err(format!("invalid theme: {theme} (auto/light/dark)"));
     }
@@ -296,7 +360,10 @@ where
 
 /// 工具栏状态:标签列表 + 激活标签 + 面板开关(同时刷新激活标签的 URL/标题)
 #[tauri::command]
-async fn toolbar_state(app: tauri::AppHandle, state: State<'_, ui::UiState>) -> Result<serde_json::Value, String> {
+async fn toolbar_state(
+    app: tauri::AppHandle,
+    state: State<'_, ui::UiState>,
+) -> Result<serde_json::Value, String> {
     let active = *state.active_tab.lock().unwrap();
     // 从页面 webview 读一次状态(非轮询,仅工具栏拉取时);走同一守卫,错误页不覆盖地址栏
     if let Some(label) = ui::active_page_webview(&app).map(|w| w.label().to_string()) {
@@ -319,7 +386,11 @@ async fn toolbar_state(app: tauri::AppHandle, state: State<'_, ui::UiState>) -> 
 
 /// 新建标签页(工具栏"+"按钮 → 新标签页 / 指定地址)
 #[tauri::command]
-async fn toolbar_new_tab(app: tauri::AppHandle, state: State<'_, ui::UiState>, url: Option<String>) -> Result<(), String> {
+async fn toolbar_new_tab(
+    app: tauri::AppHandle,
+    state: State<'_, ui::UiState>,
+    url: Option<String>,
+) -> Result<(), String> {
     let url = url.unwrap_or_else(|| ui::NEWTAB_URL.to_string());
     let _ = state;
     ui::open_new_tab(&app, &url)
@@ -327,21 +398,33 @@ async fn toolbar_new_tab(app: tauri::AppHandle, state: State<'_, ui::UiState>, u
 
 /// 切换标签:隐藏当前 webview,显示目标 webview(不重新加载,保留页面状态)
 #[tauri::command]
-async fn toolbar_switch_tab(app: tauri::AppHandle, state: State<'_, ui::UiState>, id: u32) -> Result<(), String> {
+async fn toolbar_switch_tab(
+    app: tauri::AppHandle,
+    state: State<'_, ui::UiState>,
+    id: u32,
+) -> Result<(), String> {
     let _ = state;
     ui::switch_tab(&app, id)
 }
 
 /// 关闭标签:销毁其 webview,切换到邻近标签(关闭最后一个则自动新建空白标签)
 #[tauri::command]
-async fn toolbar_close_tab(app: tauri::AppHandle, state: State<'_, ui::UiState>, id: u32) -> Result<(), String> {
+async fn toolbar_close_tab(
+    app: tauri::AppHandle,
+    state: State<'_, ui::UiState>,
+    id: u32,
+) -> Result<(), String> {
     let _ = state;
     ui::close_tab(&app, id)
 }
 
 /// 地址栏导航:更新激活标签 URL 并导航
 #[tauri::command]
-async fn toolbar_navigate(app: tauri::AppHandle, state: State<'_, ui::UiState>, url: String) -> Result<(), String> {
+async fn toolbar_navigate(
+    app: tauri::AppHandle,
+    state: State<'_, ui::UiState>,
+    url: String,
+) -> Result<(), String> {
     if url.is_empty() {
         return Err("url is required".into());
     }
@@ -357,7 +440,11 @@ async fn toolbar_navigate(app: tauri::AppHandle, state: State<'_, ui::UiState>, 
     }
     // 记录导航前文档身份,用于确认导航确实发生(与 /api/navigate 同口径)
     let prev = ui_block(&app, |h| control::document_state(h))?;
-    let prev_url = prev.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let prev_url = prev
+        .get("url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let prev_to = prev.get("timeOrigin").and_then(|v| v.as_f64());
     let nav_url = url.clone();
     let nav_res = ui_block(&app, move |h| control::navigate(h, &nav_url));
@@ -367,7 +454,9 @@ async fn toolbar_navigate(app: tauri::AppHandle, state: State<'_, ui::UiState>, 
     nav_res?;
     // 有界等待就绪;未就绪至少留痕(此前静默"成功")
     let wait_url = url.clone();
-    match ui_block(&app, move |h| control::wait_ready(h, &prev_url, prev_to, control::nav_timeout_ms())) {
+    match ui_block(&app, move |h| {
+        control::wait_ready(h, &prev_url, prev_to, control::nav_timeout_ms())
+    }) {
         Ok(st) if st.get("ready").and_then(|v| v.as_bool()) == Some(false) => {
             eprintln!("[toolbar] navigate not ready: {wait_url} -> {st}")
         }
@@ -380,8 +469,10 @@ async fn toolbar_navigate(app: tauri::AppHandle, state: State<'_, ui::UiState>, 
 
 /// 切换面板浮层显示,返回新状态
 #[tauri::command]
-fn toolbar_toggle_panel(app: tauri::AppHandle, state: State<'_, ui::UiState>) -> Result<bool, String>
-{
+fn toolbar_toggle_panel(
+    app: tauri::AppHandle,
+    state: State<'_, ui::UiState>,
+) -> Result<bool, String> {
     let open = state.panel_open.lock().unwrap();
     let now = !*open;
     drop(open);
@@ -436,11 +527,25 @@ fn main() {
     // 显式声明 DPI 感知(否则窗口被系统虚拟化缩放,与 WebView2 真实 DPI 不一致导致布局错位)
     #[cfg(windows)]
     unsafe {
-        use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
+        use windows::Win32::UI::HiDpi::{
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+        };
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
 
     let (browsers_path, port, user_data_dir, notify_url, title, cli_token) = parse_args();
+
+    // 事件流配置(console/network 缓冲与聚合窗口):必须在 create_ui 前确定
+    // (create_ui 依此决定是否注入 console 猴补)。
+    streams::configure(streams_config_from_args());
+    let stream_cfg = streams::config();
+    eprintln!(
+        "[streams] console={}B network={}B burst={}ms inject={}",
+        stream_cfg.console_bytes,
+        stream_cfg.network_bytes,
+        stream_cfg.burst_window_ms,
+        stream_cfg.console_inject
+    );
 
     // HTTP API 鉴权:令牌在实例创建期确定,随实例不可变(attach 模式由插件用同一环境变量提供)。
     // 日志只打前 4 位 + 长度,绝不打印完整令牌。

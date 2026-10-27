@@ -3,18 +3,18 @@
 //! 工具栏 Webview 顶部横条(标签 + 地址栏 + 面板开关)
 //! 覆盖层 Webview 透明叠加,面板 Webview 覆盖式浮层(不占页面)
 pub mod annotate;
-/// 新窗口拦截(Windows/Linux:target=_blank → 新标签页)
-#[cfg(any(windows, target_os = "linux"))]
-pub mod new_window;
 /// Linux 子 webview 绝对定位垫片(tauri/wry 在 Linux 用 GtkBox 导致 set_bounds 失效)
 #[cfg(target_os = "linux")]
 pub mod linux_layout;
+/// 新窗口拦截(Windows/Linux:target=_blank → 新标签页)
+#[cfg(any(windows, target_os = "linux"))]
+pub mod new_window;
 
 use std::sync::{Mutex, OnceLock, mpsc};
 
 use serde::Serialize;
-use tauri::window::WindowBuilder;
 use tauri::webview::WebviewBuilder;
+use tauri::window::WindowBuilder;
 use tauri::{AppHandle, Manager, Runtime, WebviewUrl};
 
 /// 页面 Webview 标签
@@ -149,7 +149,14 @@ impl UiState {
             devtools_open: Mutex::new(false),
             service_port: Mutex::new(0),
             panel_open: Mutex::new(false),
-            tabs: Mutex::new(vec![TabState { id: 1, url: "about:blank".into(), title: "新标签页".into(), icon: String::new(), errored: false, webview: None }]),
+            tabs: Mutex::new(vec![TabState {
+                id: 1,
+                url: "about:blank".into(),
+                title: "新标签页".into(),
+                icon: String::new(),
+                errored: false,
+                webview: None,
+            }]),
             active_tab: Mutex::new(1),
             next_tab_id: Mutex::new(2),
             pending_click: Mutex::new(None),
@@ -195,19 +202,6 @@ const PAGE_BRIDGE_JS: &str = r##"
         viewport:{w:innerWidth,h:innerHeight,dpr:devicePixelRatio}};
     }
   };
-  // 控制台日志捕获:劫持 console.* 存入 __btLogs(service /api/console-logs 读取)
-  window.__btLogs=[];
-  ["log","info","warn","error","debug"].forEach(function(level){
-    var orig=console[level]&&console[level].bind(console);
-    console[level]=function(){
-      var msg=Array.prototype.map.call(arguments,function(a){
-        try{return (typeof a==="object"&&a!==null)?JSON.stringify(a):String(a);}catch(e){return String(a);}
-      }).join(" ");
-      if(window.__btLogs.length>=500)window.__btLogs.shift();
-      window.__btLogs.push({level:level,msg:msg});
-      if(orig)orig.apply(null,arguments);
-    };
-  });
 })();
 "##;
 
@@ -258,9 +252,21 @@ const PAGE_EVENT_JS: &str = r##"
 })();
 "##;
 
-/// 生成页面 Webview 的注入脚本(页面桥 + 媒体模拟 + 事件上报;含事件端口与 webview label)
+/// 生成页面 Webview 的注入脚本(页面桥 + 媒体模拟 + 事件上报 + 可选 console 猴补)
+///
+/// console 采集来源按平台分工(1.12.0):
+/// - Windows:CDP(`capture::setup_page`),默认不注入,避免与 CDP 双计;
+/// - Linux:注入猴补(`CONSOLE_INJECT_JS`),`BT_CONSOLE_INJECT=0` 可关。
 fn page_init_script(label: &str, port: u16) -> String {
-    format!("window.__btEventPort={port};window.__btPageLabel=\"{label}\";\n{PAGE_BRIDGE_JS}{MEDIA_FAKE_JS}{PAGE_EVENT_JS}")
+    #[allow(unused_mut)]
+    let mut script = format!(
+        "window.__btEventPort={port};window.__btPageLabel=\"{label}\";\n{PAGE_BRIDGE_JS}{MEDIA_FAKE_JS}{PAGE_EVENT_JS}"
+    );
+    #[cfg(target_os = "linux")]
+    if crate::capture::console_inject_enabled() {
+        script.push_str(crate::capture::CONSOLE_INJECT_JS);
+    }
+    script
 }
 
 /// 错误页 scheme(chromium/webview2 导航失败后的文档地址)
@@ -270,17 +276,35 @@ pub fn is_error_url(url: &str) -> bool {
 
 /// 内部 scheme:不作为"用户可见地址栏"内容(不覆盖 TabState.url)
 pub fn is_internal_url(url: &str) -> bool {
-    const P: [&str; 8] = ["about:", "tauri:", "data:", "chrome:", "devtools:", "edge:", "chrome-error:", "edge-error:"];
+    const P: [&str; 8] = [
+        "about:",
+        "tauri:",
+        "data:",
+        "chrome:",
+        "devtools:",
+        "edge:",
+        "chrome-error:",
+        "edge-error:",
+    ];
     P.iter().any(|p| url.starts_with(p))
 }
 
 /// 用页面/导航事件更新某 webview(label) 对应标签的 URL/标题/图标。
 /// 守卫:错误页只置 `errored`、**不覆盖 url**;其它内部 scheme 也不覆盖 url。
 /// 返回是否有变化(调用方据此决定是否 emit_tabs_changed)。
-pub fn apply_page_state(app: &AppHandle, label: &str, url: Option<&str>, title: Option<&str>, icon: Option<&str>) -> bool {
+pub fn apply_page_state(
+    app: &AppHandle,
+    label: &str,
+    url: Option<&str>,
+    title: Option<&str>,
+    icon: Option<&str>,
+) -> bool {
     let state = app.state::<UiState>();
     let mut tabs = state.tabs.lock().unwrap();
-    let Some(t) = tabs.iter_mut().find(|t| t.webview.as_deref() == Some(label)) else {
+    let Some(t) = tabs
+        .iter_mut()
+        .find(|t| t.webview.as_deref() == Some(label))
+    else {
         return false;
     };
     let before = (t.url.clone(), t.title.clone(), t.icon.clone(), t.errored);
@@ -333,13 +357,20 @@ fn schedule_after_load(handle: AppHandle, label: String) {
 pub fn reload_active_tab(app: &AppHandle) -> Result<serde_json::Value, String> {
     let state = app.state::<UiState>();
     let active = *state.active_tab.lock().unwrap();
-    let tab = state.tabs.lock().unwrap().iter().find(|t| t.id == active).cloned();
+    let tab = state
+        .tabs
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|t| t.id == active)
+        .cloned();
     // 最后真实导航 URL(标签不存在或从未导航则为空 → 返回体不带 url,由调用方降级文案)
     let last_url = tab.as_ref().map(|t| t.url.clone()).unwrap_or_default();
     if let Some(t) = tab {
         if t.errored && !t.url.is_empty() {
             let url = t.url.clone();
-            crate::control::navigate(app, &url).map_err(|e| format!("retry navigate failed: {e}"))?;
+            crate::control::navigate(app, &url)
+                .map_err(|e| format!("retry navigate failed: {e}"))?;
             return Ok(serde_json::json!({ "reloaded": true, "url": url, "retried": url }));
         }
     }
@@ -720,7 +751,10 @@ const MEDIA_FAKE_JS: &str = r##"
 
 /// 按需给 WebviewBuilder 设置用户数据目录(多用户配置隔离;None 用默认目录)
 /// 同目录的多个 webview 会共享同一 WebView2 environment,页面/工具栏等统一走同一用户配置
-fn with_data_dir<R: Runtime>(builder: WebviewBuilder<R>, dir: &Option<String>) -> WebviewBuilder<R> {
+fn with_data_dir<R: Runtime>(
+    builder: WebviewBuilder<R>,
+    dir: &Option<String>,
+) -> WebviewBuilder<R> {
     match dir {
         Some(d) => builder.data_directory(std::path::PathBuf::from(d.as_str())),
         None => builder,
@@ -752,7 +786,10 @@ pub fn create_ui(app: &AppHandle, service_port: u16, title: Option<&str>) -> tau
     // 1. 工具栏 Webview(顶部横条:标签 + 地址栏 + 面板开关)
     // 创建后先隐藏,布局定位完成后再显示,避免初始 100x100 在左上角闪现
     let toolbar = window.add_child(
-        with_data_dir(WebviewBuilder::new(TOOLBAR_WEBVIEW, WebviewUrl::App("toolbar.html".into())), &data_dir),
+        with_data_dir(
+            WebviewBuilder::new(TOOLBAR_WEBVIEW, WebviewUrl::App("toolbar.html".into())),
+            &data_dir,
+        ),
         tauri::PhysicalPosition::new(0, 0),
         tauri::PhysicalSize::new(100, 100),
     )?;
@@ -799,9 +836,8 @@ pub fn create_ui(app: &AppHandle, service_port: u16, title: Option<&str>) -> tau
         // 注册新窗口拦截(target=_blank → 新标签页)
         #[cfg(any(windows, target_os = "linux"))]
         new_window::setup(app, &w);
-        // 注册响应捕获(expect/assert-response 查询历史)
-        #[cfg(any(windows, target_os = "linux"))]
-        crate::control::responses::setup(app, &w);
+        // 注册事件采集(console/network/phase;expect/assert-response 查同一 network 流)
+        crate::capture::setup_page(app, &w, &label);
         // 注册媒体权限放行(摄像头/麦克风统一放行)
         #[cfg(any(windows, target_os = "linux"))]
         crate::control::media::setup(app, &w);
@@ -831,7 +867,10 @@ pub fn create_ui(app: &AppHandle, service_port: u16, title: Option<&str>) -> tau
 
     // 4. 面板 Webview(覆盖式浮层,默认隐藏,由工具栏按钮切换)
     window.add_child(
-        with_data_dir(WebviewBuilder::new(PANEL_WEBVIEW, WebviewUrl::App("index.html".into())), &data_dir),
+        with_data_dir(
+            WebviewBuilder::new(PANEL_WEBVIEW, WebviewUrl::App("index.html".into())),
+            &data_dir,
+        ),
         tauri::PhysicalPosition::new(100, 0),
         tauri::PhysicalSize::new(100, 100),
     )?;
@@ -873,7 +912,11 @@ pub fn create_ui(app: &AppHandle, service_port: u16, title: Option<&str>) -> tau
     // 失败不再静默:写 stderr(被插件转发为 [shell:err])并立即重试一次,仍失败则放弃并留日志
     let handle = app.clone();
     window.on_window_event(move |event| match event {
-        tauri::WindowEvent::Resized(size) | tauri::WindowEvent::ScaleFactorChanged { new_inner_size: size, .. } => {
+        tauri::WindowEvent::Resized(size)
+        | tauri::WindowEvent::ScaleFactorChanged {
+            new_inner_size: size,
+            ..
+        } => {
             if let Some(win) = handle.get_window("main") {
                 let scale = win.scale_factor().unwrap_or(1.0);
                 apply_layout_or_log(&handle, *size, scale);
@@ -894,9 +937,15 @@ pub(crate) fn apply_layout_or_log(app: &AppHandle, size: tauri::PhysicalSize<u32
     match apply_layout(app, size, scale) {
         Ok(()) => {}
         Err(first) => {
-            eprintln!("[layout] apply_layout failed: {first} (size {}x{}, scale {scale}) — retrying once", size.width, size.height);
+            eprintln!(
+                "[layout] apply_layout failed: {first} (size {}x{}, scale {scale}) — retrying once",
+                size.width, size.height
+            );
             if let Err(second) = apply_layout(app, size, scale) {
-                eprintln!("[layout] apply_layout retry failed: {second} (size {}x{}, scale {scale}) — giving up", size.width, size.height);
+                eprintln!(
+                    "[layout] apply_layout retry failed: {second} (size {}x{}, scale {scale}) — giving up",
+                    size.width, size.height
+                );
             }
         }
     }
@@ -906,7 +955,14 @@ pub(crate) fn apply_layout_or_log(app: &AppHandle, size: tauri::PhysicalSize<u32
 /// 参数:app tauri 应用句柄;label webview 标签;x/y 左上角坐标;w/h 尺寸
 /// 坐标口径:Windows 为物理像素;Linux 为 GTK 逻辑像素(apply_layout 在 Linux 已统一为逻辑口径)
 /// 返回值:Windows 分支透传 tauri 设置失败的错误;其余平台恒 Ok
-fn set_webview_bounds(app: &AppHandle, label: &str, x: i32, y: i32, w: i32, h: i32) -> tauri::Result<()> {
+fn set_webview_bounds(
+    app: &AppHandle,
+    label: &str,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+) -> tauri::Result<()> {
     #[cfg(windows)]
     {
         if let Some(wv) = app.get_webview(label) {
@@ -936,7 +992,11 @@ fn set_webview_bounds(app: &AppHandle, label: &str, x: i32, y: i32, w: i32, h: i
 /// (工作区换算用 `mon.scale_factor()`,窗口位置换算用 `win.scale_factor()`;二者在「窗口位于该显示器」时相同,
 /// 因为 `current_monitor()` 返回的就是包含窗口的那块屏 —— 混合 DPI 且窗口跨屏时是近似口径)。
 /// 降级口径:取不到显示器/工作区无效时原样返回且不标 clamped(不因防护逻辑让 resize 失败)。
-pub fn clamp_window_to_work_area(win: &tauri::Window, want_w: f64, want_h: f64) -> (f64, f64, f64, f64, bool) {
+pub fn clamp_window_to_work_area(
+    win: &tauri::Window,
+    want_w: f64,
+    want_h: f64,
+) -> (f64, f64, f64, f64, bool) {
     let scale = win.scale_factor().unwrap_or(1.0);
     // 当前窗口左上角:outer_position 是物理像素 → 换算逻辑(set_position 同样吃逻辑)
     let (px, py) = win
@@ -1007,13 +1067,18 @@ pub fn clamp_window_to_work_area(win: &tauri::Window, want_w: f64, want_h: f64) 
 /// 覆盖层叠加在页面区;面板为覆盖式浮层(常规模式右侧 280,窄模式填满整个窗口;关闭时尺寸归零)
 /// size 为窗口物理内尺寸,scale 为窗口缩放因子
 /// size/scale 仅在 Windows 与 Linux 回退路径使用;Linux 正常路径改用 GTK 逻辑尺寸(见下)
-pub fn apply_layout(app: &AppHandle, size: tauri::PhysicalSize<u32>, scale: f64) -> tauri::Result<()> {
+pub fn apply_layout(
+    app: &AppHandle,
+    size: tauri::PhysicalSize<u32>,
+    scale: f64,
+) -> tauri::Result<()> {
     // Linux: 子视图经 GTK 用逻辑坐标定位(move_/set_size_request),而 tauri 的 size/scale 是物理口径。
     // 非整数缩放下 tao 的 scale_factor 与 GTK 内部整数 scale 不一致,按物理值换算会放大裁切 ——
     // 直接采用 GTK 顶层窗口 allocation 的逻辑宽高,并以 scale=1 计算(TOOLBAR_HEIGHT/PANEL_WIDTH
     // 本身即逻辑常数),使 place() 收到与定位 API 同口径的坐标。窗口未 map(allocation 为 0)时回退。
     #[cfg(target_os = "linux")]
-    let (win_w, win_h, layout_scale) = match linux_layout::logical_window_size(app, TOOLBAR_WEBVIEW) {
+    let (win_w, win_h, layout_scale) = match linux_layout::logical_window_size(app, TOOLBAR_WEBVIEW)
+    {
         Some((w, h)) => (w, h, 1.0),
         None => (size.width as i32, size.height as i32, scale),
     };
@@ -1047,12 +1112,26 @@ pub fn apply_layout(app: &AppHandle, size: tauri::PhysicalSize<u32>, scale: f64)
             .filter_map(|t| t.webview.clone())
             .collect();
         for label in labels {
-            set_webview_bounds(app, &label, 0, toolbar_h.max(0), page_w.max(0), page_h.max(0))?;
+            set_webview_bounds(
+                app,
+                &label,
+                0,
+                toolbar_h.max(0),
+                page_w.max(0),
+                page_h.max(0),
+            )?;
         }
     }
 
     // 3. 覆盖层 Webview(透明,叠加在页面区)
-    set_webview_bounds(app, OVERLAY_WEBVIEW, 0, toolbar_h.max(0), page_w.max(0), page_h.max(0))?;
+    set_webview_bounds(
+        app,
+        OVERLAY_WEBVIEW,
+        0,
+        toolbar_h.max(0),
+        page_w.max(0),
+        page_h.max(0),
+    )?;
 
     // 4. 面板 Webview(覆盖浮层:常规模式右侧 280;窄模式 x=0 填满整个窗口;panel_open 关闭时尺寸归零)
     //    页面 webview 不随之缩窄(page_w 保持全宽),关闭面板直接露出完整页面
@@ -1063,7 +1142,14 @@ pub fn apply_layout(app: &AppHandle, size: tauri::PhysicalSize<u32>, scale: f64)
         } else {
             (page_w, 0)
         };
-        set_webview_bounds(app, PANEL_WEBVIEW, px.max(0), toolbar_h.max(0), pw.max(0), page_h.max(0))?;
+        set_webview_bounds(
+            app,
+            PANEL_WEBVIEW,
+            px.max(0),
+            toolbar_h.max(0),
+            pw.max(0),
+            page_h.max(0),
+        )?;
         // Linux: 面板改用显式 show/hide(仅靠宽度归零时,Wayland 侧输入区域不会随 resize 恢复,
         // 会表现为"面板可见但点不动、事件穿透到下层页面")
         #[cfg(target_os = "linux")]
@@ -1091,17 +1177,16 @@ pub fn apply_layout(app: &AppHandle, size: tauri::PhysicalSize<u32>, scale: f64)
 pub fn bring_webviews_to_top(app: &AppHandle) {
     use tauri::Manager;
     use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::{SetWindowPos, HWND_TOP, SWP_NOMOVE, SWP_NOSIZE};
+    use windows::Win32::UI::WindowsAndMessaging::{HWND_TOP, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos};
     // 先 overlay 后 panel,panel 最终在最上
     for label in [OVERLAY_WEBVIEW, PANEL_WEBVIEW] {
         if let Some(w) = app.get_webview(label) {
-            let _ = w.with_webview(move |platform_webview| {
-                unsafe {
-                    let controller = platform_webview.controller();
-                    let mut parent: HWND = HWND::default();
-                    if controller.ParentWindow(&mut parent).is_ok() {
-                        let _ = SetWindowPos(parent, Some(HWND_TOP), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-                    }
+            let _ = w.with_webview(move |platform_webview| unsafe {
+                let controller = platform_webview.controller();
+                let mut parent: HWND = HWND::default();
+                if controller.ParentWindow(&mut parent).is_ok() {
+                    let _ =
+                        SetWindowPos(parent, Some(HWND_TOP), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
                 }
             });
         }
@@ -1172,6 +1257,24 @@ pub fn active_page_webview(app: &AppHandle) -> Option<tauri::webview::Webview> {
     app.get_webview(&label)
 }
 
+/// 当前激活标签 id(事件采集/相位归因用)
+pub fn active_tab_id(app: &AppHandle) -> u32 {
+    let state = app.state::<UiState>();
+    *state.active_tab.lock().unwrap()
+}
+
+/// webview label → 所属标签 id(CDP/WebKit 事件回调里按 label 归属到 tab)
+pub fn tab_id_for_label(app: &AppHandle, label: &str) -> Option<u32> {
+    let state = app.state::<UiState>();
+    state
+        .tabs
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|t| t.webview.as_deref() == Some(label))
+        .map(|t| t.id)
+}
+
 /// 动态创建标签页面 Webview(真多标签,每标签一个,初始隐藏)
 pub fn create_tab_webview(app: &AppHandle, id: u32) -> Result<tauri::webview::Webview, String> {
     // add_child 定义在 tauri::Window(需 get_window,而非 get_webview_window)
@@ -1191,7 +1294,8 @@ pub fn create_tab_webview(app: &AppHandle, id: u32) -> Result<tauri::webview::We
                 WebviewBuilder::new(&label, WebviewUrl::App("newtab.html".into()))
                     .initialization_script(script)
                     .on_navigation(move |url| {
-                        if apply_page_state(&nav_handle, &nav_label, Some(url.as_str()), None, None) {
+                        if apply_page_state(&nav_handle, &nav_label, Some(url.as_str()), None, None)
+                        {
                             emit_tabs_changed(&nav_handle);
                         }
                         true
@@ -1212,9 +1316,8 @@ pub fn create_tab_webview(app: &AppHandle, id: u32) -> Result<tauri::webview::We
     // 注册新窗口拦截(target=_blank → 新标签页)
     #[cfg(any(windows, target_os = "linux"))]
     new_window::setup(app, &w);
-    // 注册响应捕获(expect/assert-response 查询历史)
-    #[cfg(any(windows, target_os = "linux"))]
-    crate::control::responses::setup(app, &w);
+    // 注册事件采集(console/network/phase;expect/assert-response 查同一 network 流)
+    crate::capture::setup_page(app, &w, &label);
     // 注册媒体权限放行(摄像头/麦克风统一放行)
     #[cfg(any(windows, target_os = "linux"))]
     crate::control::media::setup(app, &w);
@@ -1400,7 +1503,10 @@ fn notify_plugin(app: &AppHandle, count: usize) {
 fn notify_worker() -> mpsc::Sender<(String, usize)> {
     let (tx, rx) = mpsc::channel::<(String, usize)>();
     std::thread::spawn(move || {
-        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
             Ok(rt) => rt,
             Err(e) => {
                 eprintln!("[notify] worker runtime init failed: {e}");
@@ -1429,7 +1535,12 @@ async fn post_notify(url: &str, count: usize) {
     // 1 次首发 + NOTIFY_RETRY_DELAYS_MS.len() 次重试
     let max_attempts = NOTIFY_RETRY_DELAYS_MS.len() + 1;
     for attempt in 1..=max_attempts {
-        match client.post(url).json(&serde_json::json!({ "count": count })).send().await {
+        match client
+            .post(url)
+            .json(&serde_json::json!({ "count": count }))
+            .send()
+            .await
+        {
             Ok(r) if r.status().is_success() => {
                 eprintln!("[notify] posted count={count} -> {url} (attempt {attempt})");
                 return;
@@ -1497,11 +1608,18 @@ pub fn send_all_records(app: &AppHandle) -> usize {
     eprintln!(
         "[send] send_all_records: count={} ids={:?} images={:?}",
         count,
-        items.iter().filter_map(|v| v.get("index").and_then(|x| x.as_u64())).collect::<Vec<_>>(),
+        items
+            .iter()
+            .filter_map(|v| v.get("index").and_then(|x| x.as_u64()))
+            .collect::<Vec<_>>(),
         items
             .iter()
             .filter(|v| v.get("image").map(|i| !i.is_null()).unwrap_or(false))
-            .map(|v| format!("#{}:{}B", v["index"], v["image"].as_str().map(str::len).unwrap_or(0)))
+            .map(|v| format!(
+                "#{}:{}B",
+                v["index"],
+                v["image"].as_str().map(str::len).unwrap_or(0)
+            ))
             .collect::<Vec<_>>()
     );
     drop(records);
@@ -1516,7 +1634,10 @@ pub fn send_all_records(app: &AppHandle) -> usize {
         let _ = panel.emit("records-changed", Vec::<AnnotationRecord>::new());
     }
     // 清空覆盖层批注/截图标记
-    let _ = eval_overlay(app, "window.__btOverlay._marks = []; window.__btOverlay.redraw([], [])");
+    let _ = eval_overlay(
+        app,
+        "window.__btOverlay._marks = []; window.__btOverlay.redraw([], [])",
+    );
     // 主动通知插件(推送式):仅传最小 count,插件收到后立即 drain 拉取内容
     if count > 0 {
         notify_plugin(app, count);
@@ -1586,7 +1707,14 @@ pub fn open_new_tab(app: &AppHandle, url: &str) -> Result<(), String> {
             t.title = "新标签页".into();
             t.webview = Some(label);
         } else {
-            tabs.push(TabState { id, url: url.clone(), title: "新标签页".into(), icon: String::new(), errored: false, webview: Some(label) });
+            tabs.push(TabState {
+                id,
+                url: url.clone(),
+                title: "新标签页".into(),
+                icon: String::new(),
+                errored: false,
+                webview: Some(label),
+            });
         }
         *state.active_tab.lock().unwrap() = id;
     }
@@ -1614,8 +1742,12 @@ pub fn switch_tab(app: &AppHandle, id: u32) -> Result<(), String> {
     let (cur_label, target_label) = {
         let tabs = state.tabs.lock().unwrap();
         (
-            tabs.iter().find(|t| t.id == active).and_then(|t| t.webview.clone()),
-            tabs.iter().find(|t| t.id == id).and_then(|t| t.webview.clone()),
+            tabs.iter()
+                .find(|t| t.id == active)
+                .and_then(|t| t.webview.clone()),
+            tabs.iter()
+                .find(|t| t.id == id)
+                .and_then(|t| t.webview.clone()),
         )
     };
     if let Some(l) = cur_label {
@@ -1665,7 +1797,14 @@ pub fn close_tab(app: &AppHandle, id: u32) -> Result<(), String> {
                     *n += 1;
                     nid
                 };
-                tabs.push(TabState { id: nid, url: NEWTAB_URL.to_string(), title: "新标签页".into(), icon: String::new(), errored: false, webview: None });
+                tabs.push(TabState {
+                    id: nid,
+                    url: NEWTAB_URL.to_string(),
+                    title: "新标签页".into(),
+                    icon: String::new(),
+                    errored: false,
+                    webview: None,
+                });
                 nid
             } else {
                 // 优先激活右侧标签,否则左侧
@@ -1680,6 +1819,8 @@ pub fn close_tab(app: &AppHandle, id: u32) -> Result<(), String> {
     if let Some(label) = closed_label.as_deref() {
         release_tab_webview(app, label);
     }
+    // 释放该标签的控制台/网络缓冲与相位(1.12.0);关闭会话时由 /api/close-session 全量清空
+    crate::streams::release_tab(id);
 
     let Some(new_active) = new_active else {
         // 关闭非激活标签:不切换,只广播(tabs 锁已释放,emit 安全)
@@ -1733,10 +1874,14 @@ pub fn close_tab(app: &AppHandle, id: u32) -> Result<(), String> {
 ///
 /// 说明:池成员由 `create_ui` 预创建、跨标签复用;关闭后保留实例回池,不销毁。
 fn is_pool_label(label: &str) -> bool {
-    let Some(rest) = label.strip_prefix(PAGE_WEBVIEW).and_then(|r| r.strip_prefix('-')) else {
+    let Some(rest) = label
+        .strip_prefix(PAGE_WEBVIEW)
+        .and_then(|r| r.strip_prefix('-'))
+    else {
         return false;
     };
-    rest.parse::<u32>().is_ok_and(|id| (1..=MAX_TABS).contains(&id))
+    rest.parse::<u32>()
+        .is_ok_and(|id| (1..=MAX_TABS).contains(&id))
 }
 
 /// 释放被关闭标签的 webview:池内保留(隐藏待复用),动态创建的真正 `close()` 销毁
@@ -1745,7 +1890,9 @@ fn is_pool_label(label: &str) -> bool {
 /// 说明:1.10.0 前只 `hide()`,标签 id 单调递增且池只有 `MAX_TABS` 个,
 /// 反复开关标签会让动态 webview 全部常驻(每个都是一个页面进程)→ 内存无界增长。
 fn release_tab_webview(app: &AppHandle, label: &str) {
-    let Some(w) = app.get_webview(label) else { return };
+    let Some(w) = app.get_webview(label) else {
+        return;
+    };
     // 先隐藏:避免关闭瞬间在旧位置闪一帧
     let _ = w.hide();
     if is_pool_label(label) {
@@ -1754,7 +1901,11 @@ fn release_tab_webview(app: &AppHandle, label: &str) {
     }
     // 非池内:销毁 webview(释放宿主窗口与页面进程),使 webview 数量不随开关标签增长
     match w.close() {
-        Ok(()) => eprintln!("[tabs] closed {label}: webview destroyed"),
+        Ok(()) => {
+            // 事件订阅随 webview 一并释放(1.12.0)
+            crate::capture::release_webview(label);
+            eprintln!("[tabs] closed {label}: webview destroyed");
+        }
         Err(e) => eprintln!("[tabs] closed {label}: close failed: {e}"),
     }
 }
@@ -1766,7 +1917,11 @@ pub fn normalize_url(raw: &str) -> String {
     if t.is_empty() {
         return String::new();
     }
-    if t.contains("://") || t.starts_with("about:") || t.starts_with("data:") || t.starts_with("file:") {
+    if t.contains("://")
+        || t.starts_with("about:")
+        || t.starts_with("data:")
+        || t.starts_with("file:")
+    {
         t.to_string()
     } else {
         format!("http://{t}")
@@ -1785,12 +1940,9 @@ pub fn eval_page(app: &AppHandle, js: &str) -> Result<String, String> {
 pub fn eval_page_timeout(app: &AppHandle, js: &str, timeout_ms: u64) -> Result<String, String> {
     let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
     let page = active_page_webview(app).ok_or("page webview not ready")?;
-    page.eval_with_callback(
-        js,
-        move |result| {
-            let _ = tx.send(Ok(result));
-        },
-    )
+    page.eval_with_callback(js, move |result| {
+        let _ = tx.send(Ok(result));
+    })
     .map_err(|e| format!("eval failed: {e}"))?;
     rx.recv_timeout(std::time::Duration::from_millis(timeout_ms))
         .map_err(|_| format!("eval timeout (budget {timeout_ms}ms)"))?
@@ -1799,7 +1951,9 @@ pub fn eval_page_timeout(app: &AppHandle, js: &str, timeout_ms: u64) -> Result<S
 /// 在覆盖层 Webview 执行 JS
 pub fn eval_overlay(app: &AppHandle, js: &str) -> Result<(), String> {
     let overlay = overlay_webview(app).ok_or("overlay webview not ready")?;
-    overlay.eval(js).map_err(|e| format!("overlay eval failed: {e}"))
+    overlay
+        .eval(js)
+        .map_err(|e| format!("overlay eval failed: {e}"))
 }
 
 #[cfg(test)]

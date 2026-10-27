@@ -1,6 +1,6 @@
 [package]
 name = "bt-shell"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2024"
 
 [build-dependencies]
@@ -9,6 +9,8 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 axum = "0.8"
 futures-util = "0.3.33"
+# 注入规则的 `re:` 匹配(非法正则按不匹配处理);版本已随 tauri 传递依赖锁定在 1.x
+regex = "1"
 reqwest = { version = "0.13.4", features = ["json"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

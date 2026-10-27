@@ -1,6 +1,6 @@
 # opencode-browser-tool
 
-opencode 插件：Tauri 多 Webview 浏览器外壳 + 零注入视觉元素选取面板。对外只注册 **2 个工具**：`bt_cli`（命令行式分发器，内含 **47 条**浏览器自动化命令）与 `bt_set_media_mode`（摄像头/麦克风真伪切换），见下文「工具」。
+opencode 插件：Tauri 多 Webview 浏览器外壳 + 零注入视觉元素选取面板。对外只注册 **2 个工具**：`bt_cli`（命令行式分发器，内含 **50 条**浏览器自动化命令）与 `bt_set_media_mode`（摄像头/麦克风真伪切换），见下文「工具」。
 
 > 架构演进：V1-V3 使用 Playwright 注入式面板（存在弹框类元素无法批注的问题）；V4 改为 Rust Shell + 原始调试协议；V5 迁移到 Tauri 2 多 Webview（跨平台）。
 
@@ -20,7 +20,7 @@ opencode 插件：Tauri 多 Webview 浏览器外壳 + 零注入视觉元素选�
 `%USERPROFILE%\.opencode\plugins-data\opencode-browser-tool\<triple>\bt-shell.exe`），并**就地覆盖**同一路径
 （不按插件版本建目录）；同目录另有 `bt-shell.version.json` 记录该可执行文件的来源
 （`tag` / `pluginVersion` / `asset` / `sha256` / `size` / `downloadedAt` / `sourceUrl`，`src/binary.ts:69-79`）。下载用 Release 的 `SHA256SUMS` 做
-sha256 校验（**幂等**：sha 与当前 release 期望值一致即跳过；**原子**替换；跨进程 `.lock`；Linux 下载后 `chmod 755`）。下载在插件初始化时即发起、后台进行、**不阻塞 opencode 启动**（`src/index.ts:342-343`）；未就绪时工具调用会给出
+sha256 校验（**幂等**：sha 与当前 release 期望值一致即跳过；**原子**替换；跨进程 `.lock`；Linux 下载后 `chmod 755`）。下载在插件初始化时即发起、后台进行、**不阻塞 opencode 启动**（`src/index.ts:760`）；未就绪时工具调用会给出
 明确提示（下载进度 / 失败原因），不会假装成功。
 
 平台支持与系统依赖：
@@ -54,14 +54,22 @@ sha256 校验（**幂等**：sha 与当前 release 期望值一致即跳过；**
 
 项目级配置放 `<项目根目录>/.opencode/browser-tool.jsonc`，会覆盖全局。
 
-生成的配置还支持（可选项，见 `src/config/index.ts:27-35,246-274`）：
+生成的配置还支持（可选项，见 `src/config/index.ts:54-72,247-275`）：
 
 - `browsersPath` — 浏览器缓存目录（等价 `BT_BROWSERS_PATH`）
 - `cacheDir` — 插件缓存根（默认 `~/.opencode/plugins-cache/opencode-browser-tool`，下设 `sessions/<profile>/<sid>`、`user-data/<profile>`、`exports`、`tmp`）
 - `nodePath` — Node.js 可执行路径（等价 `BT_NODE_PATH`）
-- `disabledTools` — **按已注册工具名**禁用工具。bt_cli 合并后注册的工具名只有 `bt_cli` 与 `bt_set_media_mode`（`src/index.ts:376-463`、过滤逻辑 `src/index.ts:493-500`），因此只有写这两个名字才生效；旧的 47 个分工具名（`close`、`custom_user_agent`…）或不带前缀的命令名**不再有效、会被静默忽略**（自动生成配置的注释示例同样偏旧，以本节为准）。禁用 `bt_cli` 等于没有命令入口，慎用。
+- `disabledTools` — **按已注册工具名**禁用工具。bt_cli 合并后注册的工具名只有 `bt_cli` 与 `bt_set_media_mode`（`src/index.ts:806-905`、过滤逻辑 `src/index.ts:935-942`），因此只有写这两个名字才生效；旧的按命令拆分的工具名（`close`、`custom_user_agent`…）或不带前缀的命令名**不再有效、会被静默忽略**（自动生成配置的注释示例同样偏旧，以本节为准）。禁用 `bt_cli` 等于没有命令入口，慎用。
+- `consoleBufferBytes` / `networkBufferBytes` — console / network 日志流的**字节预算**，默认各 **8 MiB**（8 388 608，跨 tab 全局共享）；超出按最旧逐出并计入 `dropped`（等价 `BT_CONSOLE_BUFFER_MB` / `BT_NETWORK_BUFFER_MB`，env 以 **MB** 计）
+- `networkBurstWindowMs` — network 聚合窗口，默认 **2000 ms**：仅当与上一条同 key 且间隔 ≤ 该值才累加 `count`（等价 `BT_NETWORK_BURST_MS`）
+- `consoleInject` — Linux console 注入猴补开关，默认 **Linux `true` / Windows `false`**；Windows 走 CDP 不需要注入（等价 `BT_CONSOLE_INJECT`）
+- `webview2Args` — **仅 Windows** 的 WebView2 额外启动参数（透传为 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`，与进程已有值合并、已包含则不重复），默认四个参数（`src/config/index.ts:40-48`）：
+  - `--disable-features=CalculateNativeWinOcclusion`（关窗口遮挡计算）
+  - `--disable-background-timer-throttling` / `--disable-renderer-backgrounding` / `--disable-backgrounding-occluded-windows`（窗口被遮挡/后台时不节流、不挂起 renderer，否则 `ExecuteScript` 可能永不回调 → 同步等 UI 的调用永久阻塞）
 
-环境变量（优先级最高，`src/config/index.ts:223-240`）：
+  动机是 **RDP 断连/切后台时 DWM 合成暂停**会让依赖 GPU 合成的 WebView2 卡住 UI 线程。**默认保留 GPU 合成**（不加 `--disable-gpu-compositing`）；确实需要 CPU 合成排障时自行追加。写**空串**表示**不加任何参数**（`src/config/index.ts:368-378`）。等价 env `BT_WEBVIEW2_ARGS`（优先级更高）
+
+环境变量（优先级最高，`src/config/index.ts:293-319`）：
 - `BT_LANG` — 同时设置 panelLang 和 toolLang
 - `BT_PANEL_LANG` / `BT_TOOL_LANG` — 分别只设置面板 UI 语言 / 工具描述语言
 - `BT_BROWSERS_PATH` — 浏览器缓存目录
@@ -74,12 +82,18 @@ sha256 校验（**幂等**：sha 与当前 release 期望值一致即跳过；**
 - `BT_SHELL_DOWNLOAD_BASE` — 覆盖下载根（默认 GitHub Release `https://github.com/xiaoqiong0v0/opencode-browser-tool/releases/download`），可指向镜像/自建
 - `BT_SHELL_VERSION` — 显式指定**二进制发布版本**（形如 `1.2.0`，即 `x.Y.0` 的 Release；**原样使用、不做归 0 推导**；不设时由插件版本自动推导）
 - `BT_SHELL_NOTIFY_URL` — 插件通知地址（**推送式投递**；一般由插件自动通过 `--notify-url` / `/api/notify-url` 设置，仅在手动启动 shell 时需自行指定）
+- `BT_CONSOLE_BUFFER_MB` / `BT_NETWORK_BUFFER_MB` — console / network 日志流字节预算（**MB**，默认各 8；对应配置项 `consoleBufferBytes` / `networkBufferBytes`）
+- `BT_NETWORK_BURST_MS` — network 聚合窗口（ms，默认 2000；对应配置项 `networkBurstWindowMs`）
+- `BT_CONSOLE_INJECT` — Linux console 注入开关（`1`/`0`；默认 Linux `1`、其它平台 `0`；对应配置项 `consoleInject`）
+- `BT_WEBVIEW2_ARGS` — **仅 Windows**：WebView2 额外启动参数（覆盖配置项 `webview2Args`；**空串=不加任何参数**；默认见上方 `webview2Args` 的四个参数；与进程已有 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` 合并）
 
 > **附着模式 vs 启动模式**：设置了 `BT_SHELL_URL`（优先）或 `BT_SHELL_PORT` 时进入附着模式——插件**不 spawn** 任何进程，直接连接该地址的外部 shell；两者都未设置时按启动模式 spawn 本地二进制（`BT_SHELL_PATH` 可覆盖查找路径）。附着模式下 `close` 命令只断开本地连接（**不关闭外部窗口、不结束外部进程**；进程不归插件管理）。
 >
 > **附着模式必须设置 `BT_SHELL_TOKEN`**：外部 shell 启动时的令牌必须与插件侧环境变量一致（见下方示例），否则插件启动即报 `client.attach_need_token`，不会去连一个注定 401 的端点。令牌未设置时 shell 会随机生成，因此手动启动的 shell 务必显式传 `--token`（或用同值环境变量）。
+>
+> **日志流配置只在启动模式生效**：`consoleBufferBytes` / `networkBufferBytes` / `networkBurstWindowMs` / `consoleInject` 由插件 spawn shell 时以 env 下发；**附着模式下插件只读不传**（外部进程不归插件管），要改缓冲/窗口/注入需在**启动外部 shell 的环境里**自行设置同名 `BT_*` 变量。`webview2Args` 同理：它是 spawn 时塞进子进程环境的 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`，附着模式下对已存在的外部进程无效（Windows 下需在启动外部 shell 的环境里设该变量）。
 
-**本地 API 语义**：`/api/*` 只监听 `127.0.0.1`，且只服务插件进程——所有请求必须带 `x-bt-token`（服务端常量时间比较）。**`Origin` 规则（1.11.0 起）**：只有**面板自身 origin 白名单**（`http://tauri.localhost` / `https://tauri.localhost` / `tauri://localhost`，精确匹配、不带端口/子域）放行；**其它任何 `Origin`（`null`、外部站点、子域变体、带端口）仍一律 403**，插件 Node `fetch` 不带 `Origin` 不受影响。**CORS 只对面板 origin 最小恢复**：预检 `OPTIONS` 回 204 + 精确回显该 origin 的 `Access-Control-Allow-Origin`（允许 `POST, OPTIONS` 与 `content-type, x-bt-token` 头），实际响应（含 401）也带精确 ACAO + `Vary: Origin`，**永不通配 `*`**；非面板来源的响应不带任何 CORS 头、`OPTIONS` 仍 405。令牌在 shell 实例创建期确定、运行期不可变；若提供了 `--user-data-dir`，令牌还会写到 `<user-data-dir>/bt-auth-token`（Unix `chmod 600`）供排查。日志只打印令牌前 4 位与长度。**同进程的两个合法调用方各有例外**：面板 Webview 通过 Tauri `invoke("api_token")` 读取本实例令牌（只存 JS 内存，不写 DOM/HTML/日志）后再带 `x-bt-token` 调用，其 origin 也在白名单内（**令牌仍是最终闸门**）；页面注入脚本无法持有令牌，故服务端仅对**精确路径 `/api/page-event`** 豁免 `Origin` 与令牌校验（不做前缀匹配），该端点只更新标签 url/title/icon、不执行任何操作。
+**本地 API 语义**：`/api/*` 只监听 `127.0.0.1`，且只服务插件进程——所有请求必须带 `x-bt-token`（服务端常量时间比较）。**`Origin` 规则（1.11.0 起）**：只有**面板自身 origin 白名单**（`http://tauri.localhost` / `https://tauri.localhost` / `tauri://localhost`，精确匹配、不带端口/子域）放行；**其它任何 `Origin`（`null`、外部站点、子域变体、带端口）仍一律 403**，插件 Node `fetch` 不带 `Origin` 不受影响。**CORS 只对面板 origin 最小恢复**：预检 `OPTIONS` 回 204 + 精确回显该 origin 的 `Access-Control-Allow-Origin`（允许 `POST, OPTIONS` 与 `content-type, x-bt-token` 头），实际响应（含 401）也带精确 ACAO + `Vary: Origin`，**永不通配 `*`**；非面板来源的响应不带任何 CORS 头、`OPTIONS` 仍 405。令牌在 shell 实例创建期确定、运行期不可变；若提供了 `--user-data-dir`，令牌还会写到 `<user-data-dir>/bt-auth-token`（Unix `chmod 600`）供排查。日志只打印令牌前 4 位与长度。**同进程的两个合法调用方各有例外**：面板 Webview 通过 Tauri `invoke("api_token")` 读取本实例令牌（只存 JS 内存，不写 DOM/HTML/日志）后再带 `x-bt-token` 调用，其 origin 也在白名单内（**令牌仍是最终闸门**）；页面注入脚本无法持有令牌，故服务端对**两个精确路径**豁免 `Origin` 与令牌校验（精确匹配、不做前缀匹配）：**`/api/page-event`** 与 **`/api/console-log`**（1.12.0 增）。两者的共同限制：**只写缓冲、不执行任何内容**（前者只更新标签 url/title/icon；后者只把页面 console 条目写进该标签的日志缓冲，body ≤ 256 KiB、超 200 条/秒丢弃并计数），**均无敏感回读**；`OPTIONS` 对它们同样不豁免（非面板 origin 仍 405）。残余风险：同机/页面侧可伪造这两个端点的写入（地址栏/标题错乱、日志缓冲被灌入伪造条目），但拿不到任何令牌或页面数据；若将来给它们加敏感字段或副作用，**必须重新评估豁免**。
 
 **WSL / Linux 附着示例**（shell 跑在 WSL，插件跑在 Windows 宿主）：
 
@@ -113,7 +127,7 @@ opencode（Bun）
 
 - 浏览器渲染引擎（WebView2 / WebKitGTK / WKWebView，随平台）直接绘制到插件窗口
 - 页面零注入残留脚本，弹框类元素可正常批注
-- 所有工具调用通过 `POST http://127.0.0.1:PORT/api/{command}` 通信，并统一带鉴权头 `x-bt-token`（**除面板 origin 白名单外拒绝任何带 `Origin` 的请求**；面板 origin 走最小 CORS 预检，见上。唯一鉴权豁免是页面事件桥 `/api/page-event`）
+- 所有工具调用通过 `POST http://127.0.0.1:PORT/api/{command}` 通信，并统一带鉴权头 `x-bt-token`（**除面板 origin 白名单外拒绝任何带 `Origin` 的请求**；面板 origin 走最小 CORS 预检，见上。鉴权豁免只有**两个精确路径**：页面事件桥 `/api/page-event` 与 console 回传 `/api/console-log`，均只写缓冲、无敏感回读）
 - 除 spawn 本地 shell 外，也可用 `BT_SHELL_URL` / `BT_SHELL_PORT` **附着到已运行的 shell**（不 spawn，适用于 shell 跑在 WSL/Linux、插件跑在 Windows；**必须同时设置 `BT_SHELL_TOKEN`**，外部 shell 用同一令牌启动）
 - 跨平台代码：Windows / Linux / macOS；**预编译二进制只发 Windows x64 与 Linux x64**，macOS 需自行构建（`cargo build --release`）且功能不完整：截图待实现（`rust/src/control/screenshot.rs:4`）、DevTools 无法真正关闭（`close_supported = cfg!(target_os = "linux")`，`rust/src/service.rs:1063`）、自定义 UA 未实现
 - 真多标签：每标签独立 page Webview，切换不重载；`target=_blank` / `window.open` 链接通过 WebView2 原生事件拦截并打开为新标签。**关闭标签会释放该标签的页面实例**（预创建池的 3 个 webview 保留复用，池外动态创建的实例直接销毁），反复开关标签不会累积页面进程
@@ -123,7 +137,7 @@ opencode（Bun）
 
 ## 工具
 
-插件**只注册 2 个工具**（`src/index.ts:376-463`）：
+插件**只注册 2 个工具**（`src/index.ts:806-905`）：
 
 | 工具 | 参数 | 说明 |
 |------|------|------|
@@ -137,10 +151,10 @@ bt_cli({ args: "<command> [--flag value ...]" })
 ```
 
 - **命令名不带 `bt_` 前缀**：写 `click`、`navigate`、`list_tabs`，**不是** `bt_click` / `bt_navigate` / `bt_list_tabs`（旧文档里的 `bt_*` 名称既不是工具名也不是命令名）
-- **分词**：按 shell 风格切分（`string-argv` 0.3.2，`src/index.ts:3` 引入、`:388-390` 使用），含空格的值用引号包裹，如 `fill --selector #q --value "hello world"`；**只按引号配对切分、不处理反斜杠转义**——值里要出现引号就改用**另一种引号**包外层（如 `get_visible_text --selector "[title='a b']"`），写成 `--value "a\"b"` 会把 `\` 原样带进值里
-- **flag 解析**：第一个 token 为命令名，其余交给 `node:util.parseArgs`（`src/index.ts:296-304`）；**未知 flag 直接报错并回显该命令用法**（输出可自愈，不必先调 help）
-- **敏感值 `@file:`**：值写成 `@file:<路径>` 时由插件读取文件内容作为实际值，**内容不进模型上下文**（`src/index.ts:443-472`）。只允许读插件临时目录（全局 tmp 或本会话 tmp）内的文件，其余路径一律拒绝；`lookup` 生成的密码临时文件即用于 `fill --value @file:...`，位于全局 tmp 的用完即删
-- **全局 flag `--private-session`**（任何命令都可带，`src/index.ts:296-304,433-442`）：用**调用者自己的 sid** 建私有浏览器实例，不与根会话共用；并且对**同一子会话粘住**——首次用过之后，后续不带该 flag 也继续私有（根会话带它等价于自身）。典型场景：子代理需要**独立的浏览器环境做隔离测试**（自己的 cookie/登录态与窗口，不污染主会话）。根会话自己带它等价于自身（合法但无实际差别）。注意它紧跟某个 string flag 时会被当成该 flag 的值（`parseArgs` 行为），要写就写在命令名之后或命令末尾
+- **分词**：按 shell 风格切分（`string-argv` 0.3.2，`src/index.ts:3` 引入、`:819` 使用），含空格的值用引号包裹，如 `fill --selector #q --value "hello world"`；**只按引号配对切分、不处理反斜杠转义**——值里要出现引号就改用**另一种引号**包外层（如 `get_visible_text --selector "[title='a b']"`），写成 `--value "a\"b"` 会把 `\` 原样带进值里
+- **flag 解析**：第一个 token 为命令名，其余交给 `node:util.parseArgs`（`src/index.ts:683-702`）；**未知 flag 直接报错并回显该命令用法**（输出可自愈，不必先调 help）
+- **敏感值 `@file:`**：值写成 `@file:<路径>` 时由插件读取文件内容作为实际值，**内容不进模型上下文**。flag 值上的 `@file:` 只允许读插件临时目录（全局 tmp 或本会话 tmp）内的文件，其余路径一律拒绝；`lookup` 生成的密码临时文件即用于 `fill --value @file:...`，位于全局 tmp 的用完即删。**`evaluate` 的位置参数项**额外允许读**工作区目录**内的脚本文件（见下方「evaluate：多脚本顺序执行」）；**`type --text @file:`** 与 `evaluate` 同口径（工作区目录 + 插件 tmp，且**不删除**源文件，便于反复输入同一段文本）
+- **全局 flag `--private-session`**（任何命令都可带，`src/index.ts:683-702,839-846`）：用**调用者自己的 sid** 建私有浏览器实例，不与根会话共用；并且对**同一子会话粘住**——首次用过之后，后续不带该 flag 也继续私有（根会话带它等价于自身）。典型场景：子代理需要**独立的浏览器环境做隔离测试**（自己的 cookie/登录态与窗口，不污染主会话）。根会话自己带它等价于自身（合法但无实际差别）。注意它紧跟某个 string flag 时会被当成该 flag 的值（`parseArgs` 行为），要写就写在命令名之后或命令末尾
 - **会话归属由插件自动透传**（见「多会话」）：实例按会话隔离，但 **task 子代理会话默认归并到根会话**——沿 `Session.parentID` 回溯到最顶层，用**根 sid** 作路由键，于是主会话与所有子会话共用同一 bt-shell 实例、同一数据目录 `sessions/<profile>/<根 sid>/`，窗口标题取根会话标题。`args` 里**不需要**也**不支持**传会话 id
 
 示例：
@@ -153,15 +167,64 @@ bt_cli({ args: "fill --selector #q --value \"hello world\"" })
 bt_cli({ args: "screenshot --selector .chart" })
 ```
 
-### `--timeout`（下表标 ⏱ 的 17 条命令支持）
+### `--timeout`（下表标 ⏱ 的 18 条命令支持）
 
 - 单位**毫秒**，`--timeout 800` 可让卡住的操作约 0.8s 返回（快失败）；**未列出的命令不接受该 flag**
-- 钳制区间 `[100, 60000]`：插件侧（`src/index.ts:80-81,96-98`）与 Rust 服务端（`rust/src/service.rs:96-97,104-116`）**同口径二次钳制**（直连 HTTP 也安全）；非正整数直接报错拒绝；被钳制时输出如实标注 `(clamped to …ms)`，服务端响应体带 `timeoutMs` / `timeoutClamped`
+- 钳制区间 `[100, 60000]`：插件侧（`src/index.ts:107-108,116-126`）与 Rust 服务端（`rust/src/service.rs:96-97,104-116`）**同口径二次钳制**（直连 HTTP 也安全）；非正整数直接报错拒绝；被钳制时输出如实标注 `(clamped to …ms)`，服务端响应体带 `timeoutMs` / `timeoutClamped`
 - **未传时走各命令自己的默认，并非统一 15s**：eval / CDP / 截图 / `wait_for_selector` 默认 **15s**（`rust/src/ui/mod.rs:35`、`rust/src/control/cdp.rs:27`、`rust/src/control/screenshot.rs:23`、`rust/src/service.rs:609`）；点击类（click / hover / drag / press_key 等）的稳定等待默认 **700ms**（`rust/src/control/mouse.rs:19,177-178`）；`fill` / `select` 的读回校验默认 **2500ms**（`rust/src/control/input.rs:343`）
 
-### 命令参考（47 条）
+### `evaluate`：多脚本顺序执行（插件侧，零 Rust 改动）
 
-> 唯一真源：`src/index.ts:101-268` 的 `COMMANDS`（本表与之逐条对应，条数、flag 名、可选性均以代码为准）。说明取自 `src/i18n/en.ts` 的 `cli.cmd.*`（`src/i18n/en.ts:24-70`，中文对照见 `src/i18n/zh.ts`）。参数列中**不带 `[]` 者为必填**；⏱ = 支持 `--timeout ms`。完整命令/参数/help 以 `bt_cli({ args: "help" })` 的实际输出为准。
+位置参数按**给定顺序**逐项执行，`@file:<路径>` 读文件内容作为脚本，其余参数当作内联 JS：
+
+```text
+bt_cli({ args: "evaluate @file:scripts/hook.js @file:scripts/collect.js \"console.log(1)\"" })
+bt_cli({ args: "evaluate \"1+1\"" })                                  # 单个内联脚本
+bt_cli({ args: "evaluate --script \"1+1\"" })                          # 单项旧写法（输出仍为裸结果 "2"）
+bt_cli({ args: "evaluate @file:a.js @file:bad.js --continue-on-error" })
+```
+
+- **串行、按顺序**：前一项 `await` 结束后才发下一项，绝不并行
+- **默认遇错即停**（`stop`）；`--continue-on-error` 继续执行后续项（`continued`）
+- **`--script` 只能单独用**：与位置参数同时给会报错（避免执行顺序歧义）
+- **文件读取安全边界**：只允许读**工作区目录**（插件 `setAppDirectory` 记录的 opencode `directory`）与**插件 tmp**（全局 tmp / 本会话 tmp）内的文件；其余路径**直接拒绝且不读取**。相对路径相对**工作区目录**解析（不是插件 cwd），并做 `isInsideDir` containment 校验。单文件 ≤ **256 KiB**、合计 ≤ **1 MiB**，超限报错
+- **文件项在执行前统一读入**：任一项路径越界 / 读取失败 / 超限 → 整次调用**不执行任何脚本**（不留半截副作用）
+
+输出（每条结果截断到 500 字符；失败信息经 `sanitizeForModel`，不含绝对路径）：
+
+```text
+evaluate: 3 item(s), 2 ok, 1 failed (stop)
+[1] file scripts/hook.js  ok  3ms  → <result>
+[2] text                  ok  0ms  → <result>
+[3] file scripts/bad.js   FAILED  1ms  → SyntaxError: ...
+```
+
+全部成功时首行是 `evaluate: N item(s), N ok`；`--continue-on-error` 时标注 `(continued)`。单项 `--script` 保持旧输出（结果 JSON + 可能的 timeout 提示）。
+
+### 持久注入规则（`inject`）
+
+把 JS 存成**规则**：文档加载完成时若当前 URL 命中，就自动执行（不必每次 `evaluate`）。
+
+```text
+bt_cli({ args: "inject add --match \"*ygpm.zhihjy.cn*\" --file scripts/hook.js --order 10" })
+bt_cli({ args: "inject add --match \"re:^https://example\\.com/\" --text \"console.log(1)\" --disabled" })
+bt_cli({ args: "inject list" })
+bt_cli({ args: "inject test --url https://ygpm.zhihjy.cn/a" })   # 只算命中，不执行
+bt_cli({ args: "inject disable --id r1" })
+```
+
+- **存储**：`sessions/<profile>/<sid>/inject/rules.json`（随会话数据目录，**会话删除即清理**）；写入用临时文件 + rename **原子替换**
+- **匹配语法**：`--match` 传 glob（`*` 通配，如 `*host*`）或 `re:<正则>`（如 `re:^https://x\.com/`）；多条命中按 `--order` **升序**执行（未给 `--order` 时由服务端取默认）
+- **执行时机**：该标签文档加载完成（Windows `Page.loadEventFired`、Linux `WebKitWebView::load-changed` FINISHED）→ 取该标签当前 URL → 命中 enabled 规则 → 逐条**串行**执行 items（单条 15s 超时）；失败**不阻塞页面加载**、不向页面抛异常，结果只写回规则的 `last`
+- **失败自动禁用**：`last` 记录 `ok` / `failed` / `error`；同一规则连续失败 **3** 次（`failStreak >= 3`）自动置 `enabled=false`，`last.error` 保留原因（`inject list` 显示错误首行）
+- **上限**：规则 ≤ **20** 条；单条 items 合计 ≤ **256 KiB**；全部 ≤ **1 MiB**。超限在插件侧直接拒绝，不把坏规则写进存储
+- **`--file` 读取**：只允许**工作区目录**（插件记录的 opencode `directory`）与**插件 tmp**（全局 tmp / 本会话 tmp），与 `evaluate` 同一套 containment；单条 ≤ **256 KiB**。文件内容在插件侧转成 `{ kind:"text", code, name:"<basename>" }` 发送，**Rust 不接触路径**；`--text` 的 name 固定为 `text`
+- **`inject list` 只给结构**：`id / order / enabled / match / items / last`（ok、failed + 最近错误首行），明细只显示每个 item 的 `name` + 字节数，**绝不回显脚本内容**
+- **与 `evaluate` 的区别**：`evaluate` 是**一次性**在当前页面执行并返回结果；`inject` 是**持久规则**，命中 URL 后每次加载都执行，结果只写回规则（不回模型），需用 `inject list` 查看
+
+### 命令参考（50 条，与 `COMMANDS` 一致）
+
+> 唯一真源：`src/index.ts:435-658` 的 `COMMANDS`（本表与之逐条对应，条数、flag 名、可选性均以代码为准）。说明取自 `src/i18n/en.ts` 的 `cli.cmd.*`（`src/i18n/en.ts:49-98`，中文对照见 `src/i18n/zh.ts`）。参数列中**不带 `[]` 者为必填**；⏱ = 支持 `--timeout ms`。完整命令/参数/help 以 `bt_cli({ args: "help" })` 的实际输出为准。
 
 | 命令 | 参数（usage 原文） | 说明 |
 |------|------|------|
@@ -173,12 +236,15 @@ bt_cli({ args: "screenshot --selector .chart" })
 | `hover` ⏱ | `--selector` 必填 | 悬停到元素 |
 | `drag` ⏱ | `--sourceSelector --targetSelector` 必填 | 拖拽元素到目标 |
 | `press_key` ⏱ | `--key` 必填，`[--selector]` | 按下键盘按键；`--selector` 指定先聚焦的元素 |
+| `type` ⏱ | `--text <文本\|@file:<路径>>` 必填，`[--selector] [--enter]` | **向当前焦点插入文本（不清空已有内容）**；`--selector` 先聚焦该元素，`--enter` 插入后回车；`--text` 支持 `@file:`（与 `evaluate` 同一套 containment）。xterm/终端/contenteditable 用它，表单替换用 `fill` |
 | `upload_file` ⏱ | `--selector --filePath` 必填 | 上传文件到输入框 |
 | `screenshot` ⏱ | `[--selector]` | 截取页面/元素截图（返回图片附件；带 `--selector` 先滚动到元素再截） |
-| `evaluate` ⏱ | `--script` 必填 | 在页面执行 JS，返回结果 |
+| `evaluate` ⏱ | `[<js 文本>\|@file:<路径>]...`（或单个 `--script`） | 在页面执行 JS，返回结果。位置参数按**顺序**逐项执行（`@file:` 读脚本文件，其余为内联 JS）；默认遇错即停，`--continue-on-error` 继续；`--script` 只能单独用（与位置参数同时给会报错） |
+| `inject` | `[add --match <glob\|re:...> [--file <path>]... [--text <code>]... [--order N] [--disabled] \| list \| remove\|enable\|disable --id <id> \| clear \| test --url <url>]` | 持久注入规则：URL 命中时在文档加载完成后执行 items（新增/列表/删除/清空/启用/禁用/试算命中，详见「持久注入规则」一节） |
 | `get_visible_text` | `[--selector]` | 获取页面可见文本 |
 | `get_visible_html` | `[--selector --removeScripts --removeComments --maxLength]` | 获取页面 HTML 结构（`--removeScripts` / `--removeComments` 为布尔开关；`--maxLength` 超出时输出标注截断） |
-| `console_logs` | `[--type --search --limit --clear]` | 获取浏览器控制台日志（`--clear` 读取后清空） |
+| `console_logs` | `[--type --group burst\|none --phase --search --limit --tab --include-internal --clear --no-dedupe]` | 获取缓冲的控制台日志：`--type` = `all`/`log`/`info`/`warn`/`error`/`debug`/`exceptions`；`--group burst`（默认）合并同内容连续重复，`none` 逐条；`--phase` 过滤 `load`/`interactive`/`action:<cmd>`；`--tab N` 按标签过滤，N 是 `list_tabs` 打印的**0 基索引**（`--tab 0` = 第一个标签；不是内部 id）；`--include-internal` 显示浏览器内部日志（CDP `Log.entryAdded` 的 `source=violation\|deprecation`，如 `[DOM] Password field …`），默认不显示；`--limit` 默认 30；`--clear` 读取后清空；`--no-dedupe` 等价 `--group=none`。条目带 `(xN)`/`phase=`/`source=`（`cdp`/`injected`/`native`），异常附 stack 首行 |
+| `network_logs` | `[--type --status 2xx\|3xx\|4xx\|5xx\|N --failed --search --group burst\|key\|none --phase --limit --tab --include-headers --reveal-secrets --clear --no-dedupe]` | 获取缓冲的网络请求：`--type` = `all`/`xhr`/`fetch`/`doc`/`script`/`image`/`font`/`other`；`--status` 支持区间写法或具体码；`--failed` 只看失败（`status=0` + `failure`）；`--group burst`（默认，同 key 且间隔 ≤ `networkBurstWindowMs` 才合并）/`key`（忽略 phase 与间隔）/`none`；`--tab N` 同 `console_logs`（`list_tabs` 的 0 基索引）；`--include-headers` 附加 headers（默认 `Authorization`/`Cookie`/`Set-Cookie` → `<redacted>`）；`--reveal-secrets` 显示原值（**必须配合 `--include-headers`**，单独使用会明确报错；**风险见下**）；`--clear` 读取后清空；`--no-dedupe` 等价 `--group=none` |
 | `go_back` | 无 | 浏览器后退，返回当前 URL |
 | `go_forward` | 无 | 浏览器前进，返回当前 URL |
 | `resize` | `--width --height` 必填 | 调整页面内容区尺寸（视口，非 OS 窗口；窗口高 = 内容高 + 工具栏 72px；下限 360×360，低于下限被钳制并标 `clamped`） |
@@ -202,16 +268,44 @@ bt_cli({ args: "screenshot --selector .chart" })
 | `scroll_to_element` ⏱ | `--selector` 必填 | 滚动到元素可见；未到达/未稳定不吞错，输出带 `reached`/`stable`/`waitedMs` |
 | `get_dropdown_options` ⏱ | `--selector` 必填 | 列出下拉框选项（当前选中项标 `*`） |
 | `custom_user_agent` | `--userAgent` 必填 | 设置自定义 User-Agent（Windows/Linux 支持；macOS 未实现） |
-| `expect_response` | `--url` 必填 | 记录期望匹配的响应模式，清空响应历史后重新捕获 |
+| `expect_response` | `--url` 必填 | 记录期望匹配的响应模式与起点（**不清空** `network_logs` 历史；`assert_response` 只匹配起点之后的请求） |
 | `assert_response` | `--id` 必填 | 断言是否存在匹配的响应（返回 `url` + `status` 码） |
-| `get_accessibility_tree` ⏱ | `[--selector --maxDepth]` | 获取可访问性树（role/name/value 嵌套）。`--maxDepth` 缺省 8；服务端硬上限 **depth 64 / 节点 5000**，超出静默截断并记日志（`rust/src/control/accessibility.rs:355,359,551`） |
-| `list_records` | 无 | 列出面板批注/截图记录（索引/选择器/rect/说明；截图带 `+img`，已发送带 `[sent]`）。记录上限 **200** 条，超出丢最旧（`rust/src/ui/annotate.rs:395,403-406`） |
+| `get_accessibility_tree` ⏱ | `[--selector --maxDepth]` | 获取可访问性树（role/name/value 嵌套）。`--maxDepth` 缺省 8；服务端硬上限 **depth 64 / 节点 5000**，超出静默截断并记日志（`rust/src/control/accessibility.rs:362,366,572`） |
+| `list_records` | 无 | 列出面板批注/截图记录（索引/选择器/rect/说明；截图带 `+img`，已发送带 `[sent]`）。记录上限 **200** 条，超出丢最旧（`rust/src/ui/annotate.rs:461,467-475`） |
 | `read_record_content` | `--id` 必填 | 按 id 读取单条记录详情（截图落盘为临时 PNG 并给出大小与路径） |
 | `fake_audio` | `--kind` 必填，`[--data --freq --durMs --notes --digits --loop]` | 向 fake 麦克风注入音频（`kind`：tone/seq/dtmf/noise/audio/ambient/stop） |
 | `fake_video` | `--kind` 必填，`[--data --url --loop]` | 向 fake 摄像头注入画面（`kind`：image/video/auto/stop） |
 | `profile` | `[--set <name> \| --delete <name>]` | user-data 配置管理：空参列出；`--set` 切换默认配置（影响**后续新会话**的数据根，不重启运行中的浏览器）；`--delete` 删除（default/激活项除外） |
 | `exports` | 无 | 显示导出目录与 Edge/Chrome 密码/书签导出指引 |
 | `lookup` | `--csv <path> --url <site>` 必填 | 从密码 CSV 按站点匹配并返回 `@file:` 临时文件路径（密码不进上下文，用完即删） |
+
+### `fill` vs `type` vs `press_key`（三种输入方式别混用）
+
+| 命令 | 语义 | 典型场景 |
+|---|---|---|
+| `fill --selector --value` | **替换**：先聚焦 → 全选 → 插入 → 读回校验 | 普通表单输入框（`input`/`textarea`）：要把原值整段换成新值 |
+| `type --text [--selector] [--enter]` | **插入**：不选中、不清空，直接插到光标处（可选先聚焦、可选回车） | xterm/终端、`contenteditable` 富文本、需要逐段追加或在已有内容后继续输入 |
+| `press_key --key [--selector]` | **单个按键**（含 Enter/Tab/方向键/Delete/F1-F12） | 触发快捷键、提交、删一个字符、方向键选择下拉项 |
+
+- **为什么要有 `type`**：`fill` 是替换语义 + 读回校验，在 xterm 里会把终端已有内容清掉、且读不到 `input.value`；`press_key` 一次只能一个键，多字符文本要自己拼接。`type` 走同一条可信注入通道（Windows `Input.insertText`、Linux GDK 逐字符），一次插入整段文本，**不需要用 `evaluate` 伪造 `InputEvent`/`KeyboardEvent`**（伪造事件 `isTrusted=false`，不少终端/富文本组件不认）。
+- **组合用法**：先 `type --text "ls" --enter`（终端里执行命令）；富文本追加后如未触发组件自身的保存逻辑，再配合 `press_key --key Tab` 或在表单场景改用 `fill`。
+
+### 日志流能力矩阵（1.12.0）
+
+| 能力 | Windows（WebView2 + CDP） | Linux（WebKitGTK） |
+|---|---|---|
+| console 采集 | `Runtime.enable` + `Log.enable`（`consoleAPICalled` / `entryAdded` / `exceptionThrown`） | 页面注入（`console.*` + `onerror` + `unhandledrejection` + 1s 重挂检测 + 同源 iframe 汇总，`sendBeacon` 批量回传）；开关 `consoleInject` |
+| console `source` | `cdp` / `native`（浏览器自身日志） | `injected` |
+| network 采集 | `Network.enable`（`requestWillBeSent` / `responseReceived` / `loadingFailed` / `loadingFinished`） | WebKitGTK `resource-load-started` + `notify::response`（补 method/mime/耗时/failed） |
+| `initiator` | `<type> <scriptUrl>:<line>`，无则 `other` | `subresource` / `document`（**无脚本行号**） |
+| `phase` | 主帧 `Page.frameNavigated` / `Page.loadEventFired` + 动作窗口（子帧导航不置 `load`） | `load-changed` + 动作窗口 |
+| 失败请求 | `status=0` + `failure`（如 `net::ERR_ABORTED`） | 同样 `status=0` + `failure`（字段来自 WebKitGTK 事件） |
+
+- **动作归因（两平台）**：工具命令 `click` / `fill` / `select` / `press_key` / `navigate` 等执行期间开窗、结束后保留 **3s 宽限**（硬上限 60s；并发命令取最新，窗口不叠加），窗口内条目记 `phase=action:<cmd>`。
+- **跨导航保留**：日志缓冲在 shell 侧、按标签归属，导航不清空；关闭标签释放该标签记录，关闭会话释放全部。
+- **默认预算 8 MiB**：console / network 各自独立预算，且**跨 tab 全局共享**（逐出全局最旧，不是每 tab 各 8 MiB）；超限丢最旧并累加 `dropped`（输出末尾标注）。
+
+> ⚠ **`--reveal-secrets` 风险**：默认对 `Authorization` / `Cookie` / `Set-Cookie` 做 `<redacted>` 脱敏；`--reveal-secrets` 会把这些头**原样返回给模型并进入对话上下文**（可能含会话令牌/密码）。仅在排障必要时临时使用，用完及时收尾；不要把输出粘到外部系统。
 
 ### 元素截图行为（v1.7.0 起统一）
 
@@ -263,7 +357,7 @@ bt_cli({ args: "screenshot --selector .chart" })
 
 - **批注模式** — 悬停高亮元素（覆盖层自绘），点击元素弹出输入框填写说明；引擎层拦截，弹框/下拉类元素不失焦
 - **截图模式** — 点击立即截全屏；也可进入截图模式后拖动框选区域（选区可拖拽手柄调整大小），保存时可按需裁剪（遮罩式选区，默认整图，双击还原）
-- **记录列表** — 面板「AI 功能」区：批注/截图记录卡片（截图带缩略图），显示所属标签 URL 与说明。**记录上限 200 条**，超出丢最旧（`rust/src/ui/annotate.rs:395,403-406`）
+- **记录列表** — 面板「AI 功能」区：批注/截图记录卡片（截图带缩略图），显示所属标签 URL 与说明。**记录上限 200 条**，超出丢最旧（`rust/src/ui/annotate.rs:461,467-475`）
 - **发送** — 面板底部「发送」按钮：所有记录（批注文字 + 截图图片）推送到 opencode 对话；发送后**面板列表清空**（与旧 Playwright 工具一致，仅列表为空），但**记录本身保留**并标记 `[sent]`（`list_records` 仍可读取，截图也可通过 `read_record_content` 取到）。投递为**推送式**：shell 发送后主动通知插件（`POST /notify/<sid>`，按会话归属），插件收到即拉取并推送到对话（无轮询、无 2s 延迟）。**待发送队列上限 500 条**，超出丢最旧（`rust/src/ui/mod.rs:1369,1464-1466`）
 - 批注和截图**必须填写说明**才能保存/发送，否则弹出提示
 

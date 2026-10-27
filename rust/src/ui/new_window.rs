@@ -50,7 +50,7 @@ pub fn setup(app: &AppHandle, webview: &tauri::webview::Webview) {
                     let handler = NewWindowRequestedEventHandler::create(Box::new(
                         move |_sender: Option<ICoreWebView2>,
                               args: Option<ICoreWebView2NewWindowRequestedEventArgs>|
-                         -> windows::core::Result<()> {
+                              -> windows::core::Result<()> {
                             if let Some(args) = args {
                                 // 读取目标地址并标记已处理(阻止默认忽略行为)
                                 let mut uri_out = windows::core::PWSTR::null();

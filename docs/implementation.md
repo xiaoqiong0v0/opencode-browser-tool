@@ -2,7 +2,7 @@
 
 ## 当前架构（V5：跨平台 Tauri 2 多 Webview）
 
-**当前版本**：插件 **1.11.1**（`package.json`）/ bt-shell **0.11.0**（`rust/Cargo.toml`，未变）。1.10.1 只动插件 TS：`httpCall` 统一原语、模型可见文本脱敏、状态文案去重；1.10.2 为文档一致性 + `read_record_content` 传 `includeImages:true` + Linux 复验脚本补令牌（零 Rust 改动，复用 1.10.0 二进制）。**1.11.0 动 Rust（→ 新二进制 `0.11.0`）**：修 1.10.0 引入的回归——面板 webview 的 `fetch` 带 `Origin: http://tauri.localhost`，被「带 `Origin` 一律 403」挡死，面板 `/api/device/list` 取不到、设备预设下拉只剩「默认」；现改为面板 origin 白名单 + 最小 CORS（预检 204/精确 ACAO），其它 Origin 仍 403。**1.11.1 仅插件 TS 改动**（零 Rust 改动，复用 0.11.0 二进制）：会话树归并——task 子代理会话默认归并到根会话、新增全局 flag `--private-session`、i18n 新增 `cli.usage.flags` 与 `cli.err.flag_not_number`（键数 168 → 170，zh/en parity）；修复数值 flag 未转 number 导致 `resize`/`switch_tab --index`/`fake_audio --freq/--durMs` 静默失效。本文所有 `src/client.ts` 行号按 **1.10.2** 代码核对（1.11.0/1.11.1 未改 `client.ts`），`src/index.ts` 行号按 **1.11.1** 代码核对，`rust/src/http.rs` 行号按 **0.11.0**。
+**当前版本**：插件 **1.12.0**（`package.json`）/ bt-shell **0.12.0**（`rust/Cargo.toml`）。**1.12.0 动 Rust（→ 新二进制 `0.12.0`）**：console/network 双流缓冲（默认 8MiB 可配、按 tab 分组、跨导航保留、重复 `+n` 聚合）、Windows console/network 走 CDP（零注入）、Linux 注入加固+批量回传、`phase` 分段与动作归因、新增 `network_logs` 命令、`evaluate` 兼容多语句。1.10.1 只动插件 TS：`httpCall` 统一原语、模型可见文本脱敏、状态文案去重；1.10.2 为文档一致性 + `read_record_content` 传 `includeImages:true` + Linux 复验脚本补令牌（零 Rust 改动，复用 1.10.0 二进制）。**1.11.0 动 Rust（→ 新二进制 `0.11.0`）**：修 1.10.0 引入的回归——面板 webview 的 `fetch` 带 `Origin: http://tauri.localhost`，被「带 `Origin` 一律 403」挡死，面板 `/api/device/list` 取不到、设备预设下拉只剩「默认」；现改为面板 origin 白名单 + 最小 CORS（预检 204/精确 ACAO），其它 Origin 仍 403。**1.11.1 仅插件 TS 改动**（零 Rust 改动，复用 0.11.0 二进制）：会话树归并——task 子代理会话默认归并到根会话、新增全局 flag `--private-session`、i18n 新增 `cli.usage.flags` 与 `cli.err.flag_not_number`（1.11.1 时键数 168 → 170，zh/en parity；**1.12.0 当前 208/208**）；修复数值 flag 未转 number 导致 `resize`/`switch_tab --index`/`fake_audio --freq/--durMs` 静默失效。本文所有 `src/client.ts` 行号按 **1.10.2** 代码核对（1.11.0/1.11.1 未改 `client.ts`），`src/index.ts` 行号按 **1.12.0** 代码核对，`rust/src/http.rs` 行号按 **0.11.0**。
 
 单窗口 + 多 Webview（toolbar / page-1..N 真多标签 / overlay / panel / newtab），前端 TS 工程化，详见 [v5-tauri-architecture.md](./v5-tauri-architecture.md)。
 
@@ -169,6 +169,7 @@
   | 请求形态 | 结果 | 位置 |
   |---|---|---|
   | `POST /api/page-event`（精确路径，含带**任意** `Origin`、无令牌） | **200**（豁免 `Origin` 与令牌两项校验后照常分发） | `http.rs:174-176` |
+  | `POST /api/console-log`（精确路径，含带**任意** `Origin`、无令牌；body ≤ 256 KiB） | **200**（同 page-event 豁免两项校验；只把条目写进该 tab 的 console 缓冲） | `http.rs`（`CONSOLE_LOG_PATH`） |
   | 非豁免路径 + **非面板** `Origin`（无论是否带令牌、是否 `OPTIONS`） | **403** | `http.rs:176` → `:101` |
   | 面板 origin + `OPTIONS` | **204** 预检（精确 ACAO + 允许方法/头） | `http.rs:179-185` → `:196` |
   | 非面板 / 无 `Origin` + `OPTIONS` | **405** | `http.rs:179-185` → `:259` |
@@ -178,9 +179,12 @@
 
    注一：`/api/page-event/extra` **不是**豁免路径（精确匹配，非前缀）——带非面板 `Origin` 走 403，无 `Origin` 无令牌才落 401。
    注二：401 与 403 **共用同一个响应体** `auth_error`（`http.rs:248`，`{success:false,error:"unauthorized"}`，不回显期望令牌）；区分只体现在状态码上。TS 侧把 401/403 一并归入 `HttpOutcome.auth`（`client.ts:681-682`）。
-- **唯一豁免：精确路径 `/api/page-event`**，且该豁免**最先判定、先于 `Origin`**。页面注入脚本运行在远程页面源下、拿不到令牌，浏览器又必带 `Origin`，故该路径跳过 `Origin` 与令牌两项校验；但 `OPTIONS` 不豁免（非面板 origin 仍 405）。残余风险：该端点只把 url/title/icon 写进 `TabState` 提示、不执行操作、无敏感回读，被同机页面伪造最多导致地址栏/标题错乱；若未来给它加敏感字段或副作用，必须重新评估豁免。
+- **两个令牌 / `Origin` 豁免端点**（都是**精确路径**、不做前缀匹配，且豁免**最先判定、先于 `Origin`**）：页面注入脚本运行在远程页面源下、拿不到令牌，浏览器又必带 `Origin`，故这两条路径跳过 `Origin` 与令牌两项校验；但 `OPTIONS` 对它们**不豁免**（非面板 origin 仍 405）。
+  - **`/api/page-event`**（SPA 路由 / 标题 / 图标上报）：只把 url/title/icon 写进 `TabState`，**不执行操作、无敏感回读**。残余风险：同机页面伪造最多导致地址栏/标题/图标错乱。
+  - **`/api/console-log`**（1.12.0，Linux console 注入回传，见「1.12.0 日志流」）：只把页面 console 条目写进**该 tab 的 console 缓冲**——body ≤ **256 KiB**，按 `IP + tab` **> 200 条/秒直接丢弃并累加 `dropped`**（不返回错误、不重试）。残余风险：可被灌入伪造条目（污染模型看到的 console 输出，也可能把真实条目挤出预算），但**拿不到令牌、读不到任何页面数据、不触发脚本执行**。
+  - 两者的共同限制与复查条件：**只写缓冲、无回读、无副作用**；若将来给任一端点加敏感字段或副作用，**必须重新评估豁免**。
 - **面板 origin 放行的边界**：外部网页无法伪造 `Origin`（浏览器强制写入），`null`（沙箱 iframe / `file://`）、带端口、子域变体都不在白名单，故放行不扩大对"其它站点"的攻击面；**令牌仍是最终闸门**（面板 origin 同样必须有正确 `x-bt-token`），Origin 只做纵深防御。残余风险：同机进程可自带任意 `Origin` 构造请求（绕过 Origin 语义），但同机进程本就能读到实例令牌，故非新增风险。
-- 校验顺序：`page-event` 精确判定 → `Origin`（豁免路径跳过）→ `OPTIONS` → 令牌（豁免路径跳过）→ 读 body → `App::handle`（`http.rs:70` 头注释同步）。
+- 校验顺序：豁免路径（`page-event` / `console-log`）精确判定 → `Origin`（豁免路径跳过）→ `OPTIONS` → 令牌（豁免路径跳过）→ 读 body → `App::handle`（`http.rs` 头注释同步）。
 
 ### TS 侧（`src/client.ts`）
 
@@ -227,12 +231,12 @@
 
 ### `sanitizeForModel`（模型可见文本脱敏）
 
-`src/util/sanitize.ts:60`，默认上限 `DEFAULT_MAX_LEN=300`（`:21`）。规则：先把 URL 用占位符保护（`URL_RE` `:27`），再掩码 Windows 盘符路径、UNC、POSIX 绝对路径；**`/api/*`、`/notify/*` 接口路径与 URL 原样保留**（`:44`、`:78`、还原 `:81-82`），末尾按长度截断（`:85`）。幂等。调用点：`postJson` 的服务端错误文本（`client.ts:821`）、工具层参数错误/读文件失败/命令失败三处（`index.ts:430,469,480`）、二进制下载原因文本（`binary.ts:193,250`）。
+`src/util/sanitize.ts:60`，默认上限 `DEFAULT_MAX_LEN=300`（`:21`）。规则：先把 URL 用占位符保护（`URL_RE` `:27`），再掩码 Windows 盘符路径、UNC、POSIX 绝对路径；**`/api/*`、`/notify/*` 接口路径与 URL 原样保留**（`:44`、`:78`、还原 `:81-82`），末尾按长度截断（`:85`）。幂等。调用点：`postJson` 的服务端错误文本（`client.ts:821`）、工具层参数错误/读文件失败/命令失败三处（`index.ts:834,872,883`）、二进制下载原因文本（`binary.ts:193,250`）。
 
 ### 参数默认值口径
 
-- `--timeout`：合法区间 **[100, 60000] ms**（插件 `src/index.ts:90-91` 与 Rust `service.rs:96-97` 同口径）；非正整数直接抛 `cli.err.timeout_invalid`，超界**钳制并回显**（插件 `timeoutNote` `index.ts:99-108`、Rust 二次钳制 `service.rs:113`）。未传时用服务端默认 **15s**（`ui/mod.rs:35 EVAL_TIMEOUT_MS`、`control/mod.rs:43 DEFAULT_NAV_TIMEOUT_MS`）。
-- 可访问性树：输出层默认展示深度 `maxDepth ?? 8`（`src/index.ts:204`，客户端裁剪参数）；**服务端遍历上限是另一回事**——Rust 侧 `AX_MAX_DEPTH=64`、`AX_MAX_NODES=5000`（`rust/src/control/accessibility.rs:355,359`，与 Linux `DOM_AX_JS` 同口径），触顶只截断并留日志、不 panic。两者别混。
+- `--timeout`：合法区间 **[100, 60000] ms**（插件 `src/index.ts:107-108` 与 Rust `service.rs:96-97` 同口径）；非正整数直接抛 `cli.err.timeout_invalid`，超界**钳制并回显**（插件 `timeoutNote` `index.ts:116-126`、Rust 二次钳制 `service.rs:113`）。未传时用服务端默认 **15s**（`ui/mod.rs:35 EVAL_TIMEOUT_MS`、`control/mod.rs:43 DEFAULT_NAV_TIMEOUT_MS`）。
+- 可访问性树：输出层默认展示深度 `maxDepth ?? 8`（`src/index.ts:584`，客户端裁剪参数）；**服务端遍历上限是另一回事**——Rust 侧 `AX_MAX_DEPTH=64`、`AX_MAX_NODES=5000`（`rust/src/control/accessibility.rs:362,366`，与 Linux `DOM_AX_JS` 同口径），触顶只截断并留日志、不 panic。两者别混。
 ## 1.10.0 其他行为（队列 / 记录 / 标签 / DevTools / Linux 截图）
 
 ### 待发送队列
@@ -242,7 +246,7 @@
 
 ### 批注 / 截图记录
 
-- 记录表上限 `MAX_RECORDS=200`（`annotate.rs:395`），超出丢最旧；`index` 单调递增（不按 `len` 推算，避免丢旧记录后与队列里的旧 index 重号）。
+- 记录表上限 `MAX_RECORDS=200`（`rust/src/ui/annotate.rs:461`，裁剪函数 `push_record_capped` `:467-475`），超出丢最旧；`index` 单调递增（不按 `len` 推算，避免丢旧记录后与队列里的旧 index 重号）。
 - `/api/annotate/records` 的 `includeImages` **默认 false**(`service.rs:1279` 读取)：每条记录只回 `hasImage:boolean`(`service.rs:1294`)，**不带 PNG base64**；只有显式传 `includeImages:true` 时该条才附 `image`(`service.rs:1296-1300`)，避免整批大图塞进响应。取用方式与上文「发送修复」条一致：`list_records`(`index.ts:205`)不传，只看 `hasImage`；`read_record_content`(`index.ts:206`)传 `includeImages:true` 取回 base64 并落盘到该会话临时目录。
 - 发送后记录**仍保留**（只标 `sent`，面板列表按未发送过滤），但可被后续新记录按 200 上限挤出。
 
@@ -258,6 +262,196 @@
 
 - Linux 截图裁剪把 CSS 像素 rect 按 `scale_factor` 换算成设备像素（`rust/src/control/screenshot.rs:230,293`，`round(css × scale)`）；HiDPI 下选区不再错位/裁小。Windows 走 CDP `clip`（`scale:1`、CSS 像素口径），见「元素截图行为」。
 
+## 1.12.0 日志流（console / network）
+
+**动机**：旧 `console_logs` 只有「读一次注入数组」的即时快照（导航即清、无网络视图、无聚合），模型难以定位「刚才那次点击后失败了什么请求」。1.12.0 把 console 与 network 做成**按标签归属、跨导航保留**的缓冲流，并提供聚合/过滤/归因。
+
+### 端点与请求
+
+| 端点 | 用途 | 请求字段 |
+|---|---|---|
+| `POST /api/console-logs` | 读 console 流 | `limit?`、`type?`（`all`/`log`/`info`/`warn`/`error`/`debug`/`exceptions`）、`search?`、`group?`（`burst`/`none`）、`phase?`（`load`/`interactive`/`action:<cmd>`）、`tab?`（0 基索引，同 list_tabs）、`includeInternal?`（默认 `false`：浏览器内部日志 `source=violation\|deprecation` 不返回）、`clear?` |
+| `POST /api/network-logs` | 读 network 流 | `limit?`、`type?`（`all`/`xhr`/`fetch`/`doc`/`script`/`image`/`font`/`other`）、`status?`（`2xx`/`3xx`/`4xx`/`5xx`/具体码）、`failed?`、`search?`、`group?`（`burst`/`key`/`none`）、`phase?`（`load`/`interactive`/`action:<cmd>`）、`tab?`（0 基索引，同 list_tabs）、`includeHeaders?`、`revealSecrets?`、`clear?` |
+| `POST /api/console-log` | **Linux 页面注入回传**（无令牌、放行 Origin；与 `/api/page-event` 同级豁免） | `entries:[{level,msg,ts?,stack?}]`、`tab?`；body ≤ 256 KiB；按 IP+tab 限速（>200 条/秒丢弃并累加 `dropped`） |
+
+读端点响应：`{success:true,data:{items,dropped,bytes,total}}`。
+- console item：`level`/`msg`/`count`/`firstTs`/`lastTs`/`phase`/`source`/`stack?`/`tab`
+- network item：`method`/`url`/`status`/`type`/`initiator`/`durationMs`/`failure?`/`phase`/`count`/`firstTs`/`lastTs`/`tab`/`headers?`
+
+### 聚合规则
+
+- **console `group=burst`**（默认）：同 `level+msg+phase+source+tab` 且与上一条连续时累加 `count`；`none` 逐条。
+- **network `group=burst`**（默认）：key = `method|url|status|initiator|phase`；**仅当与上一条同 key 且 `ts - lastTs ≤ networkBurstWindowMs`（默认 2000ms）** 才累加 `count`。
+- **network `group=key`**：同 key 即合并，**忽略 phase 与时间间隔**（长时间轮询会合成一条大计数）。
+- **network `group=none`**：逐条（`--no-dedupe` 等价此值，console 同理）。
+- 失败请求：`status=0` + `failure`（如 `net::ERR_ABORTED`）。
+
+### phase 与动作归因
+
+- `phase ∈ load | interactive | action:<cmd>`：`load`（文档加载/`load` 前）、`interactive`（可交互后）、`action:<cmd>`（工具命令窗口）。
+- **优先级**：`load` 最高——文档加载期间恒返回 `load`，`action:<cmd>` 只在 `interactive` 阶段生效（否则 `navigate` 的动作窗口会把整段文档加载的请求全标成 `action:navigate`，归因失真）。
+- 归因由 **shell 侧**完成：命令开始时开窗、结束后保留 **3s 宽限**（硬上限 60s；新命令覆盖旧窗口、不叠加）。命令名取 API 端点（`click`/`fill`/`select`/`press_key`/`navigate` 等）；插件只透传筛选参数 `--phase`，不自行打标。
+- Windows 来源：**主帧** `Page.frameNavigated` / `Page.loadEventFired`（子帧/iframe 导航不置 `load`，避免整页相位被污染）；Linux：`load-changed`。
+
+### 采集来源与平台差异
+
+- Windows：CDP（console `Runtime.enable` + `Log.enable`；network `Network.enable`）。
+- Linux：console 注入猴补（`console.*` + `onerror` + `unhandledrejection` + 1s 重挂检测 + 同源 iframe `postMessage` 汇总 + 批量 `sendBeacon` 回传）；network 走 WebKitGTK `resource-load-started` + `notify::response`。
+- `initiator`：Windows 优先取 CDP `initiator.stack.callFrames[0]`（再回退顶层 `url`），格式 `<type> <scriptUrl>:<line>`（无则 `other`）；Linux 仅 `subresource` / `document`（**无脚本行号**）。插件输出时去类型前缀、去 scheme+host，只留**最后两段 + `:line`**（`js/chunk-vendors.js:3498`）；解析不出 / 为空 / 行号为 `0`（如 `BASE_DIGITAL:0`）→ `other`（此时不输出 `from`）；Linux 的 `subresource` / `document` 原样保留。
+- `source`：`cdp` / `injected` / `native`。
+- **内部日志过滤**：CDP `Log.entryAdded` 且 `source=violation|deprecation`（如 `[debug] [DOM] Password field …`）标记为 `internal`，**保留在缓冲里**但默认不返回；`includeInternal:true`（CLI `--include-internal`）才显示。与 `--type` 取值无关（`--type debug` 不会因此放行）。
+
+### 存储、预算与生命周期
+
+- 缓冲在 **shell 侧**、按 page webview（tab）归属；**跨导航保留**；关闭标签释放该 tab 记录，关闭会话释放全部。
+- 逐出：超字节预算丢最旧，`dropped += 1`；默认 console / network 各 **8 MiB**，且预算**全局共享**（跨 tab 累计，逐出全局最旧，而非每 tab 各 8 MiB）。
+- 单条上限：console `msg` 4 KiB（超出 `…[truncated]`）、url 2 KiB、headers 合计 32 KiB。
+
+### 脱敏
+
+- 默认 headers 的 `Authorization` / `Cookie` / `Set-Cookie` → `<redacted>`；只有 `revealSecrets:true`（CLI `--reveal-secrets`）才回原值（**输出会进模型上下文**）；`revealSecrets` 必须同时开 `includeHeaders`（CLI `--include-headers`），否则明确报错。
+- 模型可见文本统一过 `sanitizeForModel`（`src/util/log-format.ts:renderLogText`，上限 20000 字符）：绝对路径 → `<path>`；`file://` URL 额外整体掩码（现有 `sanitizeForModel` 的 URL 保护不覆盖 `file:`）；http(s) URL 保留（模型需要接口地址）。
+
+### 配置下发（插件 → shell）
+
+| 配置键 | env（启动模式） | 默认 |
+|---|---|---|
+| `consoleBufferBytes` | `BT_CONSOLE_BUFFER_MB`（**整数 MB**；字节值向上取整） | 8 MiB |
+| `networkBufferBytes` | `BT_NETWORK_BUFFER_MB`（**整数 MB**；字节值向上取整） | 8 MiB |
+| `networkBurstWindowMs` | `BT_NETWORK_BURST_MS` | 2000 |
+| `consoleInject` | `BT_CONSOLE_INJECT`（`1`/`0`） | Linux `1` / 其它 `0` |
+| `webview2Args` | `BT_WEBVIEW2_ARGS`（原样字符串；**空串 = 不加任何参数**） | **仅 Windows**：`--disable-features=CalculateNativeWinOcclusion --disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows` |
+
+- 插件在 `spawnForSession` 里以子进程 `env` 下发（与 `--token` 同批）；配置文件/环境变量优先级沿用 `loadConfig`（env > 项目 > 全局 > 默认）。
+- **`webview2Args`（仅 Windows）**：`getWebviewEnv()` 拼成 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` 与子进程 env 合并（`client.ts:363`），已包含同一串则不重复；非 Windows 直接返回空对象。默认清单的动机是 **RDP 断连 / 窗口遮挡时 DWM 合成暂停**会让 WebView2 阻塞、进而卡死同步 UI 调用——关遮挡计算 + 不节流/不挂起 renderer；**默认保留 GPU 合成**（清单里**没有** `--disable-gpu-compositing`），需要 CPU 合成排障时才自行追加。给空串等于退回 WebView2 默认行为。
+- **附着模式不传**（`attachToService` 不 spawn）：缓冲/窗口/注入由外部 shell 启动者自行设置。
+
+### 输出格式（`src/util/log-format.ts`）
+
+- console：`[level] msg (xN) phase=… source=…`，异常追加 `  stack: <首行>`；`count=1` 不显示 `(x1)`。
+- network：`[200] GET web.zhihjy.cn/js/app.js (x487) 30ms last from js/app.js:42 phase=interactive`；失败 `[0]   POST app.local/api/submit (x3) failed: net::ERR_ABORTED …`（中文文案 `失败:`）。`other`/空 initiator 不输出 `from`。
+- **URL 展示**（`displayUrl`）：同源去 scheme 保留 `host + path + query`（`web.zhihjy.cn/js/app.js?v=1`），跨域保留完整 URL（`https://other.host/...`）；同源基准由同批 `type=doc` 条目推断，推断不出时退化为去 scheme 形式。超长（>120 字符）保留 host + 末尾 60 字符（中间 `…`）。**绝不输出以 `/` 开头的裸路径**——`sanitizeForModel` 会把裸 POSIX 路径掩码成 `<path>`（只有 `/api/*`、`/notify/*` 例外），历史实测的 `[200] GET <path>` 即由此产生；不可解析的相对入参补 `./` 前缀。
+- **`durationMs` 是聚合组内「最后一条」的耗时**（shell 侧聚合 `last.duration_ms = e.duration_ms`），契约没有 avg/min/max 字段，故输出标 `last` 而不谎报平均值。
+- 空结果文案明确列出可能原因：**页面无日志 / 已导航（日志按标签保留、跨导航不清空）/ 在其它标签**，并提示 `--tab` / `list_tabs`（避免模型误判为功能坏了）。
+- **`--tab` 统一为 0 基索引**：与 `list_tabs` 输出的 `[0] url` / `[1] url` 同一套编号（`--tab 0` = 第一个标签），**不是**内部 id；`console_logs` / `network_logs` 两个命令同口径（插件侧只透传该数字，不解析）。
+
+## `evaluate` 多项顺序执行（插件侧，零 Rust 改动）
+
+`bt_cli` 的 `evaluate` 支持「多文件 + 内联文本混合，按顺序执行」，完全在插件 TS 侧实现（`/api/evaluate` 契约与 Rust 代码未改）。
+
+### 语义
+
+- **位置参数 = 有序执行项**：`@file:<path>` 读该文件内容作为脚本，其余参数当内联 JS；例如 `evaluate @file:a.js @file:b.js "console.log(1)"` 依次执行 3 项。
+- **串行**：前一项 `await` 完成才发下一项（`src/util/eval-items.ts:runEvalItems`），不并行；调用方必须 `await`（`src/index.ts:runEvalCommand` → 命令 `run` 里 `(await runEvalCommand(...)) + tn`）。
+- **默认遇错即停**；`--continue-on-error` 继续执行后续项。
+- **`--script` 保持旧行为（单项）**：只给 `--script` 时完全走旧路径（请求体与输出格式不变）；`--script` 与位置参数同时给 → 报错（顺序歧义），文案 `cli.err.eval_script_conflict`。都没给 → `cli.err.eval_no_items` + 用法提示。
+
+### 输出格式（`src/util/eval-items.ts:formatEvalReport`）
+
+```text
+evaluate: 3 item(s), 2 ok, 1 failed (stop)
+[1] file scripts/hook.js  ok  3ms  → <result>
+[2] text                  ok  0ms  → <result>
+[3] file scripts/bad.js   FAILED  1ms  → SyntaxError: ...
+```
+
+- 首行汇总：`evaluate: <总项数> item(s), <ok> ok`，有失败追加 `, <n> failed`；提前停止标 ` (stop)`，`--continue-on-error` 标 ` (continued)`（无失败时也标）。
+- 每条一行：多行结果折叠为字面量 `\n`；结果截断到 **500 字符**（含省略号）。
+- 失败信息统一过 `sanitizeForModel`（绝对路径 → `<path>`）；标签（`file <path>`）同样脱敏，避免模型回显的绝对路径泄漏。
+- `--timeout` 逐项生效（每项一次独立调用），钳制后的提示仍追加在报告末尾。
+
+### 安全边界（文件读取）
+
+- 允许目录：**工作区目录**（`client.ts:getAppDirectory`，即插件初始化/工具上下文传入的 opencode `directory`）+ **插件全局 tmp**（`getTmpDir`）+ **本会话 tmp**（`getSessionTmpDir`，sid 形态校验失败回落 `default` 桶，与既有 `@file:` 同口径）。
+- 相对路径相对**工作区目录**解析（不是插件 cwd），随后用 `isInsideDir` 做 containment 校验；不允许读目录本身（`isInsideDir` 不含相等）。越界路径**直接拒绝且不读取**（`cli.err.eval_file_outside`）。
+- 体积：单文件 ≤ **256 KiB**（`EVAL_ITEM_MAX_BYTES`）、一次调用合计 ≤ **1 MiB**（`EVAL_TOTAL_MAX_BYTES`）；stat 与实际读取后各判一次（覆盖读前读后文件变大）。
+- **预检先于执行**：所有文件项在执行任何脚本前读入，任一项失败即整次返回错误文案（不留半截副作用）。
+- 已知边界：只做 `path.relative` containment，**不解析符号链接**（与既有 `@file:` 一致）；工作区目录为空（未记录）时只允许插件 tmp，相对路径按进程 cwd 解析后仍会被 containment 拒绝。
+
+### 代码落点
+
+- `src/util/eval-items.ts`：逻辑与编排（`classifyEvalArgs` / `evalItemLabel` / `formatEvalValue` / `truncateEvalText` / `formatEvalReport` / **`runEvalItems`** + 三个上限常量）。**IO 全部通过 `EvalRunDeps` 注入**（`readFile` / `evaluate` / `continued`），模块自身不做 IO，故可用假 `evaluate` 直接单测逐项结果（`tests/unit/eval-items.test.mjs`）。
+- `src/index.ts`：`parseFlagArgs` 改为返回 `{ values, positionals }`（位置参数不再丢弃，其它命令行为不变）；`CmdDef.run` 增第二入参 `positionals`（仅 `evaluate` 使用）；新增 `evalPayload` / `allowedFileDirs` / `readEvalFile` / **`runEvalCommand`**（把文件读取与 `service.evaluate` 注入 `runEvalItems`，并累计 1 MiB 预算）。既有 flag 值上的 `@file:` 解析改用 `allowedFileDirs`（行为不变）。
+- `src/client.ts`：新增只读 `getAppDirectory()`（原只有 `setAppDirectory`）。
+- i18n：`cli.cmd.evaluate` 说明改写，新增 `cli.err.eval_*` 与 `cli.example.5`（zh/en 同批，键集合保持 parity）。
+
+## `inject` 持久注入规则（插件侧 + Rust 端点）
+
+`bt_cli` 的 `inject` 把 JS 存成**规则**，文档加载完成且 URL 命中时自动执行。契约见 `.tmp/scratch/inject-rules-contract.md`（Rust 侧由并行改动实现，本节只描述插件侧行为与两侧共享的口径）。
+
+### 存储
+
+- 路径：`sessions/<profile>/<sid>/inject/rules.json`（会话数据目录内，会话删除时随目录回收）
+- 结构：`{ version: 1, rules: [ { id, match, enabled, order, items:[{kind:"text",code,name}], last:{ts,ok,failed,error}, failStreak } ] }`
+- 写入由 shell 侧用**临时文件 + rename 原子替换**；插件侧**不读写该文件**（只经 HTTP 端点）
+- 上限：规则 ≤ 20 条、单条 items 合计 ≤ 256 KiB、全部 ≤ 1 MiB；`failStreak >= 3` → 自动 `enabled=false`
+
+### 端点
+
+- `POST /api/inject/rules`（`src/client.ts:service.injectRules`）：请求体 `{ action: "add"|"list"|"remove"|"clear"|"enable"|"disable", id?, match?, order?, enabled?, items? }`；响应 `data.rules`，`add` 额外带 `data.rule`
+- `POST /api/inject/test`（`service.injectTest`）：请求 `{ url }` → `data: { matched: string[], items: number }`，**只算不执行**
+- 两个端点都走既有 `httpCall` 原语（同一套鉴权头、超时与错误分类；服务端错误经 `sanitizeForModel` 脱敏），未新增 HTTP 分支
+
+### 执行时序（shell 侧）
+
+1. 文档加载完成事件（Windows `Page.loadEventFired` / Linux `load-changed` FINISHED）
+2. 取该标签当前 URL → 匹配 `enabled` 规则（glob 或 `re:` 正则）→ 按 `order` 升序
+3. 逐条**串行**执行 items（单条 15s 超时），写完该规则的 `last`（`ok` / `failed` / `error`）
+4. 失败**不阻塞**页面加载、不向页面抛异常；连续失败 3 次自动 `enabled=false`
+
+### 与 `evaluate` 的区别
+
+| | `evaluate` | `inject` |
+| --- | --- | --- |
+| 触发 | 模型显式调用一次 | 文档加载完成后按 URL 命中自动执行 |
+| 结果 | 直接返回给模型 | 只写回规则 `last`，需 `inject list` 查看 |
+| 生命周期 | 一次性 | 持久（会话级存储），可启用/禁用 |
+| 文件参数 | 位置参数 `@file:<path>` | `--file <path>`（可重复），同样只允许工作区 / 插件 tmp |
+
+### 插件侧实现要点
+
+- `src/util/inject-rules.ts`（纯逻辑，无 IO）：`buildInjectItems`（文件 → `{kind:"text",code,name:basename}`、`--text` → name 固定 `text`，**先 file 后 text**）、`injectItemsBytes` / `injectRuleLimitIssue`（256 KiB 口径，UTF-8 字节）、`injectAddIssue`（缺 `--match` / 无 item 的原因码）、`normalizeInjectAction`（未给子动作按 `list`）、`formatInjectList` / `formatInjectAdd` / `formatInjectTest`（列表只给 item 的 `name` + 字节数，**不回显脚本内容**；错误只取首行）
+- `src/index.ts`：`runInject` 分发 + `runInjectAdd` / `runInjectMutate`；文件读取复用 `readEvalFile`——该函数现在接受**错误文案键集合**与**合计上限**（`inject` 传 256 KiB，`evaluate` 保持 1 MiB），containment 与单文件 256 KiB 判定完全同一份代码
+- `--file` / `--text` 用 `parseArgs` 的 `multiple: true`（值恒为数组）：因此既支持重复传参，也天然绕过参数层通用的 `@file:` 临时文件解析（inject 自己读工作区文件）；`--order` 登记在 `NUMERIC_FLAGS`，`--disabled` → `enabled:false`
+- i18n：新增 `cli.cmd.inject`、`cli.err.inject_*`、`cli.out.inject_*`（zh/en 同批，键集合 parity）；`buildHelp` 与 `DESC_INDEX` 自动纳入（都由 `COMMANDS` 派生）
+- 单测：`tests/unit/inject-rules.test.mjs`（item 构造 / 上限边界 / 子动作与 add 校验 / 三种输出格式）
+
+## `type`：向当前焦点插入文本（插件命令 + Rust 端点）
+
+**动机（实测）**：在 xterm / 终端 / `contenteditable` 里输入时，过去只能写 `evaluate` 伪造 `InputEvent`/`KeyboardEvent`——合成事件 `isTrusted=false`，不少组件直接忽略。`fill` 是「聚焦 → 全选 → 插入 → 读回校验」的**替换**语义（会清空终端已有内容，且读不到 `input.value`），`press_key` 一次只能一个键。`type` 补上「插入到当前焦点」这一档。
+
+### 端点
+
+`POST /api/type`（`rust/src/service.rs` 的 `App::type_text`）
+
+| 字段 | 含义 |
+|---|---|
+| `text` | 必填，待插入文本。空串报错；**上限 8 KiB（UTF-8 字节）**，超限报错 |
+| `selector?` | 有值时先聚焦该元素（复用 `keyboard::focus_element_with`，元素不存在/不可聚焦 → 明确报错，不静默落到 body） |
+| `enter?` | `true` 时插入后再 `press_key("Enter")` |
+| `timeout?` | 走既有 `timeout_arg`（默认 15s，钳到 `[100, 60000]`），贯穿聚焦 eval / insertText / Enter 三次注入 |
+
+响应 `data`：`{ inserted, focused, entered }`——`inserted` 为**字符数**（按 char 计，多字节字符算 1）；`focused` 表示本次是否**显式聚焦了 `selector`**（无 selector 时为 `false`，沿用页面当前焦点）；`entered` 为是否补发 Enter。显式传了 `timeout` 时另带 `timeoutMs`/`timeoutClamped`（`with_timeout`）。错误文案不含绝对路径。
+
+### 能力差异（Windows CDP / Linux GDK）
+
+| 环节 | Windows（WebView2 + CDP） | Linux（WebKitGTK） |
+|---|---|---|
+| 聚焦 | eval `el.focus()` + `document.activeElement` 校验（两平台共用 `focus_element_with`） | 同左 |
+| 插入文本 | CDP `Input.insertText`（整段一次写入，可信、触发浏览器默认行为） | GDK `gdk_event_put` **逐字符**注入 keyval（`insert_text_with`，已实测大小写/数字/符号） |
+| 补发 Enter | CDP `Input.dispatchKeyEvent` keyDown+keyUp（`press_key_with`） | GDK `Return` keyval |
+| 其余平台 | — | macOS 无 CDP/GDK 可信通道 → **明确报错**，不做 untrusted JS 兜底 |
+
+实现全部复用既有原语：`keyboard::plan_type`（纯校验，空/超长在动页面之前报错）、`keyboard::type_text_with` = 可选聚焦 → `insert_text_with` → 可选 `press_key_with("Enter")`；Linux 的逐字符注入意味着长文本比 Windows 慢（每字符一个 GDK 事件），超大文本请分批。
+
+### 插件侧
+
+- 命令 `type`：`type --text <文本|@file:<路径>> [--selector <css>] [--enter] [--timeout ms]`；`COMMANDS` 派生 `buildHelp`/`DESC_INDEX`，无需另登记帮助
+- `--text @file:<path>`：复用 `evaluate` 的 `readEvalFile`（允许**工作区目录 + 插件 tmp**，单文件 ≤256 KiB，**不删除**源文件）；参数层通用的「仅插件 tmp」`@file:` 解析对 `type --text` **跳过**（`index.ts` 的 `cmdName === "type" && key === "text"`），避免两套规则叠加
+- 输出：`typed N char(s) into <selector|focused element>`，`--enter` 追加 ` + Enter`（i18n `cli.out.type` / `cli.out.type.focused` / `cli.out.type.enter`）
+- 纯逻辑在 `src/util/type-text.ts`（`TYPE_TEXT_MAX_BYTES` / `typeTextIssue` / `resolveTypeText` / `formatTypeOutput`，无 IO，可单测）
+- 动作归因：`/api/type` 登记在 `action_for_path` → 执行期间日志 `phase=action:type`
+
 ## 待办
 
 - macOS：截图（WKWebView snapshot）、可信输入（无 CDP/GDK 通道，现走降级或明确报错）等平台分支
@@ -271,5 +465,5 @@
 1. **`librsvg2-dev` 是否为 Linux 构建/运行必需**：`Cargo.lock` 无对应 crate，`linux-verification.md:17` 的安装清单里带着它，但去掉能否构建/是否有 SVG 渲染差异，本机未实测（`linux-support.md:74` 同样标注「待核实」）。需要一次「不装 librsvg2-dev 的干净构建 + SVG 页面渲染」实测才能定。
 2. **`show_notification --type` 的合法取值集合**：Rust `service.rs:273-291` 只读 `body["type"]`、缺省 `"ok"`（`:275`），随后**原样注入** overlay 的 `notify(m,t)`（`:281`）；插件层（`index.ts:176`）也不校验。已知实际用到的值有 `"err"`（drain 失败路径 `index.ts:708`）。**完整取值枚举与未知值的渲染降级行为**要看覆盖层前端 `notify` 实现（未逐一核实），故不在本文给出「支持哪些 type」的清单。
 
-（对比：`console_logs --type` 是**另一套**取值 —— `all/error/warning/log/info/debug`，服务端校验并报错 `service.rs:794-811`，与通知类型无关，勿混。）
+（对比：`console_logs --type` 是**另一套**取值 —— 1.12.0 起为 `all/log/info/warn/error/debug/exceptions`，与通知类型无关，勿混。）
 

@@ -1,10 +1,13 @@
 //! 应用核心:HTTP 端点分发(基于 Tauri Webview 控制层)
 //! 所有操作通过 control 模块 eval 驱动页面 Webview
-use serde_json::{json, Value};
+use std::net::IpAddr;
+
+use serde_json::{Value, json};
 use tauri::AppHandle;
 use tauri::Manager;
 
 use crate::control;
+use crate::streams;
 use crate::ui;
 
 /// 滚动缺省方向(与 bt_cli `scroll` 用法一致)
@@ -17,8 +20,8 @@ const DEFAULT_HTML_MAX_LENGTH: u64 = 20000;
 const DEFAULT_REMOVE_SCRIPTS: bool = true;
 /// visible-html 默认保留 HTML 注释
 const DEFAULT_REMOVE_COMMENTS: bool = false;
-/// console-logs 默认返回条数(取最后 N 条)
-const DEFAULT_CONSOLE_LOG_LIMIT: u64 = 50;
+/// console/network 查询默认返回条数(契约:`limit?:30`)
+const DEFAULT_CONSOLE_LOG_LIMIT: u64 = 30;
 
 /// visible-html 提取 JS(占位符由 Rust 侧替换;返回 {html,truncated} 或 {error})
 /// 先 clone 再删除,不改动页面实际 DOM
@@ -50,36 +53,96 @@ const VISIBLE_HTML_JS: &str = r##"
 })()
 "##;
 
-/// console-logs 过滤 JS(占位符由 Rust 侧替换;返回 {logs:[...]} 已格式化为 "[level] msg")
-/// 页面缓冲为 window.__btLogs = [{level,msg}],level ∈ log/info/warn/error/debug
-const CONSOLE_LOGS_JS: &str = r##"
-(function(){
-  var all=window.__btLogs||[];
-  var type=__BT_TYPE__;
-  var search=__BT_SEARCH__;
-  var limit=__BT_LIMIT__;
-  var clear=__BT_CLEAR__;
-  var out=[];
-  for(var i=0;i<all.length;i++){
-    var e=all[i]||{};
-    if(type!=="all"&&String(e.level||"")!==type)continue;
-    if(search&&String(e.msg||"").indexOf(search)<0)continue;
-    out.push(e);
-  }
-  if(limit<out.length)out=out.slice(out.length-limit);
-  if(clear)window.__btLogs=[];
-  var lines=[];
-  for(var j=0;j<out.length;j++)lines.push("["+(out[j].level||"log")+"] "+(out[j].msg||""));
-  return {logs:lines};
-})()
-"##;
-
 /// 读取整型参数:兼容 JSON 数字与命令行字符串(bt_cli 的 flag 默认 string 类型)
 fn num_i64(body: &Value, key: &str) -> Option<i64> {
     body.get(key).and_then(|v| match v {
         Value::Number(n) => n.as_i64(),
         Value::String(s) => s.trim().parse::<i64>().ok(),
         _ => None,
+    })
+}
+
+/// 读取布尔参数:兼容 JSON bool 与命令行字符串("true"/"1"/"false"/"0")
+fn bool_arg(body: &Value, key: &str) -> Option<bool> {
+    body.get(key).and_then(|v| match v {
+        Value::Bool(b) => Some(*b),
+        Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Some(true),
+            "false" | "0" | "no" | "off" => Some(false),
+            _ => None,
+        },
+        Value::Number(n) => n.as_i64().map(|n| n != 0),
+        _ => None,
+    })
+}
+
+/// macOS 未接入 CDP/WebKit 资源采集:相关端点明确报不支持,而不是静默返回空数组
+fn unsupported_platform() -> Option<&'static str> {
+    if cfg!(target_os = "macos") {
+        Some("console/network/expect is not supported on macOS")
+    } else {
+        None
+    }
+}
+
+/// 解析 `--phase` 过滤参数(非法值明确报错;缺省为空=不过滤)
+fn phase_arg(body: &Value) -> Result<String, String> {
+    match body.get("phase") {
+        None | Some(Value::Null) => Ok(String::new()),
+        Some(Value::String(s)) => streams::parse_phase_filter(s),
+        Some(other) => Err(format!(
+            "phase must be a string (load|interactive|action:<cmd>), got: {other}"
+        )),
+    }
+}
+
+/// 把 0 基标签索引映射为内部 tab id(与 `list_tabs` 输出顺序一致;越界报错)
+fn tab_id_for_index(ids: &[u32], idx: u64) -> Result<u32, String> {
+    usize::try_from(idx)
+        .ok()
+        .and_then(|i| ids.get(i).copied())
+        .ok_or_else(|| {
+            format!(
+                "tab index out of range: {idx} (0-based; {} tabs open)",
+                ids.len()
+            )
+        })
+}
+
+/// `revealSecrets` 单独使用没有意义(不返回 headers):明确提示需配合 `--include-headers`
+fn validate_reveal(include_headers: bool, reveal_secrets: bool) -> Result<(), String> {
+    if reveal_secrets && !include_headers {
+        return Err("revealSecrets requires includeHeaders (use --include-headers)".into());
+    }
+    Ok(())
+}
+
+/// 工具命令 → 动作相位名(1.12.0)。只列会驱动页面/网络的命令;
+/// 查询类(visible-text/screenshot 等)不参与归因,避免噪声。
+fn action_for_path(url: &str) -> Option<&'static str> {
+    Some(match url {
+        "/api/click" => "click",
+        "/api/fill" => "fill",
+        "/api/clear" => "clear",
+        "/api/select" => "select",
+        "/api/hover" => "hover",
+        "/api/press-key" => "press_key",
+        "/api/type" => "type",
+        "/api/drag" => "drag",
+        "/api/upload-file" => "upload_file",
+        "/api/navigate" => "navigate",
+        "/api/go-back" => "go_back",
+        "/api/go-forward" => "go_forward",
+        "/api/reload" => "reload",
+        "/api/scroll" => "scroll",
+        "/api/scroll-to-element" => "scroll_to_element",
+        "/api/iframe-click" => "iframe_click",
+        "/api/iframe-fill" => "iframe_fill",
+        "/api/tabs/new" => "tabs_new",
+        "/api/tabs/switch" => "tabs_switch",
+        "/api/tabs/close" => "tabs_close",
+        "/api/click-switch-tab" => "click_switch_tab",
+        _ => return None,
     })
 }
 
@@ -144,14 +207,40 @@ pub struct App {
 
 impl App {
     pub fn new(handle: AppHandle, browsers_path: String) -> Self {
-        Self { handle, browsers_path }
+        Self {
+            handle,
+            browsers_path,
+        }
     }
 
-    /// 分发端点
-    pub async fn handle(&self, url: &str, body: Value) -> Result<Value, String> {
+    /// 分发端点(client_ip 用于 `/api/console-log` 的 IP+tab 限速)
+    pub async fn handle(
+        &self,
+        url: &str,
+        body: Value,
+        client_ip: Option<IpAddr>,
+    ) -> Result<Value, String> {
         // 选择器统一入口校验:Playwright 风格(text= / xpath= / 以 / 开头等)在此快速明确报错,
         // 覆盖 click/fill/iframe_click 等**所有**收选择器字段的端点,不进点击/解析链路
         control::validate_selector_fields(&body)?;
+        // 动作归因(1.12.0):工具命令执行期间相位 = `action:<cmd>`,
+        // 结束后保留 3s 宽限;并发命令取最新(begin_action 覆盖旧窗口,不叠加)。
+        let action = action_for_path(url)
+            .map(|cmd| streams::begin_action(ui::active_tab_id(&self.handle), cmd));
+        let result = self.dispatch(url, body, client_ip).await;
+        if let Some(h) = action {
+            streams::end_action(h);
+        }
+        result
+    }
+
+    /// 端点分发本体(不含动作相位包装)
+    async fn dispatch(
+        &self,
+        url: &str,
+        body: Value,
+        client_ip: Option<IpAddr>,
+    ) -> Result<Value, String> {
         match url {
             "/api/status" => self.status().await,
             "/api/title" => self.title().await,
@@ -164,6 +253,7 @@ impl App {
             "/api/select" => self.select(&body).await,
             "/api/hover" => self.hover(&body).await,
             "/api/press-key" => self.press_key(&body).await,
+            "/api/type" => self.type_text(&body).await,
             "/api/drag" => self.drag(&body).await,
             "/api/upload-file" => self.upload_file(&body).await,
             "/api/screenshot" => self.screenshot(&body).await,
@@ -182,12 +272,19 @@ impl App {
             "/api/go-forward" => self.go_forward().await,
             "/api/resize" => self.resize(&body).await,
             "/api/console-logs" => self.console_logs(&body).await,
+            // Linux 注入脚本回传(与 page-event 同级豁免:无令牌、放行 Origin,只写缓冲)
+            "/api/console-log" => self.console_log_upload(&body, client_ip).await,
+            "/api/network-logs" => self.network_logs(&body).await,
             "/api/expect-response" => self.expect_response(&body).await,
             "/api/assert-response" => self.assert_response(&body).await,
             "/api/notify" => self.notify(&body).await,
             "/api/user-agent" => self.set_user_agent(&body).await,
             "/api/panel-config" => Ok(json!({ "ok": true })),
-            "/api/close-session" => Ok(json!({ "closed": true })),
+            "/api/close-session" => {
+                // 关闭会话:释放全部 tab 缓冲/相位/限速窗口
+                streams::clear_all();
+                Ok(json!({ "closed": true }))
+            }
             "/api/accessibility" => self.accessibility(&body).await,
             "/api/iframe-click" => self.iframe_click(&body).await,
             "/api/iframe-fill" => self.iframe_fill(&body).await,
@@ -212,6 +309,9 @@ impl App {
             "/api/media/audio" => self.media_audio(&body).await,
             // fake 摄像头画面注入(模拟视频输入)
             "/api/media/video" => self.media_video(&body).await,
+            // 持久注入规则(1.12.0):规则 CRUD 与「只匹配不执行」自检
+            "/api/inject/rules" => self.inject_rules(&body).await,
+            "/api/inject/test" => self.inject_test(&body).await,
             _ => Err(format!("Not found: POST {url}")),
         }
     }
@@ -226,19 +326,34 @@ impl App {
             let cur = url["url"].as_str().unwrap_or("").to_string();
             Ok::<_, String>((cur, title))
         })?;
-        let tabs_count = self.handle.state::<crate::ui::UiState>().tabs.lock().unwrap().len();
-        Ok(json!({ "open": true, "url": st.0, "title": st.1, "tabs": tabs_count, "installing": {} }))
+        let tabs_count = self
+            .handle
+            .state::<crate::ui::UiState>()
+            .tabs
+            .lock()
+            .unwrap()
+            .len();
+        Ok(
+            json!({ "open": true, "url": st.0, "title": st.1, "tabs": tabs_count, "installing": {} }),
+        )
     }
 
     /// 返回主窗口标题(多会话实例自验用;标题来自 `--title`,默认 "bt-shell")
     async fn title(&self) -> Result<Value, String> {
         use tauri::Manager;
-        let win = self.handle.get_window("main").ok_or("main window not found")?;
+        let win = self
+            .handle
+            .get_window("main")
+            .ok_or("main window not found")?;
         Ok(json!({ "title": win.title().map_err(|e| e.to_string())? }))
     }
 
     async fn navigate(&self, body: &Value) -> Result<Value, String> {
-        let url = body.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string();
+        let url = body
+            .get("url")
+            .and_then(|u| u.as_str())
+            .unwrap_or("")
+            .to_string();
         if url.is_empty() {
             return Err("url is required".into());
         }
@@ -251,7 +366,9 @@ impl App {
             .as_ref()
             .and_then(|v| v.get("url").and_then(|u| u.as_str()).map(str::to_string))
             .unwrap_or_default();
-        let prev_to = prev.as_ref().and_then(|v| v.get("timeOrigin").and_then(|t| t.as_f64()));
+        let prev_to = prev
+            .as_ref()
+            .and_then(|v| v.get("timeOrigin").and_then(|t| t.as_f64()));
         tokio::task::block_in_place(|| control::navigate(&handle, &url))?;
         // 同步激活标签的 URL(工具栏显示一致)
         ui::sync_active_tab(&self.handle, &url, "");
@@ -271,8 +388,16 @@ impl App {
 
     /// 在页面显示通知气泡(通过覆盖层 Webview 的 __btOverlay.notify)
     async fn notify(&self, body: &Value) -> Result<Value, String> {
-        let message = body.get("message").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let ty = body.get("type").and_then(|v| v.as_str()).unwrap_or("ok").to_string();
+        let message = body
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let ty = body
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("ok")
+            .to_string();
         if message.is_empty() {
             return Err("message is required".into());
         }
@@ -298,7 +423,11 @@ impl App {
     }
 
     async fn click(&self, body: &Value) -> Result<Value, String> {
-        let s = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let s = body
+            .get("selector")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         if s.is_empty() {
             return Err("selector is required".into());
         }
@@ -317,11 +446,19 @@ impl App {
     }
 
     async fn fill(&self, body: &Value) -> Result<Value, String> {
-        let s = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let s = body
+            .get("selector")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         if s.is_empty() {
             return Err("selector is required".into());
         }
-        let v = body.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let v = body
+            .get("value")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
         let (t, tclamped) = timeout_arg(body)?;
         let handle = self.handle.clone();
         // Windows:focus + 全选 + Input.insertText;非 Windows:降级 DOM setter + input/change 并标注
@@ -334,7 +471,11 @@ impl App {
     }
 
     async fn clear(&self, body: &Value) -> Result<Value, String> {
-        let s = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let s = body
+            .get("selector")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         if s.is_empty() {
             return Err("selector is required".into());
         }
@@ -349,28 +490,36 @@ impl App {
     }
 
     async fn select(&self, body: &Value) -> Result<Value, String> {
-        let s = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let s = body
+            .get("selector")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         if s.is_empty() {
             return Err("selector is required".into());
         }
-        let v = body.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let v = body
+            .get("value")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
         let (t, tclamped) = timeout_arg(body)?;
         let handle = self.handle.clone();
         // Windows:focus + 方向键可信选择(单值 select);multiple/size>1 或其他平台降级并标注
-        let o =
-            tokio::task::block_in_place(|| control::input::select_with(&handle, &s, &v, t))?;
+        let o = tokio::task::block_in_place(|| control::input::select_with(&handle, &s, &v, t))?;
         Ok(with_timeout(
-            mark_degraded(
-                json!({ "selected": true, "value": o.value }),
-                &o.degraded,
-            ),
+            mark_degraded(json!({ "selected": true, "value": o.value }), &o.degraded),
             t,
             tclamped,
         ))
     }
 
     async fn hover(&self, body: &Value) -> Result<Value, String> {
-        let s = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let s = body
+            .get("selector")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         if s.is_empty() {
             return Err("selector is required".into());
         }
@@ -389,11 +538,19 @@ impl App {
     }
 
     async fn press_key(&self, body: &Value) -> Result<Value, String> {
-        let key = body.get("key").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let key = body
+            .get("key")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         if key.is_empty() {
             return Err("key is required".into());
         }
-        let selector = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let selector = body
+            .get("selector")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let (t, tclamped) = timeout_arg(body)?;
         let handle = self.handle.clone();
         // 可信键盘注入:Windows 走 CDP(先聚焦 selector),非 Windows 未实现则明确报错
@@ -403,12 +560,51 @@ impl App {
         Ok(with_timeout(json!({ "pressed": key }), t, tclamped))
     }
 
+    /// 向当前焦点插入文本(不清空):有 selector 先聚焦,`enter` 为真时插入后再回车
+    ///
+    /// 与 `fill` 的差别:`fill` 是「聚焦 → 全选 → insertText」的替换语义;`type` 不清空、
+    /// 不选中,直接插到光标处(xterm / 终端 / contenteditable 等场景用)。
+    /// 返回 `{inserted, focused, entered}`:`inserted` 为字符数(char 计),
+    /// `focused` 表示本次是否显式聚焦了 selector(无 selector 时为 false,沿用当前焦点)。
+    async fn type_text(&self, body: &Value) -> Result<Value, String> {
+        let text = body
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let selector = body
+            .get("selector")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let enter = bool_arg(body, "enter").unwrap_or(false);
+        let (t, tclamped) = timeout_arg(body)?;
+        let handle = self.handle.clone();
+        // 文本校验(空/超 8 KiB)在 plan_type 内先行完成,非法入参不会留下聚焦副作用
+        let o = tokio::task::block_in_place(|| {
+            control::keyboard::type_text_with(&handle, &text, &selector, enter, t)
+        })?;
+        Ok(with_timeout(
+            json!({ "inserted": o.inserted, "focused": o.focused, "entered": o.entered }),
+            t,
+            tclamped,
+        ))
+    }
+
     async fn drag(&self, body: &Value) -> Result<Value, String> {
-        let from = body.get("sourceSelector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let from = body
+            .get("sourceSelector")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         if from.is_empty() {
             return Err("sourceSelector is required".into());
         }
-        let to = body.get("targetSelector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let to = body
+            .get("targetSelector")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         if to.is_empty() {
             return Err("targetSelector is required".into());
         }
@@ -420,11 +616,19 @@ impl App {
     }
 
     async fn upload_file(&self, body: &Value) -> Result<Value, String> {
-        let s = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let s = body
+            .get("selector")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         if s.is_empty() {
             return Err("selector is required".into());
         }
-        let path = body.get("filePath").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let path = body
+            .get("filePath")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         if path.is_empty() {
             return Err("filePath is required".into());
         }
@@ -440,7 +644,11 @@ impl App {
     /// ④ rect 完全在视口内 → 常规 clip(原路径);仍超出视口 → 越界路径(beyond,整块截全)
     /// 滚动 reached/stable 不吞错:如实写进返回(beyondViewport/reached/stable/…)
     async fn screenshot(&self, body: &Value) -> Result<Value, String> {
-        let selector = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let selector = body
+            .get("selector")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let (t, tclamped) = timeout_arg(body)?;
         let handle = self.handle.clone();
         let (base64, meta) = tokio::task::block_in_place(|| -> Result<(String, Value), String> {
@@ -465,10 +673,26 @@ impl App {
                 return Err(format!("element not found: {selector}"));
             }
             let rect = st.get("rect").ok_or("element rect missing")?;
-            let x = rect.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0).round() as i32;
-            let y = rect.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0).round() as i32;
-            let w = rect.get("w").and_then(|v| v.as_f64()).unwrap_or(0.0).round() as i32;
-            let h = rect.get("h").and_then(|v| v.as_f64()).unwrap_or(0.0).round() as i32;
+            let x = rect
+                .get("x")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0)
+                .round() as i32;
+            let y = rect
+                .get("y")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0)
+                .round() as i32;
+            let w = rect
+                .get("w")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0)
+                .round() as i32;
+            let h = rect
+                .get("h")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0)
+                .round() as i32;
             if w <= 0 || h <= 0 {
                 return Err(format!("element has zero size: {selector}"));
             }
@@ -484,18 +708,18 @@ impl App {
             // 两条路径都传**视口**坐标,截图层内部统一换算文档坐标(CDP clip 实测恒为文档坐标)
             let beyond = x < 0 || y < 0 || x + w > vw || y + h > vh;
             let base64 = match (beyond, t) {
-                (true, Some(ms)) => crate::control::screenshot::screenshot_clip_beyond_with_timeout(
-                    &handle, x, y, w, h, ms,
-                )?,
+                (true, Some(ms)) => {
+                    crate::control::screenshot::screenshot_clip_beyond_with_timeout(
+                        &handle, x, y, w, h, ms,
+                    )?
+                }
                 (true, None) => {
                     crate::control::screenshot::screenshot_clip_beyond(&handle, x, y, w, h)?
                 }
                 (false, Some(ms)) => crate::control::screenshot::screenshot_clip_with_timeout(
                     &handle, x, y, w, h, ms,
                 )?,
-                (false, None) => {
-                    crate::control::screenshot::screenshot_clip(&handle, x, y, w, h)?
-                }
+                (false, None) => crate::control::screenshot::screenshot_clip(&handle, x, y, w, h)?,
             };
             let meta = json!({
                 "beyondViewport": beyond,
@@ -522,7 +746,11 @@ impl App {
     }
 
     async fn evaluate(&self, body: &Value) -> Result<Value, String> {
-        let script = body.get("script").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let script = body
+            .get("script")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let (t, _tclamped) = timeout_arg(body)?;
         let handle = self.handle.clone();
         // eval 超时是最直接的「快失败」手段:默认仍 15s(批次4 统一),传了就用传入值(不写 timeoutMs 到返回体 ——
@@ -534,18 +762,50 @@ impl App {
         Ok(r)
     }
 
+    /// 持久注入规则 CRUD:`action=add|list|remove|clear|enable|disable`
+    ///
+    /// 文件位于 `<sessionDataDir>/inject/rules.json`;同步文件 IO 放进阻塞线程,
+    /// 失败只返回可读原因(不含绝对路径)。
+    async fn inject_rules(&self, body: &Value) -> Result<Value, String> {
+        let dir = crate::inject::session_dir(&self.handle);
+        tokio::task::block_in_place(|| crate::inject::rules_action(&dir, body))
+    }
+
+    /// 注入规则自检:只按 url 匹配,**不执行**任何脚本
+    async fn inject_test(&self, body: &Value) -> Result<Value, String> {
+        let url = body
+            .get("url")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
+        if url.is_empty() {
+            return Err("url is required".into());
+        }
+        let dir = crate::inject::session_dir(&self.handle);
+        tokio::task::block_in_place(|| crate::inject::test_match(&dir, &url))
+    }
+
     /// 可见文本:有 selector 取该元素 innerText,否则取 body 全文
     async fn visible_text(&self, body: &Value) -> Result<Value, String> {
-        let selector = body.get("selector").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let selector = body
+            .get("selector")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         let handle = self.handle.clone();
-        let t = tokio::task::block_in_place(|| control::visible_text(&handle, selector.as_deref()))?;
+        let t =
+            tokio::task::block_in_place(|| control::visible_text(&handle, selector.as_deref()))?;
         Ok(json!({ "text": t }))
     }
 
     /// 可见 HTML:支持 selector / removeScripts / removeComments / maxLength
     /// 默认 documentElement、移除 script、保留注释、截断 20000 字符
     async fn visible_html(&self, body: &Value) -> Result<Value, String> {
-        let selector = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let selector = body
+            .get("selector")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let remove_scripts = body
             .get("removeScripts")
             .and_then(|v| v.as_bool())
@@ -563,8 +823,14 @@ impl App {
         };
         let js = VISIBLE_HTML_JS
             .replace("__BT_SELECTOR__", &sel_lit)
-            .replace("__BT_REMOVE_SCRIPTS__", if remove_scripts { "true" } else { "false" })
-            .replace("__BT_REMOVE_COMMENTS__", if remove_comments { "true" } else { "false" })
+            .replace(
+                "__BT_REMOVE_SCRIPTS__",
+                if remove_scripts { "true" } else { "false" },
+            )
+            .replace(
+                "__BT_REMOVE_COMMENTS__",
+                if remove_comments { "true" } else { "false" },
+            )
             .replace("__BT_MAX_LENGTH__", &max_length.to_string());
         let handle = self.handle.clone();
         let r = tokio::task::block_in_place(|| control::eval(&handle, &js))?;
@@ -578,7 +844,11 @@ impl App {
     }
 
     async fn element_state(&self, body: &Value) -> Result<Value, String> {
-        let s = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let s = body
+            .get("selector")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let (t, tclamped) = timeout_arg(body)?;
         let handle = self.handle.clone();
         let r = tokio::task::block_in_place(|| control::element_state_with(&handle, &s, t))?;
@@ -586,7 +856,11 @@ impl App {
     }
 
     async fn dropdown_options(&self, body: &Value) -> Result<Value, String> {
-        let s = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let s = body
+            .get("selector")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let (t, tclamped) = timeout_arg(body)?;
         let handle = self.handle.clone();
         let js = format!(
@@ -602,13 +876,18 @@ impl App {
     }
 
     async fn wait_for_selector(&self, body: &Value) -> Result<Value, String> {
-        let s = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let s = body
+            .get("selector")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         // 修:原 `as_u64()` 只认 JSON 数字,而 bt_cli 的 flag 一律是字符串 → `--timeout` 被静默忽略。
         // 改走 timeout_arg:兼容字符串、钳到 [100,60000]、未传保持默认 15000ms(批次4 与其它超时统一),并如实回显生效值
         let (t, tclamped) = timeout_arg(body)?;
         let timeout = t.unwrap_or(15_000);
         let handle = self.handle.clone();
-        let found = tokio::task::block_in_place(|| control::wait_for_selector(&handle, &s, timeout))?;
+        let found =
+            tokio::task::block_in_place(|| control::wait_for_selector(&handle, &s, timeout))?;
         Ok(with_timeout(json!({ "found": found }), t, tclamped))
     }
 
@@ -623,7 +902,11 @@ impl App {
             )
         } else {
             let direction = body.get("direction").and_then(|v| v.as_str()).unwrap_or("");
-            let direction = if direction.is_empty() { DEFAULT_SCROLL_DIRECTION } else { direction };
+            let direction = if direction.is_empty() {
+                DEFAULT_SCROLL_DIRECTION
+            } else {
+                direction
+            };
             let amount = num_i64(body, "amount").unwrap_or(DEFAULT_SCROLL_AMOUNT) as i32;
             match direction {
                 "down" => (0, amount),
@@ -649,15 +932,18 @@ impl App {
     }
 
     async fn scroll_to_element(&self, body: &Value) -> Result<Value, String> {
-        let s = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let s = body
+            .get("selector")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         if s.is_empty() {
             return Err("selector is required".into());
         }
         let (t, tclamped) = timeout_arg(body)?;
         let handle = self.handle.clone();
         // 等待元素真正进入视口且滚动稳定;超时如实返回 reached:false(+reason)
-        let r =
-            tokio::task::block_in_place(|| control::scroll_to_element_with(&handle, &s, t))?;
+        let r = tokio::task::block_in_place(|| control::scroll_to_element_with(&handle, &s, t))?;
         let mut out = json!({
             "scrolled": true,
             "reached": r["reached"],
@@ -704,7 +990,9 @@ impl App {
             .as_ref()
             .and_then(|v| v.get("url").and_then(|u| u.as_str()).map(str::to_string))
             .unwrap_or_default();
-        let prev_to = prev.as_ref().and_then(|v| v.get("timeOrigin").and_then(|t| t.as_f64()));
+        let prev_to = prev
+            .as_ref()
+            .and_then(|v| v.get("timeOrigin").and_then(|t| t.as_f64()));
         tokio::task::block_in_place(|| control::eval(&handle, "history.back(); true"))?;
         // 等待导航就绪(文档身份/URL 变化 + readyState);有界超时,超时如实返回 ready:false
         let st = tokio::task::block_in_place(|| {
@@ -728,7 +1016,9 @@ impl App {
             .as_ref()
             .and_then(|v| v.get("url").and_then(|u| u.as_str()).map(str::to_string))
             .unwrap_or_default();
-        let prev_to = prev.as_ref().and_then(|v| v.get("timeOrigin").and_then(|t| t.as_f64()));
+        let prev_to = prev
+            .as_ref()
+            .and_then(|v| v.get("timeOrigin").and_then(|t| t.as_f64()));
         tokio::task::block_in_place(|| control::eval(&handle, "history.forward(); true"))?;
         let st = tokio::task::block_in_place(|| {
             control::wait_ready(&handle, &prev_url, prev_to, control::history_timeout_ms())
@@ -791,16 +1081,42 @@ impl App {
         })
     }
 
-    /// 读取页面控制台日志(由页面桥 __btLogs 捕获,元素形如 {level,msg})
-    /// 支持 type(按 level 过滤:all/error/warning/log/info/debug,默认 all)、
-    /// search(文本子串)、limit(取最后 N 条,默认 50)、clear(返回后清空缓冲)
+    /// 把请求里的 `tab`(0 基索引)映射为内部 tab id;未传返回 None(全部标签)
+    fn resolve_tab(&self, body: &Value) -> Result<Option<u32>, String> {
+        let Some(raw) = body.get("tab").filter(|v| !v.is_null()) else {
+            return Ok(None);
+        };
+        let idx = num_i64(body, "tab").ok_or_else(|| {
+            format!("tab must be a non-negative integer (0-based), got: {raw}")
+        })?;
+        if idx < 0 {
+            return Err(format!(
+                "tab index out of range: {idx} (0-based; must be >= 0)"
+            ));
+        }
+        let state = self.handle.state::<crate::ui::UiState>();
+        let tabs = state.tabs.lock().unwrap_or_else(|e| e.into_inner());
+        let ids: Vec<u32> = tabs.iter().map(|t| t.id).collect();
+        tab_id_for_index(&ids, idx as u64).map(Some)
+    }
+
+    /// 读取控制台流(1.12.0:读 Rust 侧缓冲,不再 eval 页面 `__btLogs`)
+    ///
+    /// 请求(向后兼容旧字段):
+    /// `{limit?:30, type?:"all|log|info|warn|error|debug|exceptions", search?, group?:"burst|none",
+    ///   phase?:"load|interactive|action:<cmd>", tab?:number(0 基索引), clear?:boolean}`
+    ///
+    /// 响应 `data`:`{items, logs, dropped, bytes, total, limit, type, search, group, phase, clear}`
+    /// - `items` 为契约字段;`logs` 为旧的 `"[level] msg"` 文本数组(旧插件兼容)。
     async fn console_logs(&self, body: &Value) -> Result<Value, String> {
+        if let Some(err) = unsupported_platform() {
+            return Err(err.to_string());
+        }
         let type_raw = body
             .get("type")
             .and_then(|v| v.as_str())
             .unwrap_or("all")
             .to_ascii_lowercase();
-        // 页面存储的 level 为 warn(非 warning),此处统一归一
         let log_type = match type_raw.as_str() {
             "" | "all" => "all",
             "error" => "error",
@@ -808,55 +1124,242 @@ impl App {
             "log" => "log",
             "info" => "info",
             "debug" => "debug",
+            "exceptions" => "exceptions",
             other => {
-                return Err(format!("unknown type: {other} (all/error/warning/log/info/debug)"));
+                return Err(format!(
+                    "unknown type: {other} (all/error/warning/log/info/debug/exceptions)"
+                ));
             }
         };
-        let search = body.get("search").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let limit = num_u64(body, "limit").unwrap_or(DEFAULT_CONSOLE_LOG_LIMIT);
-        let clear = body.get("clear").and_then(|v| v.as_bool()).unwrap_or(false);
-        let js = CONSOLE_LOGS_JS
-            .replace("__BT_TYPE__", &serde_json::to_string(log_type).unwrap_or_else(|_| "\"all\"".into()))
-            .replace("__BT_SEARCH__", &serde_json::to_string(&search).unwrap_or_else(|_| "\"\"".into()))
-            .replace("__BT_LIMIT__", &limit.to_string())
-            .replace("__BT_CLEAR__", if clear { "true" } else { "false" });
-        let handle = self.handle.clone();
-        let r = tokio::task::block_in_place(|| control::eval(&handle, &js))?;
-        Ok(r)
+        let group = match body
+            .get("group")
+            .and_then(|v| v.as_str())
+            .unwrap_or("burst")
+        {
+            "" | "burst" => "burst",
+            "none" => "none",
+            other => return Err(format!("unknown group: {other} (burst/none)")),
+        };
+        let search = body
+            .get("search")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let limit = num_u64(body, "limit").unwrap_or(DEFAULT_CONSOLE_LOG_LIMIT) as usize;
+        let clear = bool_arg(body, "clear").unwrap_or(false);
+        let tab = self.resolve_tab(body)?;
+        let phase = phase_arg(body)?;
+        // 浏览器内部日志(violation/deprecation)默认不返回
+        let include_internal = bool_arg(body, "includeInternal").unwrap_or(false);
+        let q = streams::ConsoleQuery {
+            typ: log_type.to_string(),
+            search,
+            group: group.to_string(),
+            phase,
+            tab,
+            include_internal,
+        };
+        Ok(streams::query_console(&q, limit, clear))
     }
 
-    /// 记录期望:清空响应历史并登记(声明"从此开始捕获")
+    /// Linux 注入脚本回传控制台条目(页面可用端点)
+    ///
+    /// 请求 `{entries:[{level,msg,ts?,stack?}], tab?:number, label?:string}`。
+    /// 只写缓冲、不执行任何内容;按 IP+tab 限速 200 条/秒,超限计入 `dropped`。
+    /// body 大小由 http.rs 限制为 256 KiB。
+    async fn console_log_upload(
+        &self,
+        body: &Value,
+        client_ip: Option<IpAddr>,
+    ) -> Result<Value, String> {
+        if let Some(err) = unsupported_platform() {
+            return Err(err.to_string());
+        }
+        let entries = body
+            .get("entries")
+            .and_then(|v| v.as_array())
+            .ok_or("entries is required")?;
+        // 归属标签:显式 tab 优先,其次页面注入的 webview label
+        let tab = num_u64(body, "tab")
+            .map(|t| t as u32)
+            .or_else(|| {
+                body.get("label")
+                    .and_then(|v| v.as_str())
+                    .and_then(|label| ui::tab_id_for_label(&self.handle, label))
+            })
+            .unwrap_or(0);
+        // 单请求处理上限:防止恶意页面用 256 KiB 塞入海量条目长时间占锁
+        const MAX_UPLOAD_ENTRIES: usize = 2_000;
+        let total = entries.len();
+        let ip = client_ip.unwrap_or(IpAddr::from([127, 0, 0, 1]));
+        let (accepted, over_rate) =
+            streams::rate_limit_console(ip, tab, total.min(MAX_UPLOAD_ENTRIES));
+        let overflow = total.saturating_sub(MAX_UPLOAD_ENTRIES);
+        let dropped = over_rate + overflow;
+        streams::note_console_dropped(tab, dropped);
+        for e in entries.iter().take(accepted) {
+            let level = streams::normalize_console_level(
+                e.get("level").and_then(|v| v.as_str()).unwrap_or("log"),
+            );
+            let msg = e
+                .get("msg")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let ts = e
+                .get("ts")
+                .and_then(|v| v.as_u64())
+                .filter(|t| *t > 0)
+                .unwrap_or_else(streams::now_ms);
+            let stack = e
+                .get("stack")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            streams::push_console(streams::ConsoleEvent {
+                level,
+                msg,
+                ts,
+                phase: String::new(),
+                source: streams::ConsoleSource::Injected,
+                stack,
+                tab,
+                is_exception: false,
+                internal: false,
+            });
+        }
+        Ok(json!({ "ok": true, "accepted": accepted, "dropped": dropped }))
+    }
+
+    /// 读取网络流(1.12.0)
+    ///
+    /// 请求:`{limit?:30, type?:"all|xhr|fetch|doc|script|image|font|other",
+    ///   status?:"2xx|3xx|4xx|5xx"|number, failed?:boolean, search?, group?:"burst|key|none",
+    ///   phase?:"load|interactive|action:<cmd>", tab?:number(0 基索引),
+    ///   includeHeaders?:boolean, revealSecrets?:boolean, clear?:boolean}`
+    async fn network_logs(&self, body: &Value) -> Result<Value, String> {
+        if let Some(err) = unsupported_platform() {
+            return Err(err.to_string());
+        }
+        let typ_raw = body
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("all")
+            .to_ascii_lowercase();
+        let typ = match typ_raw.as_str() {
+            "" | "all" => "all",
+            "xhr" => "xhr",
+            "fetch" => "fetch",
+            "doc" | "document" => "doc",
+            "script" => "script",
+            "image" => "image",
+            "font" => "font",
+            "other" => "other",
+            other => {
+                return Err(format!(
+                    "unknown type: {other} (all/xhr/fetch/doc/script/image/font/other)"
+                ));
+            }
+        };
+        let status = match body.get("status") {
+            None | Some(Value::Null) => String::new(),
+            Some(Value::Number(n)) => n.to_string(),
+            Some(Value::String(s)) => s.trim().to_string(),
+            Some(other) => return Err(format!("invalid status: {other}")),
+        };
+        // 非法 status(非 2xx/3xx/4xx/5xx/纯数字)直接报参数错误,不再静默返回全部
+        streams::validate_status_filter(&status)?;
+        let group = match body
+            .get("group")
+            .and_then(|v| v.as_str())
+            .unwrap_or("burst")
+        {
+            "" | "burst" => "burst",
+            "key" => "key",
+            "none" => "none",
+            other => return Err(format!("unknown group: {other} (burst/key/none)")),
+        };
+        let search = body
+            .get("search")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let limit = num_u64(body, "limit").unwrap_or(DEFAULT_CONSOLE_LOG_LIMIT) as usize;
+        let tab = self.resolve_tab(body)?;
+        let phase = phase_arg(body)?;
+        let include_headers = bool_arg(body, "includeHeaders").unwrap_or(false);
+        let reveal_secrets = bool_arg(body, "revealSecrets").unwrap_or(false);
+        validate_reveal(include_headers, reveal_secrets)?;
+        let clear = bool_arg(body, "clear").unwrap_or(false);
+        let q = streams::NetworkQuery {
+            typ: typ.to_string(),
+            status,
+            failed: bool_arg(body, "failed"),
+            search,
+            group: group.to_string(),
+            phase,
+            tab,
+        };
+        Ok(streams::query_network(
+            &q,
+            limit,
+            include_headers,
+            reveal_secrets,
+            clear,
+        ))
+    }
+
+    /// 记录期望:只记匹配起点(**不清空** network 流,保留 `network_logs` 历史)
     async fn expect_response(&self, body: &Value) -> Result<Value, String> {
+        if let Some(err) = unsupported_platform() {
+            return Err(err.to_string());
+        }
         let pattern = body
             .get("urlPattern")
             .or_else(|| body.get("url"))
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        crate::control::responses::clear();
-        Ok(json!({ "expected": true, "pattern": pattern }))
+        let since = streams::mark_expect(&pattern);
+        Ok(json!({ "expected": true, "pattern": pattern, "since": since }))
     }
 
-    /// 断言响应:在已捕获历史中匹配 pattern(URL 子串),返回最近命中
+    /// 断言响应:在 network 流中匹配 pattern(URL 子串),返回最近命中
+    ///
+    /// 若调用过 `expect_response`,只匹配起点之后的条目(历史仍保留在 `network_logs`)。
+    /// 返回字段保持兼容:`{matched, url, status}` / `{matched:false, error}`
     async fn assert_response(&self, body: &Value) -> Result<Value, String> {
+        if let Some(err) = unsupported_platform() {
+            return Err(err.to_string());
+        }
         let pattern = body
             .get("id")
             .or_else(|| body.get("urlPattern"))
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        // 未显式传 pattern 时回退到 expect_response 记录的模式
+        let pattern = if pattern.is_empty() {
+            streams::expect_pattern().unwrap_or_default()
+        } else {
+            pattern
+        };
         if pattern.is_empty() {
             return Ok(json!({ "matched": false, "error": "no pattern provided" }));
         }
-        match crate::control::responses::find(&pattern) {
-            Some(entry) => Ok(json!({ "matched": true, "url": entry.url, "status": entry.status })),
+        match streams::find_network(&pattern, streams::expect_cursor()) {
+            Some((url, status)) => Ok(json!({ "matched": true, "url": url, "status": status })),
             None => Ok(json!({ "matched": false, "error": "no response matched the pattern yet" })),
         }
     }
 
     /// 运行时修改页面 User-Agent(Windows 通过 ICoreWebView2Settings2,其他平台报错)
     async fn set_user_agent(&self, body: &Value) -> Result<Value, String> {
-        let ua = body.get("userAgent").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let ua = body
+            .get("userAgent")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         if ua.is_empty() {
             return Err("userAgent is required".into());
         }
@@ -868,7 +1371,10 @@ impl App {
 
     /// 可访问性树:有 selector 返回该元素子树,否则整页(行为不变)
     async fn accessibility(&self, body: &Value) -> Result<Value, String> {
-        let selector = body.get("selector").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let selector = body
+            .get("selector")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         let (t, tclamped) = timeout_arg(body)?;
         let handle = self.handle.clone();
         // 带 selector 是 4 步 CDP 链,每步都用传入预算(总最坏 ≈ 4 × 单步)
@@ -891,7 +1397,11 @@ impl App {
 
     /// 新建标签:真多标签独立 Webview 并导航(工具栏/+ / target=_blank 共用逻辑)
     async fn tabs_new(&self, body: &Value) -> Result<Value, String> {
-        let url = body.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string();
+        let url = body
+            .get("url")
+            .and_then(|u| u.as_str())
+            .unwrap_or("")
+            .to_string();
         if url.is_empty() {
             return Err("url is required".into());
         }
@@ -905,7 +1415,10 @@ impl App {
         let idx = body.get("index").and_then(|v| v.as_i64()).unwrap_or(0) as usize;
         let state = self.handle.state::<crate::ui::UiState>();
         let tabs = state.tabs.lock().unwrap();
-        let tid = tabs.get(idx).map(|t| t.id).ok_or("tab index out of range")?;
+        let tid = tabs
+            .get(idx)
+            .map(|t| t.id)
+            .ok_or("tab index out of range")?;
         let url = tabs[idx].url.clone();
         drop(tabs);
         let handle = self.handle.clone();
@@ -919,7 +1432,10 @@ impl App {
         let state = self.handle.state::<crate::ui::UiState>();
         let tabs = state.tabs.lock().unwrap();
         let tid = match idx {
-            Some(i) if i >= 0 => tabs.get(i as usize).map(|t| t.id).ok_or("tab index out of range")?,
+            Some(i) if i >= 0 => tabs
+                .get(i as usize)
+                .map(|t| t.id)
+                .ok_or("tab index out of range")?,
             _ => {
                 // 不传 index:关闭当前激活标签
                 let active = *state.active_tab.lock().unwrap();
@@ -934,11 +1450,19 @@ impl App {
 
     /// 在 iframe 中点击元素
     async fn iframe_click(&self, body: &Value) -> Result<Value, String> {
-        let iframe = body.get("iframeSelector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let iframe = body
+            .get("iframeSelector")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         if iframe.is_empty() {
             return Err("iframeSelector is required".into());
         }
-        let sel = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let sel = body
+            .get("selector")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         if sel.is_empty() {
             return Err("selector is required".into());
         }
@@ -960,15 +1484,27 @@ impl App {
 
     /// 在 iframe 中填写输入框
     async fn iframe_fill(&self, body: &Value) -> Result<Value, String> {
-        let iframe = body.get("iframeSelector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let iframe = body
+            .get("iframeSelector")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         if iframe.is_empty() {
             return Err("iframeSelector is required".into());
         }
-        let sel = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let sel = body
+            .get("selector")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         if sel.is_empty() {
             return Err("selector is required".into());
         }
-        let val = body.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let val = body
+            .get("value")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let (t, tclamped) = timeout_arg(body)?;
         let handle = self.handle.clone();
         // Windows:iframe 内 focus + insertText;非 Windows:降级 DOM setter + input/change 并标注
@@ -983,7 +1519,11 @@ impl App {
     }
 
     async fn click_switch_tab(&self, body: &Value) -> Result<Value, String> {
-        let s = body.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let s = body
+            .get("selector")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         if s.is_empty() {
             return Err("selector is required".into());
         }
@@ -1008,8 +1548,13 @@ impl App {
     /// 窗口 = 内容区高 + 工具栏 TOOLBAR_HEIGHT
     /// 特殊名 `__default__`(devices::DEFAULT_DEVICE_NAME,面板首项「默认」)→ 恢复默认 UA + 内容区回 1100x628
     async fn device(&self, body: &Value) -> Result<Value, String> {
-        let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let device = crate::devices::find(&name).ok_or_else(|| format!("unknown device: {name}"))?;
+        let name = body
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let device =
+            crate::devices::find(&name).ok_or_else(|| format!("unknown device: {name}"))?;
         let handle = self.handle.clone();
         // apply 内 UA 必被处理(覆盖或恢复),失败直接报错不静默 → ua=(default) 只在真重置后才可能返回
         // 返回**实际生效**内容区(大预设被工作区钳制时 ≠ 预设值),避免返回体与真实窗口不一致
@@ -1056,7 +1601,11 @@ impl App {
     /// 因此 close/toggle-close 不再谎报 `open:false`,而是如实返回 `{open:true, supported:false}` 并留日志。
     /// 返回体固定带 `open`(真实/推定状态)与 `supported`(该平台是否支持真正关闭)。
     async fn devtools(&self, body: &Value) -> Result<Value, String> {
-        let action = body.get("action").and_then(|v| v.as_str()).unwrap_or("toggle").to_string();
+        let action = body
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("toggle")
+            .to_string();
         let state = self.handle.state::<crate::ui::UiState>();
         let mut open = state.devtools_open.lock().unwrap();
         let handle = self.handle.clone();
@@ -1161,7 +1710,11 @@ impl App {
     /// 向页面 fake 麦克风注入声音(模拟音频输入)
     /// body: { kind: tone|seq|dtmf|noise|audio|ambient|stop, ... }
     async fn media_audio(&self, body: &Value) -> Result<Value, String> {
-        let kind = body.get("kind").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let kind = body
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let js = match kind.as_str() {
             "tone" => {
                 let freq = body.get("freq").and_then(|v| v.as_f64()).unwrap_or(440.0);
@@ -1173,7 +1726,11 @@ impl App {
                 format!("(window.__btFakeMic?window.__btFakeMic.seq({notes}):0)")
             }
             "dtmf" => {
-                let digits = body.get("digits").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let digits = body
+                    .get("digits")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 format!("(window.__btFakeMic?window.__btFakeMic.dtmf({digits:?}):0)")
             }
             "noise" => {
@@ -1181,7 +1738,11 @@ impl App {
                 format!("(window.__btFakeMic?window.__btFakeMic.noise({dur}):0)")
             }
             "audio" => {
-                let data = body.get("data").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let data = body
+                    .get("data")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 if data.is_empty() {
                     return Err("data (base64 audio) is required for kind=audio".into());
                 }
@@ -1193,7 +1754,9 @@ impl App {
             "stop" => "(window.__btFakeMic?window.__btFakeMic.stop():0)".to_string(),
             "" => return Err("kind is required (tone/seq/dtmf/noise/audio/ambient/stop)".into()),
             other => {
-                return Err(format!("unknown kind: {other} (tone/seq/dtmf/noise/audio/ambient/stop)"))
+                return Err(format!(
+                    "unknown kind: {other} (tone/seq/dtmf/noise/audio/ambient/stop)"
+                ));
             }
         };
         // 同步所有页面 webview(切换标签后注入目标保持一致)
@@ -1219,17 +1782,29 @@ impl App {
     /// 向页面 fake 摄像头注入画面(模拟视频输入)
     /// body: { kind: image|video|auto|stop, ... }
     async fn media_video(&self, body: &Value) -> Result<Value, String> {
-        let kind = body.get("kind").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let kind = body
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let js = match kind.as_str() {
             "image" => {
-                let data = body.get("data").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let data = body
+                    .get("data")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 if data.is_empty() {
                     return Err("data (base64 image) is required for kind=image".into());
                 }
                 format!("(window.__btFakeCam?window.__btFakeCam.setImage({data:?}):0)")
             }
             "video" => {
-                let url = body.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let url = body
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 if url.is_empty() {
                     return Err("url is required for kind=video".into());
                 }
@@ -1277,7 +1852,10 @@ impl App {
     /// false 时只给 `hasImage` 标记不带 base64 —— 列表类调用(面板/`list_records`)无需整批图片,
     /// 只有确需内容的 `read_record_content` 才显式要图,避免几十条截图 base64 一次性塞进响应。
     async fn annotate_records(&self, body: &Value) -> Result<Value, String> {
-        let include_images = body.get("includeImages").and_then(|v| v.as_bool()).unwrap_or(false);
+        let include_images = body
+            .get("includeImages")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let state = self.handle.state::<crate::ui::UiState>();
         let records = state.records.lock().unwrap().clone();
         let list: Vec<Value> = records
@@ -1288,15 +1866,16 @@ impl App {
                 obj.insert("type".into(), json!(r.typ));
                 obj.insert("url".into(), json!(r.url));
                 obj.insert("selector".into(), json!(r.selector));
-                obj.insert("rect".into(), json!([r.rect.0, r.rect.1, r.rect.2, r.rect.3]));
+                obj.insert(
+                    "rect".into(),
+                    json!([r.rect.0, r.rect.1, r.rect.2, r.rect.3]),
+                );
                 obj.insert("note".into(), json!(r.note));
                 obj.insert("sent".into(), json!(r.sent));
                 // 每条都给 hasImage:调用方据此决定是否值得再按需取图
                 obj.insert("hasImage".into(), json!(r.image.is_some()));
                 // 仅显式要图时带上 base64(默认不带,避免整批大图塞进响应)
-                if include_images
-                    && let Some(img) = &r.image
-                {
+                if include_images && let Some(img) = &r.image {
                     obj.insert("image".into(), json!(img));
                 }
                 Value::Object(obj)
@@ -1322,7 +1901,10 @@ impl App {
             eprintln!(
                 "[send] consume-sent: {} record(s) ids={:?}",
                 items.len(),
-                items.iter().filter_map(|v| v.get("index").and_then(|x| x.as_u64())).collect::<Vec<_>>()
+                items
+                    .iter()
+                    .filter_map(|v| v.get("index").and_then(|x| x.as_u64()))
+                    .collect::<Vec<_>>()
             );
         }
         Ok(json!({ "records": items }))
@@ -1330,9 +1912,18 @@ impl App {
 
     /// 注册插件通知地址(推送式投递;附着模式或需要晚注册时使用)
     async fn set_notify_url(&self, body: &Value) -> Result<Value, String> {
-        let url = body.get("url").and_then(|u| u.as_str()).unwrap_or("").trim().to_string();
+        let url = body
+            .get("url")
+            .and_then(|u| u.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
         let state = self.handle.state::<crate::ui::UiState>();
-        *state.notify_url.lock().unwrap() = if url.is_empty() { None } else { Some(url.clone()) };
+        *state.notify_url.lock().unwrap() = if url.is_empty() {
+            None
+        } else {
+            Some(url.clone())
+        };
         if url.is_empty() {
             eprintln!("[notify] notify-url cleared");
         } else {
@@ -1345,5 +1936,49 @@ impl App {
 /// 提取字符串字段
 #[allow(dead_code)]
 fn str(body: &Value, key: &str) -> String {
-    body.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string()
+    body.get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{phase_arg, tab_id_for_index, validate_reveal};
+    use serde_json::json;
+
+    /// `--tab` 为 0 基索引:按当前标签顺序映射到内部 id,越界明确报错
+    #[test]
+    fn tab_index_maps_to_internal_id_and_rejects_overflow() {
+        let ids = [1u32, 5, 9];
+        assert_eq!(tab_id_for_index(&ids, 0).unwrap(), 1);
+        assert_eq!(tab_id_for_index(&ids, 1).unwrap(), 5);
+        assert_eq!(tab_id_for_index(&ids, 2).unwrap(), 9);
+        let err = tab_id_for_index(&ids, 3).unwrap_err();
+        assert!(err.contains("tab index out of range"), "got: {err}");
+        assert!(tab_id_for_index(&[], 0).is_err());
+    }
+
+    /// phase 参数:合法值透传,非法值报错,非字符串报错
+    #[test]
+    fn phase_argument_is_validated() {
+        assert_eq!(phase_arg(&json!({})).unwrap(), "");
+        assert_eq!(phase_arg(&json!({"phase": "load"})).unwrap(), "load");
+        assert_eq!(
+            phase_arg(&json!({"phase": "action:click"})).unwrap(),
+            "action:click"
+        );
+        assert!(phase_arg(&json!({"phase": "bogus"})).is_err());
+        assert!(phase_arg(&json!({"phase": "action:"})).is_err());
+        assert!(phase_arg(&json!({"phase": 1})).is_err());
+    }
+
+    /// revealSecrets 必须配合 includeHeaders
+    #[test]
+    fn reveal_secrets_requires_include_headers() {
+        assert!(validate_reveal(true, true).is_ok());
+        assert!(validate_reveal(false, false).is_ok());
+        let err = validate_reveal(false, true).unwrap_err();
+        assert!(err.contains("--include-headers"), "got: {err}");
+    }
 }

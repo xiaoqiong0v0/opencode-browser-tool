@@ -34,12 +34,15 @@ pub fn accessibility_tree_with(
             Some(s) if !s.is_empty() => cdp_subtree(app, s, timeout_ms),
             // 无 selector:整页(原行为)
             _ => {
-                let raw =
-                    cdp::call_json_opt(app, "Accessibility.getFullAXTree", "{}", timeout_ms)?;
+                let raw = cdp::call_json_opt(app, "Accessibility.getFullAXTree", "{}", timeout_ms)?;
                 // CDP 返回 { "nodes": [...] }
                 let v: serde_json::Value =
                     serde_json::from_str(&raw).map_err(|e| format!("parse cdp result: {e}"))?;
-                let nodes = v.get("nodes").and_then(|n| n.as_array()).cloned().unwrap_or_default();
+                let nodes = v
+                    .get("nodes")
+                    .and_then(|n| n.as_array())
+                    .cloned()
+                    .unwrap_or_default();
                 build_tree(&nodes)
             }
         }
@@ -105,7 +108,11 @@ fn cdp_subtree(
     let full_raw = cdp::call_json_opt(app, "Accessibility.getFullAXTree", "{}", timeout_ms)?;
     let full: serde_json::Value =
         serde_json::from_str(&full_raw).map_err(|e| format!("parse getFullAXTree: {e}"))?;
-    let nodes = full.get("nodes").and_then(|n| n.as_array()).cloned().unwrap_or_default();
+    let nodes = full
+        .get("nodes")
+        .and_then(|n| n.as_array())
+        .cloned()
+        .unwrap_or_default();
     if nodes.is_empty() {
         return Err("no accessibility nodes".into());
     }
@@ -407,7 +414,10 @@ fn build_tree_from(
         }
         let parent = n.get("parentId").and_then(|v| v.as_str()).unwrap_or("");
         if !parent.is_empty() {
-            children_map.entry(parent.to_string()).or_default().push(id.to_string());
+            children_map
+                .entry(parent.to_string())
+                .or_default()
+                .push(id.to_string());
         }
         id_node.insert(id.to_string(), n);
     }
@@ -415,7 +425,10 @@ fn build_tree_from(
     /// 读取 AX 节点的 name 值:CDP 的 name 对象总是存在(值为空串或缺失),
     /// 因此不能用 name.is_none() 判断"没有名字"
     fn node_name(n: &serde_json::Value) -> &str {
-        n.get("name").and_then(|m| m.get("value")).and_then(|v| v.as_str()).unwrap_or("")
+        n.get("name")
+            .and_then(|m| m.get("value"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
     }
 
     /// 拼接文本上限(与 Linux 侧 DOM_AX_JS 的 120 字符对齐)
@@ -433,8 +446,14 @@ fn build_tree_from(
             budget.truncated = true;
             return Vec::new();
         }
-        let Some(n) = id_node.get(id) else { return Vec::new() };
-        let role = n.get("role").and_then(|r| r.get("value")).and_then(|v| v.as_str()).unwrap_or("");
+        let Some(n) = id_node.get(id) else {
+            return Vec::new();
+        };
+        let role = n
+            .get("role")
+            .and_then(|r| r.get("value"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         // 先转换子节点(被过滤的节点自身不输出、其子树提升到当前层)
         let mut child_nodes: Vec<serde_json::Value> = Vec::new();
         if let Some(ids) = children_map.get(id) {
@@ -502,7 +521,9 @@ fn build_tree_from(
         }
         let mut obj = serde_json::Value::Object(node);
         if !kept.is_empty() {
-            obj.as_object_mut().unwrap().insert("children".into(), serde_json::Value::Array(kept));
+            obj.as_object_mut()
+                .unwrap()
+                .insert("children".into(), serde_json::Value::Array(kept));
         }
         vec![obj]
     }

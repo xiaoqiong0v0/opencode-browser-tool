@@ -50,29 +50,28 @@ pub fn call_json_timeout(
     page.with_webview(move |platform_webview| {
         let controller = platform_webview.controller();
         unsafe {
-            use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2;
             use webview2_com::CallDevToolsProtocolMethodCompletedHandler;
+            use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2;
 
             let webview_result: Result<ICoreWebView2, String> = controller
                 .CoreWebView2()
                 .map_err(|e| format!("get webview failed: {e}"));
             match webview_result {
-                Err(e) => { let _ = tx.send(Err(e)); }
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                }
                 Ok(webview) => {
                     let method = windows::core::HSTRING::from(method_str.as_str());
                     let params = windows::core::HSTRING::from(params_str.as_str());
                     // create 只创建回调对象(不阻塞);回调由 WebView2 派到 UI 线程执行,
                     // 内部 send 结果 —— 等待发生在下方 wait_bounded(外部线程),不嵌套泵消息
-                    let completed = CallDevToolsProtocolMethodCompletedHandler::create(
-                        Box::new(
-                            move |_result: windows::core::Result<()>, json: String| {
-                                let _ = tx2.send(Ok(json));
-                                Ok(())
-                            },
-                        ),
-                    );
-                    if let Err(e) =
-                        webview.CallDevToolsProtocolMethod(&method, &params, &completed)
+                    let completed = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(
+                        move |_result: windows::core::Result<()>, json: String| {
+                            let _ = tx2.send(Ok(json));
+                            Ok(())
+                        },
+                    ));
+                    if let Err(e) = webview.CallDevToolsProtocolMethod(&method, &params, &completed)
                     {
                         let _ = tx.send(Err(format!("CallDevToolsProtocolMethod failed: {e}")));
                     }

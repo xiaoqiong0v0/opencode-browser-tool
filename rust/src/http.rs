@@ -6,16 +6,18 @@
 //! - 带 `Origin` 头的请求:仅面板自身 origin 白名单放行(见 `PANEL_ORIGINS`),其余一律 403;
 //! - 面板 origin 的跨源预检(`OPTIONS`)回 204 + 精确 ACAO,其它 `OPTIONS` 直接 405;
 //! - 面板 origin 之外的响应不带任何 CORS 头;
-//! - 唯一令牌豁免:精确路径 `/api/page-event`(页面注入脚本无法持有令牌,详见 handler 注释)。
+//! - 唯一令牌豁免:精确路径 `/api/page-event` 与 `/api/console-log`(页面注入脚本无法持有令牌,
+//!   详见 handler 注释);后者额外限制 body ≤ 256 KiB。
 use axum::{
+    Router,
     body::Body,
-    extract::State,
-    http::{header, Method, Request, StatusCode},
+    extract::{ConnectInfo, State},
+    http::{Method, Request, StatusCode, header},
     response::Response,
     routing::any,
-    Router,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::service::App;
@@ -23,8 +25,30 @@ use crate::service::App;
 /// 鉴权令牌请求头名(大小写不敏感)
 const TOKEN_HEADER: &str = "x-bt-token";
 
-/// 页面事件桥路径:唯一的鉴权豁免路径(精确匹配,禁止前缀匹配)
+/// 页面事件桥路径:鉴权豁免路径之一(精确匹配,禁止前缀匹配)
 const PAGE_EVENT_PATH: &str = "/api/page-event";
+/// 页面 console 回传路径(Linux 注入脚本;同样豁免令牌/Origin,只写缓冲)
+const CONSOLE_LOG_PATH: &str = "/api/console-log";
+
+/// 普通请求体读取上限(10 MiB);console-log 另有 256 KiB 上限
+const MAX_REQUEST_BODY: usize = 10 * 1024 * 1024;
+
+/// 按路径取请求体上限(console-log 提前收紧,避免先读 10 MiB 再拒绝)
+fn body_limit_for(path: &str) -> usize {
+    if path == CONSOLE_LOG_PATH {
+        crate::streams::CONSOLE_UPLOAD_MAX_BYTES
+    } else {
+        MAX_REQUEST_BODY
+    }
+}
+
+/// `Content-Length` 是否已声明超限(非法/缺失头不能据此拒绝,交给有界读取兜底)
+fn declared_length_too_large(value: Option<&str>, limit: usize) -> bool {
+    value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|n| n > limit as u64)
+        .unwrap_or(false)
+}
 
 /// Chromium「私有网络访问」预检请求头:面板源(`tauri.localhost`)访问 127.0.0.1 时可能带上,
 /// 命中则需在预检响应里回 `Access-Control-Allow-Private-Network: true`,否则浏览器会拦掉实际请求
@@ -52,7 +76,10 @@ struct HttpState {
 
 /// 启动 HTTP 服务,端口写入 stdout(与 Node client.ts 协议一致)
 pub async fn serve(app: Arc<App>, port: u16, token: String) -> Result<(), String> {
-    let state = HttpState { app, token: Arc::from(token) };
+    let state = HttpState {
+        app,
+        token: Arc::from(token),
+    };
     let router = Router::new()
         .route("/api/{*path}", any(handler))
         .with_state(state);
@@ -62,13 +89,20 @@ pub async fn serve(app: Arc<App>, port: u16, token: String) -> Result<(), String
         .map_err(|e| format!("bind failed: {e}"))?;
     let addr = listener.local_addr().map_err(|e| e.to_string())?;
     println!("{}", addr.port());
-    axum::serve(listener, router)
-        .await
-        .map_err(|e| format!("serve failed: {e}"))
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .map_err(|e| format!("serve failed: {e}"))
 }
 
 /// 统一入口:页面事件豁免 → Origin → OPTIONS → 令牌 → 解析请求体 → 分发到 App::handle
-async fn handler(state: State<HttpState>, req: Request<Body>) -> Response {
+async fn handler(
+    state: State<HttpState>,
+    ConnectInfo(client_addr): ConnectInfo<SocketAddr>,
+    req: Request<Body>,
+) -> Response {
     // 页面事件桥唯一豁免(精确匹配 `/api/page-event`,不做前缀匹配):
     // - 页面 JS 无法持有令牌:注入脚本运行在远程页面源下,拿不到 shell 的 `x-bt-token`;
     // - 浏览器跨源请求必带 `Origin`(no-cors 也带,只是不带响应给页面),故必须同时豁免 Origin 校验。
@@ -96,12 +130,21 @@ async fn handler(state: State<HttpState>, req: Request<Body>) -> Response {
     let token_ok = token_matches(&req, &state.token);
 
     // 判定顺序固定:页面事件豁免 → Origin → OPTIONS → 令牌(见 decide_auth)
-    match decide_auth(req.method(), path, has_origin, panel_origin.is_some(), token_ok) {
+    match decide_auth(
+        req.method(),
+        path,
+        has_origin,
+        panel_origin.is_some(),
+        token_ok,
+    ) {
         AuthDecision::Allow => {}
         AuthDecision::ForbiddenOrigin => return auth_error(StatusCode::FORBIDDEN),
         AuthDecision::OptionsNotAllowed => return method_not_allowed(),
         AuthDecision::Unauthorized => {
-            return attach_cors(auth_error(StatusCode::UNAUTHORIZED), panel_origin.as_deref());
+            return attach_cors(
+                auth_error(StatusCode::UNAUTHORIZED),
+                panel_origin.as_deref(),
+            );
         }
         // 面板跨源预检:必须回 CORS 头,否则浏览器直接拦掉后续实际请求
         // (面板用 `Content-Type: application/json` + 自定义 `x-bt-token`,都属非简单请求,必触发预检)
@@ -117,9 +160,26 @@ async fn handler(state: State<HttpState>, req: Request<Body>) -> Response {
     }
 
     let path = path.to_string();
-    let bytes = match axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024).await {
+    let body_limit = body_limit_for(&path);
+    // 页面注入回传先看 `Content-Length`:超限直接 413,不先把 10 MiB 读进来
+    if path == CONSOLE_LOG_PATH {
+        let declared = req
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok());
+        if declared_length_too_large(declared, body_limit) {
+            return payload_too_large("console-log body too large (max 256 KiB)");
+        }
+    }
+    // 无 `Content-Length`(chunked)时同样用有界读取,超限在读取阶段直接拒绝
+    let bytes = match axum::body::to_bytes(req.into_body(), body_limit).await {
         Ok(b) => b,
-        Err(e) => return err_response(&format!("read body failed: {e}")),
+        Err(e) => {
+            if path == CONSOLE_LOG_PATH {
+                return payload_too_large("console-log body too large (max 256 KiB)");
+            }
+            return err_response(&format!("read body failed: {e}"));
+        }
     };
     let body: Value = if bytes.is_empty() {
         json!({})
@@ -127,7 +187,7 @@ async fn handler(state: State<HttpState>, req: Request<Body>) -> Response {
         serde_json::from_slice(&bytes).unwrap_or(json!({}))
     };
 
-    let result = state.app.handle(&path, body).await;
+    let result = state.app.handle(&path, body, Some(client_addr.ip())).await;
     let resp = match result {
         Ok(v) => json!({ "success": true, "data": v }),
         Err(msg) => json!({ "success": false, "error": msg }),
@@ -160,6 +220,11 @@ enum AuthDecision {
     Unauthorized,
 }
 
+/// 页面桥路径(`/api/page-event`、`/api/console-log`):令牌 + Origin 双豁免
+fn is_page_bridge_path(path: &str) -> bool {
+    path == PAGE_EVENT_PATH || path == CONSOLE_LOG_PATH
+}
+
 /// 纯函数形式的鉴权判定,固定顺序:页面事件豁免 → Origin → OPTIONS → 令牌
 ///
 /// - `has_origin`:请求是否带 `Origin` 头(即便值非 UTF-8 也算带)
@@ -171,7 +236,7 @@ fn decide_auth(
     panel_origin: bool,
     token_ok: bool,
 ) -> AuthDecision {
-    let is_page_event = path == PAGE_EVENT_PATH;
+    let is_page_event = is_page_bridge_path(path);
     // 页面事件豁免最先判定:它既不带令牌,也不受 Origin 限制
     if !is_page_event && has_origin && !panel_origin {
         return AuthDecision::ForbiddenOrigin;
@@ -266,22 +331,36 @@ fn method_not_allowed() -> Response {
         .unwrap()
 }
 
+/// 请求体超限:413(与普通业务错误区分,便于注入脚本侧识别)
+fn payload_too_large(msg: &str) -> Response {
+    Response::builder()
+        .status(StatusCode::PAYLOAD_TOO_LARGE)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({ "success": false, "error": msg }).to_string(),
+        ))
+        .unwrap()
+}
+
 fn err_response(msg: &str) -> Response {
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(json!({ "success": false, "error": msg }).to_string()))
+        .body(Body::from(
+            json!({ "success": false, "error": msg }).to_string(),
+        ))
         .unwrap()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        attach_cors, decide_auth, is_panel_origin, preflight_response, AuthDecision, PAGE_EVENT_PATH,
+        AuthDecision, PAGE_EVENT_PATH, attach_cors, decide_auth, is_panel_origin,
+        preflight_response,
     };
     use axum::{
         body::Body,
-        http::{header, Method, StatusCode},
+        http::{Method, StatusCode, header},
         response::Response,
     };
 
@@ -369,20 +448,26 @@ mod tests {
         );
     }
 
-    /// page-event 豁免最先生效:非面板 Origin、无令牌也能放行(但 OPTIONS 仍 405)
+    /// page-event / console-log 豁免最先生效:非面板 Origin、无令牌也能放行(但 OPTIONS 仍 405)
     #[test]
-    fn page_event_exemption_wins_first() {
-        assert_eq!(
-            decide_auth(&Method::POST, PAGE_EVENT_PATH, true, false, false),
-            AuthDecision::Allow
-        );
-        assert_eq!(
-            decide_auth(&Method::OPTIONS, PAGE_EVENT_PATH, true, false, false),
-            AuthDecision::OptionsNotAllowed
-        );
+    fn page_bridge_exemption_wins_first() {
+        for p in [PAGE_EVENT_PATH, "/api/console-log"] {
+            assert_eq!(
+                decide_auth(&Method::POST, p, true, false, false),
+                AuthDecision::Allow
+            );
+            assert_eq!(
+                decide_auth(&Method::OPTIONS, p, true, false, false),
+                AuthDecision::OptionsNotAllowed
+            );
+        }
         // 前缀相似路径不在豁免范围
         assert_eq!(
             decide_auth(&Method::POST, "/api/page-event/x", true, false, false),
+            AuthDecision::ForbiddenOrigin
+        );
+        assert_eq!(
+            decide_auth(&Method::POST, "/api/console-log/x", true, false, false),
             AuthDecision::ForbiddenOrigin
         );
     }
@@ -398,12 +483,18 @@ mod tests {
             Some("http://tauri.localhost")
         );
         assert_eq!(
-            resp.headers().get(header::VARY).and_then(|v| v.to_str().ok()),
+            resp.headers()
+                .get(header::VARY)
+                .and_then(|v| v.to_str().ok()),
             Some("Origin")
         );
 
         let resp = attach_cors(Response::new(Body::empty()), None);
-        assert!(resp.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
+        assert!(
+            resp.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none()
+        );
     }
 
     /// 预检响应:204 + 精确 origin 回显 + 允许 x-bt-token 头,绝不通配
@@ -424,12 +515,12 @@ mod tests {
             .unwrap_or_default()
             .to_ascii_lowercase();
         assert!(allow_headers.contains("x-bt-token"), "got: {allow_headers}");
-        assert!(allow_headers.contains("content-type"), "got: {allow_headers}");
+        assert!(
+            allow_headers.contains("content-type"),
+            "got: {allow_headers}"
+        );
         // 未请求私有网络访问时不回该头(保持最小授予)
-        assert!(resp
-            .headers()
-            .get(super::PNA_ALLOW_HEADER)
-            .is_none());
+        assert!(resp.headers().get(super::PNA_ALLOW_HEADER).is_none());
     }
 
     /// Chromium 私有网络预检:请求要求时补回允许头
@@ -442,5 +533,36 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("true")
         );
+    }
+
+    /// console-log 用 256 KiB 上限,其它端点 10 MiB;Content-Length 提前判定超限
+    #[test]
+    fn console_upload_body_limits_are_checked_early() {
+        use super::{body_limit_for, declared_length_too_large};
+
+        assert_eq!(
+            body_limit_for("/api/console-log"),
+            crate::streams::CONSOLE_UPLOAD_MAX_BYTES
+        );
+        assert_eq!(body_limit_for("/api/network-logs"), 10 * 1024 * 1024);
+
+        let console_limit = crate::streams::CONSOLE_UPLOAD_MAX_BYTES;
+        assert!(!declared_length_too_large(None, console_limit));
+        assert!(!declared_length_too_large(Some("not-a-number"), console_limit));
+        assert!(!declared_length_too_large(
+            Some(&(console_limit as u64).to_string()),
+            console_limit
+        ));
+        assert!(declared_length_too_large(
+            Some(&(console_limit as u64 + 1).to_string()),
+            console_limit
+        ));
+    }
+
+    /// 413 响应体与状态码符合约定
+    #[test]
+    fn payload_too_large_is_413() {
+        let resp = super::payload_too_large("too big");
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }

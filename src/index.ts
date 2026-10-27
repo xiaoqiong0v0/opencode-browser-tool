@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, readdirSync, unlinkSync, mkdirSync, rmSync, existsSync } from "fs";
+import { readFileSync, writeFileSync, readdirSync, unlinkSync, mkdirSync, rmSync, existsSync, statSync } from "fs";
 import { resolve } from "path";
 import stringArgv from "string-argv";
 import { parseArgs } from "node:util";
@@ -11,13 +11,29 @@ import { registerLocale, tf } from "./i18n/index.js";
 import en from "./i18n/en.js";
 import zh from "./i18n/zh.js";
 import {
-  configureService, setAppDirectory, setServiceReadyHandler, setSessionIdResolver, setTitleResolver,
+  configureService, setAppDirectory, getAppDirectory, setServiceReadyHandler, setSessionIdResolver, setTitleResolver,
   resolveSessionId, openWindow, isRunning, isStarting, closeSession, closeAllSessions, clearClosedState, service, probeStatus,
   clearAttachNotifyForSid,
 } from "./client.js";
 import { startNotifyServer } from "./notify-server.js";
 import { startDownload, getBinaryStatus, describeBinaryStatus } from "./binary.js";
 import { sanitizeForModel } from "./util/sanitize.js";
+import {
+  EVAL_ITEM_MAX_BYTES, EVAL_TOTAL_MAX_BYTES, classifyEvalArgs, runEvalItems,
+  type EvalFileRead, type EvalItem,
+} from "./util/eval-items.js";
+import {
+  INJECT_RULE_MAX_BYTES, buildInjectItems, formatInjectAdd, formatInjectList, formatInjectTest,
+  injectAddIssue, injectRuleLimitIssue, normalizeInjectAction,
+  type InjectItem, type InjectRulesData,
+} from "./util/inject-rules.js";
+import {
+  formatConsoleItems, formatNetworkItems, renderLogText,
+  type ConsoleLogItem, type NetworkLogItem, type LogStreamData,
+} from "./util/log-format.js";
+import {
+  TYPE_TEXT_MAX_BYTES, resolveTypeText, typeTextIssue, formatTypeOutput,
+} from "./util/type-text.js";
 import { tool, type Plugin } from "@opencode-ai/plugin";
 import { log } from "./logger.js";
 import { createSessionIDCache, extractSessionIDFromEvent } from "./session-id.js";
@@ -74,14 +90,15 @@ function reachedNote(r: any): string {
   });
 }
 
-/** CLI 命令参数定义:flag=参数名,type=类型(string/boolean) */
-type CmdArg = { flag: string; type?: "string" | "boolean" };
-/** CLI 命令定义:usage=参数用法,descKey=命令描述 i18n 键(cli.cmd.*),args=可解析的 flag 表,run=执行 */
+/** CLI 命令参数定义:flag=参数名,type=类型(string/boolean),multiple=可重复传入(值恒为数组) */
+type CmdArg = { flag: string; type?: "string" | "boolean"; multiple?: boolean };
+/** CLI 命令定义:usage=参数用法,descKey=命令描述 i18n 键(cli.cmd.*),args=可解析的 flag 表,
+ *  run=执行(第二个入参是该命令的位置参数,只有 evaluate 使用,其余命令忽略) */
 type CmdDef = {
   usage: string;
   descKey: string;
   args?: CmdArg[];
-  run: (a: any) => Promise<any>;
+  run: (a: any, positionals: string[]) => Promise<any>;
 };
 
 /** 命令表:bt_cli 按 command 分发;命令描述全部走 i18n 键,帮助按 toolLang 本地化 */
@@ -108,6 +125,314 @@ function timeoutNote(a: any): string {
   return c === n ? "" : _t("cli.note.timeout_clamped", { ms: c });
 }
 
+/** evaluate 请求体：脚本 + 会话 id + 已钳制的 timeout（CLI 专用 flag 不下发） */
+function evalPayload(a: any, script: string): Record<string, any> {
+  const p: Record<string, any> = { script, _sessionId: a._sessionId };
+  if (a.timeout !== undefined) p.timeout = a.timeout;
+  return p;
+}
+
+/** `@file:` 允许目录：全局 tmp + 指定会话 tmp（sid 形态非法时回落 default 桶，防止路径越界） */
+function allowedFileDirs(browserSid: string): { globalTmpDir: string; dirs: string[] } {
+  const fileSid = SESSION_SID_RE.test(browserSid) ? browserSid : "default";
+  const globalTmpDir = getTmpDir();
+  return { globalTmpDir, dirs: [globalTmpDir, getSessionTmpDir(fileSid)] };
+}
+
+/** 文件项读取的错误文案键集合（evaluate / inject 共用读取与 containment 逻辑，仅文案前缀不同） */
+type FileReadKeys = { outside: string; tooLarge: string; totalTooLarge: string; notAFile: string; readFailed: string };
+
+/** `evaluate` 文件项错误文案键 */
+const EVAL_FILE_KEYS: FileReadKeys = {
+  outside: "cli.err.eval_file_outside",
+  tooLarge: "cli.err.eval_file_too_large",
+  totalTooLarge: "cli.err.eval_total_too_large",
+  notAFile: "cli.err.eval_not_a_file",
+  readFailed: "cli.read_file_failed",
+};
+
+/** `inject` 文件项错误文案键（读取/containment 逻辑复用 evaluate，上限换为单规则口径） */
+const INJECT_FILE_KEYS: FileReadKeys = {
+  outside: "cli.err.inject_file_outside",
+  tooLarge: "cli.err.inject_file_too_large",
+  totalTooLarge: "cli.err.inject_rule_too_large",
+  notAFile: "cli.err.eval_not_a_file",
+  readFailed: "cli.err.inject_read_failed",
+};
+
+/** `type --text @file:` 错误文案键（读取/containment 逻辑复用 evaluate，文案前缀换成 type） */
+const TYPE_FILE_KEYS: FileReadKeys = {
+  outside: "cli.err.type_file_outside",
+  tooLarge: "cli.err.type_file_too_large",
+  totalTooLarge: "cli.err.type_file_total_too_large",
+  notAFile: "cli.err.eval_not_a_file",
+  readFailed: "cli.err.type_read_failed",
+};
+
+/**
+ * 读取一个文件项（evaluate 的 `@file:<path>` / inject 的 `--file <path>`）。
+ *
+ * 安全边界：先做 containment 校验（工作区目录 / 全局 tmp / 会话 tmp 之内），不通过**直接拒绝且不读取**；
+ * 相对路径的基准是**工作区目录**（不是插件 cwd）。再校验单文件 ≤256KB、合计 ≤`totalMaxBytes`
+ * （默认 1MB；inject 传单规则上限）。
+ *
+ * @param pathArg 模型传入的路径（原样用于文案回显）
+ * @param ctx workspaceDir=工作区目录（可能为空）、allowedDirs=允许目录、usedBytes=已累计字节、
+ *   totalMaxBytes=合计上限（缺省 `EVAL_TOTAL_MAX_BYTES`）
+ * @param keys 错误文案键集合（缺省 evaluate 的一套）
+ * @returns 读到的脚本文本与字节数，或错误文案
+ */
+function readEvalFile(
+  pathArg: string,
+  ctx: { workspaceDir: string; allowedDirs: string[]; usedBytes: number; totalMaxBytes?: number },
+  keys: FileReadKeys = EVAL_FILE_KEYS,
+): EvalFileRead {
+  const abs = ctx.workspaceDir ? resolve(ctx.workspaceDir, pathArg) : resolve(pathArg);
+  if (!ctx.allowedDirs.some((d) => isInsideDir(abs, d))) {
+    return { error: _t(keys.outside, { path: pathArg }) };
+  }
+  const totalMax = ctx.totalMaxBytes && ctx.totalMaxBytes > 0 ? ctx.totalMaxBytes : EVAL_TOTAL_MAX_BYTES;
+  let size = 0;
+  try {
+    const st = statSync(abs);
+    if (!st.isFile()) {
+      return { error: _t(keys.readFailed, { path: pathArg, msg: _t(keys.notAFile) }) };
+    }
+    size = st.size;
+  } catch (e: any) {
+    return { error: _t(keys.readFailed, { path: pathArg, msg: sanitizeForModel(e?.message || String(e)) }) };
+  }
+  if (size > EVAL_ITEM_MAX_BYTES) {
+    return { error: _t(keys.tooLarge, { path: pathArg, kb: EVAL_ITEM_MAX_BYTES / 1024 }) };
+  }
+  if (ctx.usedBytes + size > totalMax) {
+    return { error: _t(keys.totalTooLarge, { path: pathArg, kb: totalMax / 1024 }) };
+  }
+  try {
+    const buf = readFileSync(abs);
+    // stat 与 read 之间文件可能变大：以实际读到的字节数再判一次总量
+    if (ctx.usedBytes + buf.byteLength > totalMax) {
+      return { error: _t(keys.totalTooLarge, { path: pathArg, kb: totalMax / 1024 }) };
+    }
+    return { content: buf.toString("utf-8"), bytes: buf.byteLength };
+  } catch (e: any) {
+    return { error: _t(keys.readFailed, { path: pathArg, msg: sanitizeForModel(e?.message || String(e)) }) };
+  }
+}
+
+/**
+ * `evaluate` 多客户端项的插件侧装配：把 IO（文件读取 / 浏览器调用）注入 `runEvalItems`。
+ *
+ * - 文件项在执行前统一读入（累计字节数受 `EVAL_TOTAL_MAX_BYTES` 约束）：任一项失败整次不执行脚本
+ * - `--continue-on-error` 决定某项失败后是否继续执行后续项
+ *
+ * @param a 已解析命令参数（`_sessionId` / `timeout` / `continue-on-error`）
+ * @param items 有序执行项
+ * @returns 报告文本（不含 timeout 提示，由调用方追加）
+ */
+async function runEvalCommand(a: any, items: EvalItem[]): Promise<string> {
+  const workspaceDir = getAppDirectory();
+  const { dirs: tmpDirs } = allowedFileDirs(a._sessionId);
+  const allowedDirs = workspaceDir ? [...tmpDirs, workspaceDir] : tmpDirs;
+  let usedBytes = 0;
+  return runEvalItems(items, {
+    readFile: (path: string): EvalFileRead => {
+      const read = readEvalFile(path, { workspaceDir, allowedDirs, usedBytes });
+      if (!("error" in read)) usedBytes += read.bytes;
+      return read;
+    },
+    evaluate: (script: string) => service.evaluate(evalPayload(a, script)),
+    continued: a["continue-on-error"] === true,
+  });
+}
+
+/** 把 `parseArgs` 的 `multiple` 结果（单值 / 数组 / 未传）统一成非空字符串数组 */
+function toStringList(v: unknown): string[] {
+  if (v === undefined || v === null) return [];
+  const arr = Array.isArray(v) ? v : [v];
+  return arr.map((x) => String(x)).filter((s) => s.length > 0);
+}
+
+/**
+ * 读取 inject 的文件项（复用 evaluate 的 containment / 体积校验，仅换文案与单规则上限）。
+ *
+ * @param a 已解析命令参数（用 `_sessionId` 定位会话 tmp 桶）
+ * @param files `--file` 路径列表（按传入顺序）
+ * @returns 读入成功的文件源列表，或可直接回模型的错误文案
+ */
+function readInjectFiles(a: any, files: string[]): { sources: Array<{ path: string; code: string }> } | { error: string } {
+  const workspaceDir = getAppDirectory();
+  const { dirs: tmpDirs } = allowedFileDirs(a._sessionId);
+  const allowedDirs = workspaceDir ? [...tmpDirs, workspaceDir] : tmpDirs;
+  const sources: Array<{ path: string; code: string }> = [];
+  let usedBytes = 0;
+  for (const path of files) {
+    // 单规则上限 = items 合计上限（契约 256 KiB），故这里把「合计」直接按其判定
+    const read = readEvalFile(
+      path,
+      { workspaceDir, allowedDirs, usedBytes, totalMaxBytes: INJECT_RULE_MAX_BYTES },
+      INJECT_FILE_KEYS,
+    );
+    if ("error" in read) return { error: read.error };
+    usedBytes += read.bytes;
+    sources.push({ path, code: read.content });
+  }
+  return { sources };
+}
+
+/**
+ * `inject add`：读文件 → 构造 items → 校验上限 → POST `/api/inject/rules`。
+ *
+ * - `--file` 只允许工作区目录 / 插件 tmp（与 evaluate 同 containment）；单条 ≤256 KiB
+ * - 文件内容转成 `{kind:"text", code, name:"<basename>"}`，`--text` 的 name 固定 `text`；
+ *   Rust 只收到内容，不接触路径
+ * - `--disabled` 等价 `enabled:false`；`--order` 缺省时不下发（由 Rust 取默认）
+ *
+ * @param a 已解析命令参数
+ * @returns 回模型的单行结果文本
+ */
+async function runInjectAdd(a: any): Promise<string> {
+  const match = typeof a.match === "string" ? a.match.trim() : "";
+  const files = toStringList(a.file);
+  const texts = toStringList(a.text);
+  const issue = injectAddIssue(match, files.length, texts.length);
+  if (issue === "no_match") return _t("cli.err.inject_match_required");
+  if (issue === "no_items") return _t("cli.err.inject_no_items");
+
+  const read = readInjectFiles(a, files);
+  if ("error" in read) return read.error;
+  const items: InjectItem[] = buildInjectItems(read.sources, texts);
+  const over = injectRuleLimitIssue(items);
+  if (over) return _t("cli.err.inject_items_too_large", { kb: over.kb });
+
+  const payload: Record<string, any> = { action: "add", match, items, enabled: a.disabled !== true };
+  if (a.order !== undefined) payload.order = a.order;
+  const data = (await service.injectRules(payload)) as InjectRulesData | undefined;
+  return formatInjectAdd(data?.rule);
+}
+
+/**
+ * `inject remove|enable|disable`：按 id 变更单条规则（`--id` 必填）。
+ *
+ * @param a 已解析命令参数
+ * @param action 子动作
+ * @returns 回模型的单行结果文本
+ */
+async function runInjectMutate(a: any, action: "remove" | "enable" | "disable"): Promise<string> {
+  const id = typeof a.id === "string" ? a.id.trim() : "";
+  if (!id) return _t("cli.err.inject_id_required");
+  const data = (await service.injectRules({ action, id })) as InjectRulesData | undefined;
+  const n = (data?.rules ?? []).length;
+  const key = action === "remove" ? "cli.out.inject_removed" : action === "enable" ? "cli.out.inject_enabled" : "cli.out.inject_disabled";
+  return _t(key, { id, n });
+}
+
+/**
+ * `inject` 子命令分发（未给子动作时按只读的 `list` 处理）。
+ *
+ * @param a 已解析命令参数
+ * @param positionals 位置参数（第一个是子动作）
+ * @returns 回模型的文本
+ */
+async function runInject(a: any, positionals: string[]): Promise<string> {
+  const action = normalizeInjectAction(positionals[0]);
+  switch (action) {
+    case "add":
+      return runInjectAdd(a);
+    case "list": {
+      const data = (await service.injectRules({ action: "list" })) as InjectRulesData | undefined;
+      return (data?.rules ?? []).length > 0 ? formatInjectList(data) : _t("cli.out.inject_empty");
+    }
+    case "remove":
+    case "enable":
+    case "disable":
+      return runInjectMutate(a, action);
+    case "clear":
+      await service.injectRules({ action: "clear" });
+      return _t("cli.out.inject_cleared");
+    case "test": {
+      const url = typeof a.url === "string" ? a.url.trim() : "";
+      if (!url) return _t("cli.err.inject_url_required");
+      return formatInjectTest(await service.injectTest({ url }));
+    }
+    default:
+      return _t("cli.err.inject_unknown_action", { action });
+  }
+}
+
+/**
+ * `type`：向当前焦点插入文本（不清空），可选先聚焦 selector、插入后回车。
+ *
+ * `--text` 支持 `@file:<path>`：走 `evaluate` 同一套读取与 containment（工作区目录 / 插件 tmp），
+ * 内容不进模型上下文。文本校验（空 / 超 8 KiB）在插件侧先做一次，避免把注定失败的请求发下去。
+ *
+ * @param a 已解析命令参数（`text` / `selector` / `enter` / `timeout`）
+ * @returns 回模型的单行结果文本
+ */
+async function runType(a: any): Promise<string> {
+  const tn = timeoutNote(a);
+  const raw = typeof a.text === "string" ? a.text : "";
+  if (!raw) return _t("cli.err.type_text_required");
+
+  const workspaceDir = getAppDirectory();
+  const { dirs: tmpDirs } = allowedFileDirs(a._sessionId);
+  const allowedDirs = workspaceDir ? [...tmpDirs, workspaceDir] : tmpDirs;
+  const resolved = resolveTypeText(raw, (path) =>
+    readEvalFile(path, { workspaceDir, allowedDirs, usedBytes: 0 }, TYPE_FILE_KEYS),
+  );
+  if ("error" in resolved) return resolved.error;
+
+  const issue = typeTextIssue(resolved.text);
+  if (issue === "required") return _t("cli.err.type_text_required");
+  if (issue === "too_large") return _t("cli.err.type_text_too_large", { kb: TYPE_TEXT_MAX_BYTES / 1024 });
+
+  const selector = typeof a.selector === "string" ? a.selector : "";
+  const entered = a.enter === true;
+  const r = await service.typeText({
+    text: resolved.text,
+    selector,
+    enter: entered,
+    _sessionId: a._sessionId,
+    ...(a.timeout !== undefined ? { timeout: a.timeout } : {}),
+  });
+  return formatTypeOutput(r?.inserted ?? 0, selector, entered) + tn;
+}
+
+/** console_logs 请求体：只挑契约字段（CLI 专用 flag 不下发；`--no-dedupe` 等价 `--group=none`） */
+function consoleLogParams(a: any): Record<string, any> {
+  const p: Record<string, any> = { _sessionId: a._sessionId };
+  if (a.type !== undefined) p.type = a.type;
+  if (a["no-dedupe"] === true) p.group = "none";
+  else if (a.group !== undefined) p.group = a.group;
+  if (a.phase !== undefined) p.phase = a.phase;
+  if (a.search !== undefined) p.search = a.search;
+  if (a.limit !== undefined) p.limit = a.limit;
+  if (a.tab !== undefined) p.tab = a.tab;
+  if (a["include-internal"] === true) p.includeInternal = true;
+  if (a.clear === true) p.clear = true;
+  return p;
+}
+
+/** network_logs 请求体：`--status` 纯数字转 number（契约允许 `2xx|…|N`） */
+function networkLogParams(a: any): Record<string, any> {
+  const p: Record<string, any> = { _sessionId: a._sessionId };
+  if (a.type !== undefined) p.type = a.type;
+  if (a.status !== undefined && a.status !== "") {
+    p.status = /^\d+$/.test(String(a.status)) ? Number(a.status) : a.status;
+  }
+  if (a.failed === true) p.failed = true;
+  if (a.phase !== undefined) p.phase = a.phase;
+  if (a.search !== undefined) p.search = a.search;
+  if (a["no-dedupe"] === true) p.group = "none";
+  else if (a.group !== undefined) p.group = a.group;
+  if (a.limit !== undefined) p.limit = a.limit;
+  if (a.tab !== undefined) p.tab = a.tab;
+  if (a["include-headers"] === true) p.includeHeaders = true;
+  if (a["reveal-secrets"] === true) p.revealSecrets = true;
+  if (a.clear === true) p.clear = true;
+  return p;
+}
+
 const COMMANDS: Record<string, CmdDef> = {
   navigate: { usage: "--url", descKey: "cli.cmd.navigate", args: [{ flag: "url" }], run: async (a) => {
     const r = await service.navigate(a);
@@ -121,6 +446,8 @@ const COMMANDS: Record<string, CmdDef> = {
   hover: { usage: "--selector [--timeout ms]", descKey: "cli.cmd.hover", args: [{ flag: "selector" }, { flag: "timeout" }], run: async (a) => { const tn = timeoutNote(a); const r = await service.hover(a); return _t("cli.out.hover") + degradedNote(r) + tn; } },
   drag: { usage: "--sourceSelector --targetSelector [--timeout ms]", descKey: "cli.cmd.drag", args: [{ flag: "sourceSelector" }, { flag: "targetSelector" }, { flag: "timeout" }], run: async (a) => { const tn = timeoutNote(a); await service.drag(a); return _t("cli.out.drag") + tn; } },
   press_key: { usage: "--key [--selector] [--timeout ms]", descKey: "cli.cmd.press_key", args: [{ flag: "key" }, { flag: "selector" }, { flag: "timeout" }], run: async (a) => { const tn = timeoutNote(a); await service.pressKey(a); return _t("cli.out.press_key", { key: a.key }) + tn; } },
+  // type:向当前焦点插入文本(不清空);--text 支持 @file:<path>,--enter 插入后回车
+  type: { usage: "--text <text|@file:path> [--selector] [--enter] [--timeout ms]", descKey: "cli.cmd.type", args: [{ flag: "text" }, { flag: "selector" }, { flag: "enter", type: "boolean" }, { flag: "timeout" }], run: async (a) => runType(a) },
   upload_file: { usage: "--selector --filePath [--timeout ms]", descKey: "cli.cmd.upload_file", args: [{ flag: "selector" }, { flag: "filePath" }, { flag: "timeout" }], run: async (a) => { const tn = timeoutNote(a); await service.uploadFile(a); return _t("cli.out.upload_file") + tn; } },
   screenshot: { usage: "[--selector] [--timeout ms]", descKey: "cli.cmd.screenshot", args: [{ flag: "selector" }, { flag: "timeout" }], run: async (a) => {
     const tn = timeoutNote(a);
@@ -130,8 +457,35 @@ const COMMANDS: Record<string, CmdDef> = {
     const note = (r as any)?.beyondViewport ? _t("cli.note.beyond") : "";
     return { output: _t("cli.out.screenshot", { where }) + note + reachedNote(r) + stableNote(r) + tn, attachments: [{ type: "file", mime: r.mime || "image/png", url: `data:${r.mime || "image/png"};base64,${r.base64}` }] };
   } },
-  // evaluate:超时最常用(脚本 await 慢操作);超时返回明确 eval timeout 错误,不再恒 5s
-  evaluate: { usage: "--script [--timeout ms]", descKey: "cli.cmd.evaluate", args: [{ flag: "script" }, { flag: "timeout" }], run: async (a) => { const tn = timeoutNote(a); return JSON.stringify(await service.evaluate(a), null, 2) + tn; } },
+  // evaluate:支持「多文件 + 内联文本混合、按顺序串行执行」;只给 --script 时保持 1.12.0 的输出格式
+  evaluate: {
+    usage: "[--script <js>] [<js-text>|@file:<path>]... [--continue-on-error] [--timeout ms]",
+    descKey: "cli.cmd.evaluate",
+    args: [{ flag: "script" }, { flag: "continue-on-error", type: "boolean" }, { flag: "timeout" }],
+    run: async (a, positionals) => {
+      const tn = timeoutNote(a);
+      // 旧行为:单项 --script(位置参数与它互斥,同时给会有顺序歧义 → 报错)
+      if (a.script !== undefined && positionals.length === 0) {
+        return JSON.stringify(await service.evaluate(evalPayload(a, a.script)), null, 2) + tn;
+      }
+      const parsed = classifyEvalArgs(positionals, a.script !== undefined);
+      if (!parsed.ok) {
+        return _t(parsed.reason === "script_conflict" ? "cli.err.eval_script_conflict" : "cli.err.eval_no_items");
+      }
+      return (await runEvalCommand(a, parsed.items)) + tn;
+    },
+  },
+  // inject:持久注入规则(插件侧契约 + Rust 端点);子动作见 usage,add 支持重复 --file/--text
+  inject: {
+    usage: "[add --match <glob|re:...> [--file <path>]... [--text <code>]... [--order N] [--disabled] | list | remove|enable|disable --id <id> | clear | test --url <url>]",
+    descKey: "cli.cmd.inject",
+    args: [
+      { flag: "match" }, { flag: "file", multiple: true }, { flag: "text", multiple: true },
+      { flag: "order" }, { flag: "disabled", type: "boolean" },
+      { flag: "id" }, { flag: "url" },
+    ],
+    run: async (a, positionals) => runInject(a, positionals),
+  },
   get_visible_text: { usage: "[--selector]", descKey: "cli.cmd.get_visible_text", args: [{ flag: "selector" }], run: async (a) => (await service.visibleText(a))?.text || _t("cli.out.no_visible_text") },
   get_visible_html: { usage: "[--selector --removeScripts --removeComments --maxLength]", descKey: "cli.cmd.get_visible_html", args: [{ flag: "selector" }, { flag: "removeScripts", type: "boolean" }, { flag: "removeComments", type: "boolean" }, { flag: "maxLength" }], run: async (a) => {
     // 宿主要求 tool 返回字符串;服务端返回对象 {html,truncated},这里取出 html 文本本体
@@ -141,7 +495,34 @@ const COMMANDS: Record<string, CmdDef> = {
     // 被截断时追加提示:html.length 即服务端实际生效的 maxLength(已 slice),无需再传参
     return r?.truncated ? `${html}\n${_t("cli.out.html_truncated", { n: html.length })}` : html;
   } },
-  console_logs: { usage: "[--type --search --limit --clear]", descKey: "cli.cmd.console_logs", args: [{ flag: "type" }, { flag: "search" }, { flag: "limit" }, { flag: "clear", type: "boolean" }], run: async (a) => { const r = await service.consoleLogs(a); return (r.logs || []).join("\n") || _t("cli.out.no_logs"); } },
+  console_logs: {
+    usage: "[--type --group burst|none --phase --search --limit --tab --include-internal --clear --no-dedupe]",
+    descKey: "cli.cmd.console_logs",
+    args: [
+      { flag: "type" }, { flag: "group" }, { flag: "phase" }, { flag: "search" }, { flag: "limit" },
+      { flag: "tab" }, { flag: "include-internal", type: "boolean" },
+      { flag: "clear", type: "boolean" }, { flag: "no-dedupe", type: "boolean" },
+    ],
+    run: async (a) => {
+      const r = await service.consoleLogs(consoleLogParams(a)) as LogStreamData<ConsoleLogItem> | undefined;
+      return renderLogText(formatConsoleItems(r?.items), r?.dropped) || _t("cli.out.console_empty");
+    },
+  },
+  network_logs: {
+    usage: "[--type --status 2xx|3xx|4xx|5xx|N --failed --search --group burst|key|none --phase --limit --tab --include-headers --reveal-secrets --clear --no-dedupe]",
+    descKey: "cli.cmd.network_logs",
+    args: [
+      { flag: "type" }, { flag: "status" }, { flag: "failed", type: "boolean" }, { flag: "search" }, { flag: "phase" },
+      { flag: "group" }, { flag: "limit" }, { flag: "tab" },
+      { flag: "include-headers", type: "boolean" }, { flag: "reveal-secrets", type: "boolean" },
+      { flag: "clear", type: "boolean" }, { flag: "no-dedupe", type: "boolean" },
+    ],
+    run: async (a) => {
+      const r = await service.networkLogs(networkLogParams(a)) as LogStreamData<NetworkLogItem> | undefined;
+      const lines = formatNetworkItems(r?.items, { includeHeaders: a["include-headers"] === true });
+      return renderLogText(lines, r?.dropped) || _t("cli.out.network_empty");
+    },
+  },
   go_back: { usage: "", descKey: "cli.cmd.go_back", run: async (a) => { const r = await service.goBack(sidArgs(a)); return _t("cli.out.go_back", { url: r.url }) + readyNote(r); } },
   go_forward: { usage: "", descKey: "cli.cmd.go_forward", run: async (a) => { const r = await service.goForward(sidArgs(a)); return _t("cli.out.go_forward", { url: r.url }) + readyNote(r); } },
   // resize:宽高=内容区(视口)尺寸;被钳到下限时如实标注(服务端返回 clamped/content/window)
@@ -282,7 +663,7 @@ function buildHelp(): string {
   const lines = Object.entries(COMMANDS).map(
     ([k, v]) => `  ${k.padEnd(22)} ${v.usage.padEnd(42)} ${_t(v.descKey)}`,
   );
-  const examples = [_t("cli.example.1"), _t("cli.example.2"), _t("cli.example.3"), _t("cli.example.4")]
+  const examples = [_t("cli.example.1"), _t("cli.example.2"), _t("cli.example.3"), _t("cli.example.4"), _t("cli.example.5")]
     .map((e) => `  ${e}`)
     .join("\n");
   return `${_t("cli.header")}\n\n${_t("cli.usage")}\n\n${_t("cli.usage.flags")}\n\n${_t("cli.commands")}\n${lines.join("\n")}\n\n${_t("cli.examples")}\n${examples}`;
@@ -294,16 +675,20 @@ const DESC_INDEX = Object.entries(COMMANDS).map(([k, v]) => `${k} ${v.usage}`).j
 /** 解析 --flag 风格参数(基于 node:util.parseArgs,未知 flag 报错;tokens 已由 string-argv 正确分词)
  * 全局 flag `--private-session` 对所有命令可用,由调用方消费(不进入命令业务参数)。
  *
+ * 位置参数不再丢弃:返回 `{ values, positionals }`,供 `evaluate` 按顺序执行多客户端项使用;
+ * 其它命令沿用旧行为(位置参数不参与执行)。
+ *
  * `parseArgs` 默认把值解析成字符串,而 Rust 端对下列 flag 用 `as_i64`/`as_f64` 读取
  * (取不到就落默认值/0):不转换会静默失效(如 `resize --width 800` 被钳到下限)。
  * 因此这里对已知数值 flag 统一转 number;非数字直接报错,不带着坏值进浏览器。 */
-function parseFlagArgs(tokens: string[], def: CmdDef): Record<string, any> {
-  if (tokens.length === 0) return {};
+function parseFlagArgs(tokens: string[], def: CmdDef): { values: Record<string, any>; positionals: string[] } {
+  if (tokens.length === 0) return { values: {}, positionals: [] };
   // 全局 boolean flag 先声明,避免被当作未知参数;若它出现在某个 string flag 之后,
   // parseArgs 会把它当成该 flag 的值(与用户显式传值一致,不会误判为私有会话)。
   const options: Record<string, any> = { "private-session": { type: "boolean" } };
   for (const arg of def.args || []) options[arg.flag] = { type: arg.type || "string" };
-  const { values } = parseArgs({ args: tokens, options, allowPositionals: true });
+  for (const arg of def.args || []) if (arg.multiple) options[arg.flag].multiple = true;
+  const { values, positionals } = parseArgs({ args: tokens, options, allowPositionals: true });
   for (const key of Object.keys(values)) {
     if (!NUMERIC_FLAGS.has(key)) continue;
     const raw = values[key];
@@ -314,11 +699,11 @@ function parseFlagArgs(tokens: string[], def: CmdDef): Record<string, any> {
     }
     (values as Record<string, any>)[key] = n;
   }
-  return values;
+  return { values, positionals };
 }
 
 /** 需要转成 number 的 flag(Rust 端按数值读取;新增数值参数时必须同步登记) */
-const NUMERIC_FLAGS = new Set(["width", "height", "index", "freq", "durMs"]);
+const NUMERIC_FLAGS = new Set(["width", "height", "index", "freq", "durMs", "limit", "tab", "order"]);
 
 /** 简单 CSV 行解析(处理引号包裹的字段,Edge/Chrome 密码导出格式) */
 function splitCsvLine(line: string): string[] {
@@ -439,9 +824,12 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree, directory 
               if (!def) return `${_t("cli.unknown").replace("{cmd}", cmdName)}\n\n${buildHelp()}`;
               // 剩余 token 交给 parseArgs 解析(未知 flag 会抛错,返回用法提示自愈)
               let params: Record<string, any> = {};
+              let positionals: string[] = [];
               if (tokens.length > 0) {
                 try {
-                  params = parseFlagArgs(tokens, def);
+                  const parsed = parseFlagArgs(tokens, def);
+                  params = parsed.values;
+                  positionals = parsed.positionals;
                 } catch (e: any) {
                   // 解析错误可能夹带底层异常文本:进模型前先脱敏(用法提示本身不含路径)
                   return `${_t("cli.invalid_args").replace("{cmd}", cmdName).replace("{msg}", sanitizeForModel(e?.message || String(e)))}\n\nUsage: bt_cli({ args: "${cmdName} ${def.usage}" })`;
@@ -461,15 +849,14 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree, directory 
               // (密码等敏感值不进 LLM 上下文,如 fill --value @file:C:\...\secret.tmp)
               // 安全边界:只允许读全局 tmp(getTmpDir)或**该会话(归并后 key)** tmp(getSessionTmpDir)之内的文件;
               // 其余路径一律拒绝(不读取),避免模型借助 @file: 读取任意本地文件。
-              // sid 形态校验:归并 key 来自会话树/外部传入值,任意字符串(含 .. 、路径分隔符)
-              // 会把 getSessionTmpDir 带到 sessions 目录之外,从而左右 allowed dirs。不匹配 SESSION_SID_RE
-              // 一律回退 "default" 桶("default" 本身合法,getSessionTmpDir("default") = sessions/<profile>/default/tmp,必在 sessions 内)。
-              const fileSid = SESSION_SID_RE.test(browserSid) ? browserSid : "default";
-              const globalTmpDir = getTmpDir();
-              const allowedTmpDirs = [globalTmpDir, getSessionTmpDir(fileSid)];
+              // 允许目录由 allowedFileDirs 统一计算(其中做了 sid 形态校验,非法 sid 回落 default 桶)。
+              const { globalTmpDir, dirs: allowedTmpDirs } = allowedFileDirs(browserSid);
               for (const key of Object.keys(params)) {
                 const v = params[key];
                 if (typeof v === "string" && v.startsWith("@file:")) {
+                  // `type` 的 `--text` 自带 evaluate 同款解析（允许工作区目录 + 插件 tmp，且不删文件），
+                  // 故跳过这里的「仅插件 tmp」通用层，避免两套规则叠加（通用层还会删掉全局 tmp 文件）。
+                  if (cmdName === "type" && key === "text") continue;
                   const p = v.slice(6);
                   const abs = resolve(p);
                   if (!allowedTmpDirs.some((d) => isInsideDir(abs, d))) {
@@ -491,7 +878,7 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree, directory 
               setAppDirectory(context?.directory || "");
               params._sessionId = browserSid;
               try {
-                return await def.run(params);
+                return await def.run(params, positionals);
               } catch (e: any) {
                 // 命令失败可能带 fs/网络错误文本:统一脱敏后再回模型
                 return `${_t("cli.failed").replace("{cmd}", cmdName).replace("{msg}", sanitizeForModel(e?.message || String(e)))}`;
