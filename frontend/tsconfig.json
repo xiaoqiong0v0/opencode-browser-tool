@@ -8,6 +8,8 @@
     "noEmit": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
+    // 允许 `./x.ts` 形式导入(单测用 node 直接跑 TS 源,需显式扩展名)
+    "allowImportingTsExtensions": true,
     "forceConsistentCasingInFileNames": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true

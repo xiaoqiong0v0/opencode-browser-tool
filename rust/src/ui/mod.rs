@@ -252,6 +252,19 @@ const PAGE_EVENT_JS: &str = r##"
 })();
 "##;
 
+/// 新标签页右键菜单屏蔽(注入页面 Webview,Windows/Linux 同)
+///
+/// 新标签页与真实页面共用 page webview,设置层无法按页面区分,故在页面内按当前 URL 判定:
+/// 本实例的内部新标签页(`window.__btNewtabUrl`)才 `preventDefault`,真实页面保留默认菜单。
+const NEWTAB_CONTEXT_MENU_JS: &str = r##"
+(function(){
+  addEventListener("contextmenu",function(e){
+    var u=window.__btNewtabUrl||"";
+    if(u&&location.href.indexOf(u)===0)e.preventDefault();
+  },false);
+})();
+"##;
+
 /// 生成页面 Webview 的注入脚本(页面桥 + 媒体模拟 + 事件上报 + 可选 console 猴补)
 ///
 /// console 采集来源按平台分工(1.12.0):
@@ -260,7 +273,7 @@ const PAGE_EVENT_JS: &str = r##"
 fn page_init_script(label: &str, port: u16) -> String {
     #[allow(unused_mut)]
     let mut script = format!(
-        "window.__btEventPort={port};window.__btPageLabel=\"{label}\";\n{PAGE_BRIDGE_JS}{MEDIA_FAKE_JS}{PAGE_EVENT_JS}"
+        "window.__btEventPort={port};window.__btPageLabel=\"{label}\";window.__btNewtabUrl=\"{NEWTAB_URL}\";\n{PAGE_BRIDGE_JS}{MEDIA_FAKE_JS}{PAGE_EVENT_JS}{NEWTAB_CONTEXT_MENU_JS}"
     );
     #[cfg(target_os = "linux")]
     if crate::capture::console_inject_enabled() {
@@ -761,6 +774,58 @@ fn with_data_dir<R: Runtime>(
     }
 }
 
+/// 是否禁用该 webview 的默认右键(浏览器)菜单
+///
+/// 只对 shell 自己的 UI webview 生效;页面 webview(`page-N`)保留默认菜单(用户/模型可能要用)。
+/// 新标签页(newtab.html)跑在 page webview 内,按 label 无法区分,故由
+/// [`NEWTAB_CONTEXT_MENU_JS`] 在页面内按 URL 兜底屏蔽(两端同)。
+pub fn disables_default_context_menu(label: &str) -> bool {
+    label == TOOLBAR_WEBVIEW || label == PANEL_WEBVIEW || label == OVERLAY_WEBVIEW
+}
+
+/// 给 UI webview 关掉默认右键菜单(失败只记日志,不影响界面)
+///
+/// Windows:`ICoreWebView2Settings::AreDefaultContextMenusEnabled(false)`;
+/// Linux:WebKitGTK 无对应 Settings 项,改用 `context-menu` 信号返回 `true`(不弹默认菜单)。
+fn configure_ui_webview(webview: &tauri::webview::Webview, label: &str) {
+    if !disables_default_context_menu(label) {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        let name = label.to_string();
+        let _ = webview.with_webview(move |platform_webview| unsafe {
+            let controller = platform_webview.controller();
+            let result = controller
+                .CoreWebView2()
+                .and_then(|core| core.Settings())
+                .and_then(|settings| settings.SetAreDefaultContextMenusEnabled(false));
+            match result {
+                Ok(()) => eprintln!("[ui] default context menu disabled: {name}"),
+                Err(e) => eprintln!("[ui] default context menu disable failed ({name}): {e}"),
+            }
+        });
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use webkit2gtk::WebViewExt;
+
+        let name = label.to_string();
+        let _ = webview.with_webview(move |platform_webview| {
+            let view = platform_webview.inner();
+            // 返回 true = 不弹默认菜单;页面 Webview 不连该信号
+            view.connect_context_menu(move |_view, _menu, _event, _hit| {
+                eprintln!("[ui] default context menu suppressed: {name}");
+                true
+            });
+        });
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = webview;
+    }
+}
+
 /// 创建主窗口 + 四 Webview(工具栏/页面/覆盖层/面板)
 /// 布局以窗口实际物理尺寸为准(避免 DPI 感知时序导致窗口与子 webview 缩放不一致)
 /// `title`:可选窗口标题覆盖(默认 "bt-shell";多会话实例用它在任务栏分辨)
@@ -794,6 +859,8 @@ pub fn create_ui(app: &AppHandle, service_port: u16, title: Option<&str>) -> tau
         tauri::PhysicalSize::new(100, 100),
     )?;
     let _ = toolbar.hide();
+    // UI webview:关掉默认右键菜单(页面 webview 保留)
+    configure_ui_webview(&toolbar, TOOLBAR_WEBVIEW);
 
     // 2. 页面 Webview(工具栏下方,渲染目标网页 + 注入页面桥)
     // 真多标签:预创建 MAX_TABS 个 page webview(全部先隐藏,布局定位后仅显示第 1 个),
@@ -841,6 +908,8 @@ pub fn create_ui(app: &AppHandle, service_port: u16, title: Option<&str>) -> tau
         // 注册媒体权限放行(摄像头/麦克风统一放行)
         #[cfg(any(windows, target_os = "linux"))]
         crate::control::media::setup(app, &w);
+        // 注册下载采集(1.13.0:Windows WebView2 DownloadStarting / Linux WebKit download-started)
+        crate::downloads::setup_page(app, &w);
     }
     // 初始标签绑定 webview label
     {
@@ -864,9 +933,11 @@ pub fn create_ui(app: &AppHandle, service_port: u16, title: Option<&str>) -> tau
     )?;
     // 初始隐藏覆盖层:默认非批注模式,隐藏时不拦截鼠标(页面可正常交互),批注模式开启时显示
     overlay.hide()?;
+    // UI webview:关掉默认右键菜单(页面 webview 保留)
+    configure_ui_webview(&overlay, OVERLAY_WEBVIEW);
 
     // 4. 面板 Webview(覆盖式浮层,默认隐藏,由工具栏按钮切换)
-    window.add_child(
+    let panel = window.add_child(
         with_data_dir(
             WebviewBuilder::new(PANEL_WEBVIEW, WebviewUrl::App("index.html".into())),
             &data_dir,
@@ -874,6 +945,8 @@ pub fn create_ui(app: &AppHandle, service_port: u16, title: Option<&str>) -> tau
         tauri::PhysicalPosition::new(100, 0),
         tauri::PhysicalSize::new(100, 100),
     )?;
+    // UI webview:关掉默认右键菜单(面板里没有任何需要浏览器菜单的操作)
+    configure_ui_webview(&panel, PANEL_WEBVIEW);
 
     // Linux: tauri/wry 把子 webview pack 进窗口 GtkBox(expand),set_position/set_size 失效;
     // 统一迁移到自建 gtk::Fixed 后,apply_layout 才能用 move_/set_size_request 绝对定位。
@@ -1321,6 +1394,8 @@ pub fn create_tab_webview(app: &AppHandle, id: u32) -> Result<tauri::webview::We
     // 注册媒体权限放行(摄像头/麦克风统一放行)
     #[cfg(any(windows, target_os = "linux"))]
     crate::control::media::setup(app, &w);
+    // 注册下载采集(1.13.0:Windows WebView2 DownloadStarting / Linux WebKit download-started)
+    crate::downloads::setup_page(app, &w);
     // Linux: 新页面 webview 迁入 gtk::Fixed 绝对定位,并重新置顶浮层(避免新页面盖住 overlay/panel)
     #[cfg(target_os = "linux")]
     {
@@ -1401,6 +1476,37 @@ pub fn emit_tabs_changed(app: &AppHandle) {
         "tabs-changed",
         serde_json::json!({ "tabs": tabs, "active": active, "panel_open": panel_open }),
     );
+}
+
+/// 确保面板可见(供工具栏切换与 Tauri 命令复用)
+///
+/// 行为:面板 webview 不存在 → 记日志并返回 `false`(安全跳过,不报错);
+/// 已打开 → 直接返回 `true`(不重复播放滑入动画);未打开 → 退出批注/截图模式(与遮罩互斥)
+/// → 显示覆盖层 → 展开面板。
+///
+/// 返回:面板是否处于可见状态
+pub fn show_panel(app: &AppHandle) -> bool {
+    if panel_webview(app).is_none() {
+        eprintln!("[ui] show_panel skipped: panel webview absent");
+        return false;
+    }
+    let state = app.state::<UiState>();
+    if *state.panel_open.lock().unwrap() {
+        return true;
+    }
+    // 面板与批注/截图模式互斥(覆盖层会挡住面板)
+    let annotate = *state.annotate_mode.lock().unwrap();
+    if annotate {
+        let _ = annotate::Annotator::toggle(app, &state);
+    }
+    let shot = *state.shot_mode.lock().unwrap();
+    if shot {
+        let _ = annotate::Annotator::toggle_shot(app, &state);
+    }
+    // 显示透明覆盖层 + 面板滑入动画(遮罩盖页面区,点击遮罩关闭面板)
+    show_overlay(app);
+    open_panel(app);
+    true
 }
 
 /// 打开面板:展开尺寸 + 遮罩盖页面区 + 广播状态
@@ -1996,6 +2102,42 @@ mod tests {
         assert_eq!(queue.len(), SENT_QUEUE_MAX);
         assert_eq!(queue.first().unwrap()["index"].as_u64(), Some(4));
         assert_eq!(queue.last().unwrap()["index"].as_u64(), Some(total));
+    }
+
+    /// 右键菜单判定:只有 shell 自己的 UI webview 禁用,页面 webview 保留
+    #[test]
+    fn ui_webviews_disable_default_context_menu() {
+        use super::{
+            MAX_TABS, OVERLAY_WEBVIEW, PANEL_WEBVIEW, PAGE_WEBVIEW, TOOLBAR_WEBVIEW,
+            disables_default_context_menu,
+        };
+
+        assert!(disables_default_context_menu(TOOLBAR_WEBVIEW));
+        assert!(disables_default_context_menu(PANEL_WEBVIEW));
+        assert!(disables_default_context_menu(OVERLAY_WEBVIEW));
+        // 页面 webview(预创建 + 动态标签)一律保留默认菜单
+        assert!(!disables_default_context_menu(PAGE_WEBVIEW));
+        assert!(!disables_default_context_menu(&format!("{PAGE_WEBVIEW}-1")));
+        assert!(!disables_default_context_menu(&format!(
+            "{PAGE_WEBVIEW}-{MAX_TABS}"
+        )));
+        assert!(!disables_default_context_menu(&format!(
+            "{PAGE_WEBVIEW}-{}",
+            MAX_TABS + 1
+        )));
+    }
+
+    /// 新标签页的右键屏蔽按 URL 生效:脚本里带着本实例的 newtab 地址
+    #[test]
+    fn newtab_script_guards_context_menu_by_url() {
+        use super::{NEWTAB_CONTEXT_MENU_JS, NEWTAB_URL, page_init_script};
+
+        let script = page_init_script("page-1", 4321);
+        assert!(script.contains(NEWTAB_URL), "注入脚本应带新标签页地址");
+        assert!(script.contains("contextmenu"));
+        assert!(NEWTAB_CONTEXT_MENU_JS.contains("preventDefault"));
+        // 只在当前文档是新标签页时拦截(真实页面保留默认菜单)
+        assert!(NEWTAB_CONTEXT_MENU_JS.contains("location.href.indexOf(u)===0"));
     }
 
     /// 池成员判定:仅 page-1..page-MAX_TABS 命中(决定关闭时保留还是销毁)

@@ -109,13 +109,26 @@
         background: color-mix(in srgb, var(--btn-bg) 80%, var(--fg) 10%); color: var(--btn-fg); cursor: pointer; font-size: 14px;
       }
       .nav-btn:hover { background: var(--btn-hover); }
+      /* 地址栏容器:占满剩余宽度,清空按钮绝对定位在其内部(不占流内空间,窄模式不挤压、不换行) */
+      .addr-wrap { position: relative; flex: 1; min-width: 60px; display: flex; align-items: center; }
       #addr {
-        flex: 1; min-width: 60px; padding: 5px 10px; border: 1px solid var(--border);
+        flex: 1; width: 100%; min-width: 0; padding: 5px 26px 5px 10px; border: 1px solid var(--border);
         border-radius: 14px; /* 输入框保留胶囊圆角 */
         background: var(--bg); color: var(--btn-fg); font: 13px system-ui; outline: none;
         transition: color 0.15s, border-color 0.15s;
       }
       #addr:focus { color: var(--fg); border-color: var(--accent); }
+      /* 清空按钮:仅在有输入时显示(JS 置 hidden),点击清空并聚焦 */
+      .addr-clear {
+        position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+        width: 16px; height: 16px; padding: 0; border: 0; border-radius: 50%;
+        display: flex; align-items: center; justify-content: center;
+        background: color-mix(in srgb, var(--bg) 70%, var(--fg) 25%); color: var(--btn-fg);
+        cursor: pointer; opacity: 0.75;
+      }
+      .addr-clear:hover { opacity: 1; background: var(--btn-hover); }
+      .addr-clear[hidden] { display: none; }
+      .addr-clear svg { width: 10px; height: 10px; }
       #btn-panel {
         flex-shrink: 0; padding: 5px 10px; border: 1px solid var(--border); border-radius: 14px;
         background: var(--btn-bg); color: var(--btn-fg); cursor: pointer; font: 13px system-ui;
@@ -132,8 +145,29 @@
       .tool-btn svg { width: 14px; height: 14px; }
       .tool-btn:hover { background: var(--btn-hover); }
       .tool-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
-      /* 窄模式(工具栏 webview 宽=窗口逻辑宽):批注/截图/面板按钮去文字只留图标,避免 nav-row 溢出。
-         阈值与 Rust `ui::NARROW_MODE_MAX_W`(480) 同步维护:Rust 侧 win_w < 480 → 面板填满 + 本媒体查询生效 */
+      /* 下载按钮数字角标:绝对定位在按钮右上角(不占流内空间,不撑宽按钮、不撑高导航行),
+         仅显示进行中数量;数量为 0 时由 JS 置 hidden 隐藏。
+         z-index 让角标盖住右侧相邻的「面板」按钮,避免 99+ 时被其背景遮挡 */
+      #btn-downloads { position: relative; z-index: 1; }
+      .dl-badge {
+        position: absolute; top: -5px; right: -5px;
+        min-width: 15px; height: 15px; padding: 0 3px; box-sizing: border-box;
+        display: inline-flex; align-items: center; justify-content: center;
+        border-radius: 8px; background: #e81123; color: #fff;
+        font: 600 10px/1 system-ui, sans-serif; letter-spacing: 0;
+        pointer-events: none; /* 角标不拦截点击,点角标等同点按钮 */
+      }
+      .dl-badge[hidden] { display: none; }
+      /* 新下载开始:角标脉冲 1s(时长与 toolbar.ts 的 BADGE_PULSE_MS 同步维护) */
+      @keyframes dl-badge-pulse {
+        0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(232, 17, 35, 0.7); }
+        50% { transform: scale(1.35); }
+        100% { transform: scale(1); box-shadow: 0 0 0 6px rgba(232, 17, 35, 0); }
+      }
+      .dl-badge.pulse { animation: dl-badge-pulse 1s ease-out; }
+      /* 窄模式(工具栏 webview 宽=窗口逻辑宽):批注/截图/下载/面板按钮去文字只留图标,避免 nav-row 溢出。
+         阈值与 Rust `ui::NARROW_MODE_MAX_W`(480) 同步维护:Rust 侧 win_w < 480 → 面板填满 + 本媒体查询生效
+         注意:角标不是 .btn-label,窄模式下仍然显示 */
       @media (max-width: 479px) {
         .btn-label { display: none; }
       }
@@ -164,10 +198,18 @@
       <div id="btn-back" class="nav-btn" title="后退"><i data-lucide="arrow-left"></i></div>
       <div id="btn-forward" class="nav-btn" title="前进"><i data-lucide="arrow-right"></i></div>
       <div id="btn-reload" class="nav-btn" title="刷新"><i data-lucide="rotate-cw"></i></div>
-      <input id="addr" placeholder="输入地址，回车导航" spellcheck="false" />
-      <!-- 批注/截图/面板:文字包 span.btn-label(窄模式媒体查询隐藏;裸文本节点无法用 CSS 隐藏) -->
+      <!-- 地址栏:清空按钮(×)叠在输入框右侧;有内容时显示,空时隐藏 -->
+      <div class="addr-wrap">
+        <input id="addr" placeholder="输入地址，回车导航" spellcheck="false" />
+        <button id="addr-clear" class="addr-clear" type="button" hidden title="清空地址栏" aria-label="清空地址栏">
+          <i data-lucide="x"></i>
+        </button>
+      </div>
+      <!-- 批注/截图/下载/面板:文字包 span.btn-label(窄模式媒体查询隐藏;裸文本节点无法用 CSS 隐藏) -->
       <button id="btn-annotate" class="tool-btn" title="批注模式(点击元素标注)"><i data-lucide="pen-line"></i><span class="btn-label">批注</span></button>
       <button id="btn-shot" class="tool-btn" title="立即截图"><i data-lucide="camera"></i><span class="btn-label">截图</span></button>
+      <!-- 下载:角标显示进行中数量;点击由 Rust 显示面板并切到下载视图(不在工具栏做下拉) -->
+      <button id="btn-downloads" class="tool-btn" title="下载"><i data-lucide="download"></i><span class="btn-label">下载</span><span id="dl-badge" class="dl-badge" hidden></span></button>
       <button id="btn-panel" title="功能面板"><i data-lucide="settings"></i><span class="btn-label">面板</span></button>
     </div>
     <script src="toolbar.js"></script>

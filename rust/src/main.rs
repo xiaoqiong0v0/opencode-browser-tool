@@ -18,10 +18,12 @@ use tauri::{Listener, Manager, State};
 const TOKEN_FILE_NAME: &str = "bt-auth-token";
 
 /// 解析命令行参数(兼容旧 Node 服务协议)
-/// 返回 (browsers_path, port, user_data_dir, notify_url, title, token)
+/// 返回 (browsers_path, port, user_data_dir, notify_url, title, token, download_dir, session_name)
 fn parse_args() -> (
     String,
     u16,
+    Option<String>,
+    Option<String>,
     Option<String>,
     Option<String>,
     Option<String>,
@@ -37,6 +39,10 @@ fn parse_args() -> (
     let mut title: Option<String> = None;
     // HTTP API 鉴权令牌:显式 --token 优先(缺省时由 resolve_auth_token 依次回落环境变量/随机)
     let mut token: Option<String> = None;
+    // 下载目录默认值(1.13.0;插件传入,可为模板;<sessionDataDir>/download-dir.txt 优先)
+    let mut download_dir: Option<String> = None;
+    // 会话名称(用于 <sname> 占位符;缺省回退到 sid)
+    let mut session_name: Option<String> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -76,11 +82,32 @@ fn parse_args() -> (
                     token = Some(args[i].clone());
                 }
             }
+            "--download-dir" => {
+                i += 1;
+                if i < args.len() {
+                    download_dir = Some(args[i].clone());
+                }
+            }
+            "--session-name" => {
+                i += 1;
+                if i < args.len() {
+                    session_name = Some(args[i].clone());
+                }
+            }
             _ => {}
         }
         i += 1;
     }
-    (browsers_path, port, user_data_dir, notify_url, title, token)
+    (
+        browsers_path,
+        port,
+        user_data_dir,
+        notify_url,
+        title,
+        token,
+        download_dir,
+        session_name,
+    )
 }
 
 /// 解析事件流配置(1.12.0):env 为底,命令行 `--console-buffer-mb/--network-buffer-mb/
@@ -303,6 +330,50 @@ fn panel_service_port(state: State<ui::UiState>) -> u16 {
     *state.service_port.lock().unwrap()
 }
 
+/// 面板「打开文件夹」:用系统文件管理器打开下载目录(Windows explorer.exe / Linux xdg-open)
+#[tauri::command]
+fn panel_open_download_dir(path: String) -> Result<(), String> {
+    let dir = path.trim();
+    if dir.is_empty() {
+        return Err("path is required".to_string());
+    }
+    #[cfg(windows)]
+    {
+        std::process::Command::new("explorer.exe")
+            .arg(dir)
+            .spawn()
+            .map_err(|_| "failed to open download directory".to_string())?;
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(dir)
+            .spawn()
+            .map_err(|_| "failed to open download directory".to_string())?;
+        Ok(())
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = dir;
+        Err("opening download directory is not supported on macOS".to_string())
+    }
+}
+
+/// 面板显示「下载」视图:先确保面板可见,再广播 `downloads-view-requested`(payload `{}`)
+///
+/// 面板 webview 未创建时安全跳过(只记日志,不报错);广播失败按错误回给调用方,
+/// 面板本身已展开,不影响用户手动查看。
+#[tauri::command]
+fn panel_show_downloads(app: tauri::AppHandle) -> Result<(), String> {
+    if !ui::show_panel(&app) {
+        return Ok(());
+    }
+    use tauri::Emitter;
+    app.emit(bt_shell::downloads::VIEW_EVENT, serde_json::json!({}))
+        .map_err(|e| format!("emit {} failed: {e}", bt_shell::downloads::VIEW_EVENT))
+}
+
 /// 面板读取 API 令牌所用的受管状态(实例创建期确定,运行期只读)
 struct ApiToken(Arc<str>);
 
@@ -477,18 +548,8 @@ fn toolbar_toggle_panel(
     let now = !*open;
     drop(open);
     if now {
-        // 打开面板时退出批注/截图模式(模式与遮罩互斥,避免覆盖层遮挡)
-        let annotate = *state.annotate_mode.lock().unwrap();
-        if annotate {
-            let _ = Annotator::toggle(&app, &state);
-        }
-        let shot = *state.shot_mode.lock().unwrap();
-        if shot {
-            let _ = Annotator::toggle_shot(&app, &state);
-        }
-        // 显示透明覆盖层 + 面板滑入动画(遮罩盖页面区,点击遮罩关闭面板)
-        ui::show_overlay(&app);
-        ui::open_panel(&app);
+        // 打开面板(退出批注/截图模式 + 遮罩 + 展开布局,逻辑与 Tauri 命令 panel_show_downloads 共用)
+        ui::show_panel(&app);
     } else {
         ui::close_panel(&app);
     }
@@ -533,7 +594,18 @@ fn main() {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
 
-    let (browsers_path, port, user_data_dir, notify_url, title, cli_token) = parse_args();
+    let (
+        browsers_path,
+        port,
+        user_data_dir,
+        notify_url,
+        title,
+        cli_token,
+        download_dir,
+        session_name,
+    ) = parse_args();
+    // 会话名称:命令行优先,其次环境变量(供 <sname> 占位符)
+    let session_name = session_name.or_else(|| std::env::var("BT_SESSION_NAME").ok());
 
     // 事件流配置(console/network 缓冲与聚合窗口):必须在 create_ui 前确定
     // (create_ui 依此决定是否注入 console 猴补)。
@@ -567,6 +639,8 @@ fn main() {
             panel_cmd,
             panel_mode,
             panel_service_port,
+            panel_open_download_dir,
+            panel_show_downloads,
             api_token,
             panel_set_theme,
             toolbar_state,
@@ -592,6 +666,18 @@ fn main() {
                     *state.notify_url.lock().unwrap() = notify_url.clone();
                 }
             }
+            // 下载目录与采集(1.13.0):必须在 create_ui 前初始化,页面 webview 创建时挂下载采集
+            let dl_dir = bt_shell::downloads::init(bt_shell::downloads::StartupConfig::from_args(
+                user_data_dir.as_deref(),
+                download_dir.as_deref(),
+                session_name.as_deref().unwrap_or(""),
+            ));
+            eprintln!(
+                "[downloads] ready dir={} limit={}",
+                dl_dir.display(),
+                bt_shell::downloads::history_limit()
+            );
+
             // 创建 Webview 布局(工具栏/页面/覆盖层/面板);title 用于多会话实例在任务栏可分辨
             ui::create_ui(app.handle(), port, title.as_deref())?;
 
@@ -624,9 +710,11 @@ fn main() {
         })
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
-        .run(|_app, event| {
-            if let tauri::RunEvent::ExitRequested { .. } = event {
-                // TODO: 清理浏览器状态
+        .run(|_app, event| match event {
+            // 退出路径:防抖窗口可能还没到,这里强制把下载记录写盘(无待写变更时为空操作)
+            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
+                bt_shell::downloads::flush_history();
             }
+            _ => {}
         });
 }

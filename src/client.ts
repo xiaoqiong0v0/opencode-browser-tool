@@ -12,7 +12,7 @@ import { fileURLToPath } from "url";
 import { log } from "./logger.js";
 import { getNotifyUrlForSession } from "./notify-server.js";
 import { tf } from "./i18n/index.js";
-import { getLogStreamEnv, getWebviewEnv } from "./config/index.js";
+import { getLogStreamEnv, getWebviewEnv, resolveDownloadSpawnConfig } from "./config/index.js";
 
 import { cachedBinaryPath, describeBinaryStatus, ensureBinary } from "./binary.js";
 import { sanitizeForModel } from "./util/sanitize.js";
@@ -216,21 +216,23 @@ export function isRunning(sid?: string): boolean {
   return !!attachInstance?.ready;
 }
 
-/** 组装窗口标题:优先会话标题(有界等待),拿不到用 sid 后 6 位,保证任务栏可分辨 */
-async function resolveWindowTitle(sid: string): Promise<string> {
+/**
+ * 取会话标题(有界等待,不阻塞启动):拿不到/超时/为空时回退 sid 后 6 位。
+ * 下载目录模板的 `<sname>` 与窗口标题(`bt-shell · <标题>`)共用这一份来源,保证口径一致。
+ */
+async function resolveSessionTitle(sid: string): Promise<string> {
   const suffix = sid.length > 6 ? sid.slice(-6) : sid || "main";
-  const fallback = `bt-shell · ${suffix}`;
-  if (!titleResolver) return fallback;
+  if (!titleResolver) return suffix;
   try {
     const t = await Promise.race([
       Promise.resolve().then(() => titleResolver!(sid)),
       new Promise<string | null>((r) => setTimeout(() => r(null), TITLE_RESOLVE_TIMEOUT_MS)),
     ]);
-    if (t && t.trim()) return `bt-shell · ${t.trim()}`;
+    if (t && t.trim()) return t.trim();
   } catch {
     // 标题拿不到就用后缀,绝不因此失败
   }
-  return fallback;
+  return suffix;
 }
 
 /**
@@ -333,7 +335,11 @@ async function resolveShellPath(): Promise<string> {
 async function spawnForSession(sid: string, shell: string): Promise<ShellInstance> {
   const cfg = serviceConfig;
   const dataDir = cfg?.resolveDataDir ? cfg.resolveDataDir(sid) : "";
-  const title = await resolveWindowTitle(sid);
+  // 会话标题同时用于窗口标题与下载目录模板的 <sname>(同一份有界等待结果)
+  const sessionName = await resolveSessionTitle(sid);
+  const title = `bt-shell · ${sessionName}`;
+  // 下载目录(1.13.0):插件侧展开模板后以 --download-dir 传入;每组历史上限走 env
+  const download = resolveDownloadSpawnConfig(sid, sessionName);
   // 本实例的鉴权令牌:16 字节 → 32 hex;端口重试沿用同一令牌(新的子进程仍是同一实例语义)
   const token = randomBytes(16).toString("hex");
   let lastErr: unknown = null;
@@ -352,6 +358,8 @@ async function spawnForSession(sid: string, shell: string): Promise<ShellInstanc
     ];
     // 每会话独立 user-data-dir(WebView2 profile 隔离);未提供则不传(回落 WebView2 默认目录)
     if (dataDir) args.push("--user-data-dir", dataDir);
+    // 下载目录:模板已由插件展开(见 resolveDownloadSpawnConfig);持久化文件优先于本参数
+    args.push("--download-dir", download.dir);
     // 推送式投递:注册**本会话**的通知地址 → 通知按 sid 归属
     const notifyUrl = getNotifyUrlForSession(sid);
     if (notifyUrl) args.push("--notify-url", notifyUrl);
@@ -360,7 +368,10 @@ async function spawnForSession(sid: string, shell: string): Promise<ShellInstanc
     try {
       // 日志流配置(1.12.0)以 env 传给 shell:console/network 缓冲预算、network 聚合窗口、
       // Linux 注入开关。附着模式不在本函数(不 spawn → 不传,配置由外部启动者负责)。
-      const env = { ...process.env, ...getLogStreamEnv(), ...getWebviewEnv() };
+      const env = { ...process.env, ...getLogStreamEnv(), ...getWebviewEnv(), ...download.env };
+      // 目录已展开并随 --download-dir 传入:移除 env 里的模板,避免 shell 用另一套规则二次展开
+      // (Rust 侧 env 优先级高于命令行参数,留着会让两处口径不一致)
+      delete env.BT_DOWNLOAD_DIR;
       proc = spawn(shell, args, { stdio: ["ignore", "pipe", "pipe"], env });
     } catch (e) {
       // spawn 同步失败(如文件被锁):换不含路径的文案,避免绝对路径经错误消息回流模型
@@ -918,6 +929,9 @@ export const service = {
   notify: cmd("notify"),
   consoleLogs: cmd("console-logs"),
   networkLogs: cmd("network-logs"),
+  // 下载列表 / 下载目录(1.13.0):/api/downloads、/api/download-dir
+  downloads: cmd("downloads"),
+  downloadDir: cmd("download-dir"),
   expectResponse: cmd("expect-response"),
   assertResponse: cmd("assert-response"),
   panelConfig: cmd("panel-config"),

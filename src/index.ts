@@ -34,6 +34,10 @@ import {
 import {
   TYPE_TEXT_MAX_BYTES, resolveTypeText, typeTextIssue, formatTypeOutput,
 } from "./util/type-text.js";
+import {
+  formatDownloads, buildDownloadsPayload, buildDownloadDirPayload, downloadsLimitIssue,
+  type DownloadsLabels, type DownloadsSnapshot, type DownloadDeleteResult,
+} from "./util/downloads.js";
 import { tool, type Plugin } from "@opencode-ai/plugin";
 import { log } from "./logger.js";
 import { createSessionIDCache, extractSessionIDFromEvent } from "./session-id.js";
@@ -433,6 +437,102 @@ function networkLogParams(a: any): Record<string, any> {
   return p;
 }
 
+/** 下载列表输出用的文案（状态名 / 不确定标注 / 空态；util 不依赖 i18n） */
+function downloadsLabels(): DownloadsLabels {
+  return {
+    empty: _t("cli.out.downloads_empty"),
+    unknownSize: _t("cli.out.downloads_unknown_size"),
+    states: {
+      progress: _t("cli.out.downloads_state_progress"),
+      completed: _t("cli.out.downloads_state_completed"),
+      failed: _t("cli.out.downloads_state_failed"),
+      canceled: _t("cli.out.downloads_state_canceled"),
+    },
+  };
+}
+
+/** 快照里的条目总数（`--clear` 后用于说明“保留了几条进行中”） */
+function countDownloadItems(data: DownloadsSnapshot | undefined): number {
+  return (data?.groups ?? []).reduce(
+    (n, g) => n + (Array.isArray(g?.items) ? g.items.length : 0),
+    0,
+  );
+}
+/**
+ * `downloads`：列出本会话下载（按目录分组），或取消/清空/删除单条。
+ *
+ * - `--limit N`：每组最多返回 N 条（正整数，插件侧先校验，不下发坏值）
+ * - `--cancel <id>`：取消进行中的下载；shell 明确报错时原样带回原因
+ * - `--clear`：清空已完成/失败记录（进行中保留）
+ * - `--delete <id>`：删除一条已结束的记录并删除磁盘文件；进行中会被 shell 拒绝
+ *
+ * @param a 已解析命令参数
+ * @returns 回模型的多行文本
+ */
+async function runDownloads(a: any): Promise<string> {
+  if (downloadsLimitIssue(a.limit)) return _t("cli.err.downloads_limit_invalid", { v: String(a.limit) });
+  const cancelId = typeof a.cancel === "string" ? a.cancel.trim() : "";
+  const deleteId = typeof a.delete === "string" ? a.delete.trim() : "";
+  const clearing = a.clear === true;
+
+  let data: DownloadsSnapshot | DownloadDeleteResult | undefined;
+  try {
+    data = (await service.downloads(buildDownloadsPayload(a))) as
+      | DownloadsSnapshot
+      | DownloadDeleteResult
+      | undefined;
+  } catch (e: any) {
+    // postJson 已脱敏；这里只决定「带原因回模型」还是走统一失败文案
+    const msg = sanitizeForModel(e?.message || String(e));
+    if (deleteId) return _t("cli.err.downloads_delete_failed", { id: deleteId, msg });
+    if (cancelId) return _t("cli.err.downloads_cancel_failed", { id: cancelId, msg });
+    if (clearing) return _t("cli.err.downloads_clear_failed", { msg });
+    throw e;
+  }
+
+  // --delete 是独占动作：shell 只回删除结果（不返回快照），据此输出一行结论
+  if (deleteId) {
+    const result = (data ?? {}) as DownloadDeleteResult;
+    const name = (result.filename || "").trim() || deleteId;
+    if (result.deleted === false) {
+      return _t("cli.out.downloads_deleted_keep_file", { name, msg: result.error || "unknown" });
+    }
+    return _t("cli.out.downloads_deleted", { name });
+  }
+
+  const parts: string[] = [];
+  if (cancelId) parts.push(_t("cli.out.downloads_canceled", { id: cancelId }));
+  if (clearing) parts.push(_t("cli.out.downloads_cleared", { n: countDownloadItems(data as DownloadsSnapshot) }));
+  parts.push(formatDownloads(data as DownloadsSnapshot, downloadsLabels()));
+  return parts.join("\n");
+}
+
+/**
+ * `download_dir`：查询当前保存目录，或 `--set <绝对路径>` 切换本会话目录。
+ *
+ * 路径合法性（绝对路径 / 非盘符根 / 非系统目录 / 自动 mkdir）全部由 shell 判定，
+ * 插件侧**不做白名单**，失败时把 shell 的原始错误带回模型（不在插件侧改写原因）。
+ *
+ * @param a 已解析命令参数
+ * @returns 回模型的文本
+ */
+async function runDownloadDir(a: any): Promise<string> {
+  const setting = typeof a.set === "string";
+  let data: any;
+  try {
+    data = await service.downloadDir(buildDownloadDirPayload(a));
+  } catch (e: any) {
+    const msg = sanitizeForModel(e?.message || String(e));
+    return setting
+      ? _t("cli.err.download_dir_set_failed", { msg })
+      : _t("cli.err.download_dir_query_failed", { msg });
+  }
+  const dir = data?.dir || "";
+  if (!setting) return _t("cli.out.download_dir", { dir });
+  // persisted=false:会话数据目录不可用(未传 --user-data-dir),重启后会回到默认目录
+  return _t("cli.out.download_dir_set", { dir }) + (data?.persisted === false ? _t("cli.note.download_dir_not_persisted") : "");
+}
+
 const COMMANDS: Record<string, CmdDef> = {
   navigate: { usage: "--url", descKey: "cli.cmd.navigate", args: [{ flag: "url" }], run: async (a) => {
     const r = await service.navigate(a);
@@ -522,6 +622,19 @@ const COMMANDS: Record<string, CmdDef> = {
       const lines = formatNetworkItems(r?.items, { includeHeaders: a["include-headers"] === true });
       return renderLogText(lines, r?.dropped) || _t("cli.out.network_empty");
     },
+  },
+  // downloads:本会话下载列表(按目录分组)/取消/清空/删除;download_dir:查询/切换保存目录(1.13.0)
+  downloads: {
+    usage: "[--limit N --clear --cancel <id> --delete <id>]",
+    descKey: "cli.cmd.downloads",
+    args: [{ flag: "limit" }, { flag: "clear", type: "boolean" }, { flag: "cancel" }, { flag: "delete" }],
+    run: async (a) => runDownloads(a),
+  },
+  download_dir: {
+    usage: "[--set <path>]",
+    descKey: "cli.cmd.download_dir",
+    args: [{ flag: "set" }],
+    run: async (a) => runDownloadDir(a),
   },
   go_back: { usage: "", descKey: "cli.cmd.go_back", run: async (a) => { const r = await service.goBack(sidArgs(a)); return _t("cli.out.go_back", { url: r.url }) + readyNote(r); } },
   go_forward: { usage: "", descKey: "cli.cmd.go_forward", run: async (a) => { const r = await service.goForward(sidArgs(a)); return _t("cli.out.go_forward", { url: r.url }) + readyNote(r); } },

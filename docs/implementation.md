@@ -2,7 +2,7 @@
 
 ## 当前架构（V5：跨平台 Tauri 2 多 Webview）
 
-**当前版本**：插件 **1.12.1**（`package.json`）/ bt-shell **0.12.0**（`rust/Cargo.toml`）。**1.12.1 为纯文案改动（清理工具描述中的内部实现细节，零代码变更，复用 0.12.0 二进制）。1.12.0 动 Rust（→ 新二进制 `0.12.0`）**：console/network 双流缓冲（默认 8MiB 可配、按 tab 分组、跨导航保留、重复 `+n` 聚合）、Windows console/network 走 CDP（零注入）、Linux 注入加固+批量回传、`phase` 分段与动作归因、新增 `network_logs` 命令、`evaluate` 兼容多语句。1.10.1 只动插件 TS：`httpCall` 统一原语、模型可见文本脱敏、状态文案去重；1.10.2 为文档一致性 + `read_record_content` 传 `includeImages:true` + Linux 复验脚本补令牌（零 Rust 改动，复用 1.10.0 二进制）。**1.11.0 动 Rust（→ 新二进制 `0.11.0`）**：修 1.10.0 引入的回归——面板 webview 的 `fetch` 带 `Origin: http://tauri.localhost`，被「带 `Origin` 一律 403」挡死，面板 `/api/device/list` 取不到、设备预设下拉只剩「默认」；现改为面板 origin 白名单 + 最小 CORS（预检 204/精确 ACAO），其它 Origin 仍 403。**1.11.1 仅插件 TS 改动**（零 Rust 改动，复用 0.11.0 二进制）：会话树归并——task 子代理会话默认归并到根会话、新增全局 flag `--private-session`、i18n 新增 `cli.usage.flags` 与 `cli.err.flag_not_number`（1.11.1 时键数 168 → 170，zh/en parity；**1.12.0 当前 208/208**）；修复数值 flag 未转 number 导致 `resize`/`switch_tab --index`/`fake_audio --freq/--durMs` 静默失效。本文所有 `src/client.ts` 行号按 **1.10.2** 代码核对（1.11.0/1.11.1 未改 `client.ts`），`src/index.ts` 行号按 **1.12.0** 代码核对，`rust/src/http.rs` 行号按 **0.11.0**。
+**当前版本**：插件 **1.13.0**（`package.json`）/ bt-shell **0.13.0**（`rust/Cargo.toml`）。**1.12.1 为纯文案改动（清理工具描述中的内部实现细节，零代码变更，复用 0.12.0 二进制）。1.12.0 动 Rust（→ 新二进制 `0.12.0`）**：console/network 双流缓冲（默认 8MiB 可配、按 tab 分组、跨导航保留、重复 `+n` 聚合）、Windows console/network 走 CDP（零注入）、Linux 注入加固+批量回传、`phase` 分段与动作归因、新增 `network_logs` 命令、`evaluate` 兼容多语句。1.10.1 只动插件 TS：`httpCall` 统一原语、模型可见文本脱敏、状态文案去重；1.10.2 为文档一致性 + `read_record_content` 传 `includeImages:true` + Linux 复验脚本补令牌（零 Rust 改动，复用 1.10.0 二进制）。**1.11.0 动 Rust（→ 新二进制 `0.11.0`）**：修 1.10.0 引入的回归——面板 webview 的 `fetch` 带 `Origin: http://tauri.localhost`，被「带 `Origin` 一律 403」挡死，面板 `/api/device/list` 取不到、设备预设下拉只剩「默认」；现改为面板 origin 白名单 + 最小 CORS（预检 204/精确 ACAO），其它 Origin 仍 403。**1.11.1 仅插件 TS 改动**（零 Rust 改动，复用 0.11.0 二进制）：会话树归并——task 子代理会话默认归并到根会话、新增全局 flag `--private-session`、i18n 新增 `cli.usage.flags` 与 `cli.err.flag_not_number`（1.11.1 时键数 168 → 170，zh/en parity；**1.12.0 当前 208/208**）；修复数值 flag 未转 number 导致 `resize`/`switch_tab --index`/`fake_audio --freq/--durMs` 静默失效。本文所有 `src/client.ts` 行号按 **1.10.2** 代码核对（1.11.0/1.11.1 未改 `client.ts`），`src/index.ts` 行号按 **1.12.0** 代码核对，`rust/src/http.rs` 行号按 **0.11.0**。
 
 单窗口 + 多 Webview（toolbar / page-1..N 真多标签 / overlay / panel / newtab），前端 TS 工程化，详见 [v5-tauri-architecture.md](./v5-tauri-architecture.md)。
 
@@ -451,6 +451,88 @@ evaluate: 3 item(s), 2 ok, 1 failed (stop)
 - 输出：`typed N char(s) into <selector|focused element>`，`--enter` 追加 ` + Enter`（i18n `cli.out.type` / `cli.out.type.focused` / `cli.out.type.enter`）
 - 纯逻辑在 `src/util/type-text.ts`（`TYPE_TEXT_MAX_BYTES` / `typeTextIssue` / `resolveTypeText` / `formatTypeOutput`，无 IO，可单测）
 - 动作归因：`/api/type` 登记在 `action_for_path` → 执行期间日志 `phase=action:type`
+
+## 下载列表与每会话下载目录（1.13.0）
+
+**动机**：过去下载由引擎默认落盘（用户「下载」目录），模型既看不到进度也无法切换落点。1.13.0 把下载**纳入会话状态**：每会话独立目录、列表可查可取消、面板按目录分组成组展示。
+
+### 端点
+
+| 端点 | 请求 | 响应 |
+|---|---|---|
+| `POST /api/downloads` | `{limit?, clear?, cancel?, delete?}` | `{groups:[{dir, items:[…]}], dir}`；`delete` 独占时返回 `{deleted, filename, error?}` |
+| `POST /api/download-dir` | `{}` / `{set}` / `{reset:true}` | `{dir, defaultDir, limit}` / `{dir, defaultDir, persisted}` / `{dir, defaultDir}` |
+
+`defaultDir` = 默认模板 + 占位符展开结果（不含持久化文件 / env / 命令行的运行时覆盖）：查询、`set`、`reset` 响应都带。`set` 与 `reset` **同时给时以 `set` 优先**（`reset` 被忽略，见 `rust/src/downloads.rs:parse_dir_action`）。
+
+条目字段（camelCase，`rust/src/downloads.rs:DownloadItem`）：`{id, url, filename, path, totalBytes, receivedBytes, state, error?, startedAt, kind?}`（`kind` 仅另存为记录出现：`save-as` / `save-page`，见「另存为与整页另存」），`state` 取 `progress` / `completed` / `failed` / `canceled`（进行中为空串以外的终态都算「已结束」）。`cancel` 只接受进行中的 id：不存在 → `download not found: <id>`，非进行中 → `download is not in progress`（**终态 sticky**，取消优先于采集层回调）。
+
+### 删除记录 + 文件（`delete`）
+
+- `{delete:"<id>"}` 是**独占动作**（与 `clear`/`cancel` 同时给出时只删这一条，不返回快照），响应 `data = {deleted, filename, error?}`
+- 进行中拒绝：`{success:false, error:"正在下载，请先取消"}`（`rust/src/downloads.rs:DELETE_PROGRESS_ERROR`；记录与文件都保留，先取消再删）
+- 未知 id → `download not found: <id>`
+- 结束态：**先移除记录再删文件**；文件不存在/删除失败仍算成功（记录已删），返回 `{deleted:false, filename, error:"file not found"|<系统原因>}`
+- 实现：`rust/src/downloads.rs:Downloads::delete`；不额外广播事件（面板 1s 轮询 + 删除后主动刷新即可）
+
+### 完成提示事件
+
+`downloads-changed` 的**完成**事件 payload 带 `filename` 与 `path`（`rust/src/downloads.rs:download_completed_payload`，由 `announce_state` 在 `Completed` 时从记录表补齐；记录已被淘汰则退回 `{id, state}`）。普通下载与右键「另存为」走同一条路径，所以静默保存也能拿到最终文件名。前端收到 `downloads-changed` 后：面板仅在用户当前处于「下载」视图时刷新列表（**不**弹 toast、**不**自动切视图，见 `frontend/src/download-events.ts:decideDownloadsChanged`）；工具栏据此把角标计数刷新一次（节流 ≥500ms）并在 `state === "progress"` 时脉冲 1s + 把按钮 `title` 改成 `下载：<filename>`（见 `frontend/src/download-badge.ts` / `toolbar.ts:onDownloadsChanged`）。用户点工具栏下载按钮才由 Rust 显示面板并 emit `downloads-view-requested`，面板收到后切到「下载」视图并立即刷新一次。
+
+列表每行还有「删除」按钮（trash 图标，窄屏只留图标 + `title`）：调 `{delete:id}` → 刷新列表；成功 `已删除记录与文件`，`deleted:false` 时提示记录已删而文件未删的原因；进行中的行禁用（提示先取消）。展开状态与滚动位置在重绘后保持。
+
+### 记录持久化（`download-history.json`）
+
+- 文件 `<sessionDataDir>/download-history.json`（会话数据目录根下，**不放**下载目录，避免用户清理下载文件时误删），内容是**条目数组**，每条形状与 `/api/downloads` 的 item 完全一致（`{id,url,filename,path,totalBytes,receivedBytes,state,error?,startedAt,kind?}`）
+- **一次性迁移**（`migrate_legacy_history`，启动时、`restore` 之前）：新文件不存在而旧文件 `<sessionDataDir>/downloads/history.json` 存在 → 读旧写新并删除旧文件（删除失败只记日志）；新文件已存在 → 不覆盖、旧文件保留
+- **启动回填**（`Downloads::restore`，在 `create_ui` 之前）：`progress` 是上次进程被杀的残留 → 置 `failed` + `error:"interrupted by restart"` 并**标脏回写**；已完成/已取消/已失败原样保留；分组目录取记录 `path` 的父目录；`next_id` 抬到已有 id 之后，避免重启后 id 撞车
+- **写入时机**（`mark_dirty` / `history_due` / `flush_history`）：每次影响内容的变更 `rev += 1` 并重置防抖起点；后台线程每 100ms 检查，静默满 `HISTORY_DEBOUNCE_MS`（500ms）才写（一次操作里的多次变更合并成一次）；下载进度持续刷新导致静默永不到来时，按 `HISTORY_MAX_WAIT_MS`（2s）上限兜底；`RunEvent::ExitRequested` / `Exit` 调 `flush_history` 强制写
+- **原子写**（`write_history_file` → `write_atomic_file`）：先写 `download-history.json.tmp-<pid>` 再 `fs::rename` 覆盖（Windows 上 `rename` 覆盖已有文件），进程被杀不会把半截 JSON 留在正式文件上
+- **容错**：文件缺失视为首启；不可读 / 非法 JSON / 顶层非数组 → 空列表 + 日志；单条缺 `id` 或 `path` → 跳过该条；数值字段缺失按 0，`state` 无法识别按 `failed`
+- 无 `--user-data-dir`（无会话数据目录）时不落盘，行为退回纯内存列表
+
+### 另存为与整页另存（`kind`）
+
+- Windows 右键「图片/链接另存为」与页面 `Ctrl+S` 整页另存都走 `ICoreWebView2_25::SaveAsUIShowing`（**不走** `DownloadStarting`；见 WebView2 `ICoreWebView2_25` 文档：该事件在「save as 被触发（手动或程序化）」时投递，`COREWEBVIEW2_SAVE_AS_KIND` 专为 HTML 文档定义 `HTML_ONLY` / `SINGLE_FILE` / `COMPLETE`）
+- 接管方式：`SuppressDefaultDialog(true)` 压掉系统对话框、`SaveAsFilePath` 改到当前下载目录（`unique_name` 去重）、`AllowReplace(false)`；没有进度/完成回调，由后台线程等目标文件落盘后置 `completed`（超时 120s → `failed`）
+- 来源判定 `classify_save_kind`：`ContentMimeType` 为 `text/html` / `application/xhtml+xml`，或建议名扩展名为 `html/htm/mhtml/mht` → `kind = "save-page"`；其余 → `kind = "save-as"`；两者都判不出按 `save-as`。已知不精确：「链接另存为」指向 HTML 文档时与整页另存不可区分
+- 整页另存固定 `SetKind(HTML_ONLY)` 单文件保存：HTML 文档不接受缺省 `DEFAULT`，而对话框已压制、无法让用户选格式；因此**不生成资源目录**，页面里的图片等保持远程引用
+- Linux 无对应事件（仍弹系统对话框），不产生 `save-as` / `save-page` 记录
+
+### 目录模板
+
+- 默认 `<cache>/sessions/<profile>/<sid>/downloads`；占位符 `<cache>`（插件缓存根）、`<profile>`、`<sid>`、`<sname>`（会话标题）
+- **插件侧展开**（`src/util/downloads.ts:expandDownloadDir`，配置 `config/index.ts:resolveDownloadSpawnConfig`）后以 `--download-dir` 传入；`<sname>` 安全化规则与 Rust 的 `sanitize_segment` **不同**（插件只删 `\ / : * ? " < > |`、控制字符、段尾 `.`/空格，保留中文与空格，截断 64）——因此插件展开后**从子进程环境移除 `BT_DOWNLOAD_DIR`**，避免 Rust 因 env 优先而用另一套规则二次展开，导致两处口径不一致
+- `<profile>` / `<sid>` 与 `--user-data-dir`（`sessions/<profile>/<sid>`）同源：`getActiveProfile()` + 归并后的浏览器 key，保证「数据目录 / 下载目录」二级结构对齐
+- **附着模式不传**：外部 shell 的目录由其启动参数/env 决定，插件不介入
+
+### 持久化
+
+- `download_dir --set <绝对路径>` → 校验（绝对路径、非盘符根、非系统目录）→ `create_dir_all` → 改内存目录 → 写 `<sessionDataDir>/download-dir.txt`；写失败不影响切换（响应 `persisted:false`，插件输出追加「未持久化」提示）
+- `{reset:true}`（面板「恢复默认」）→ 删 `<sessionDataDir>/download-dir.txt` → 内存目录切回 `defaultDir`；删除失败只记日志
+- shell 启动时目录解析顺序：`download-dir.txt` → env `BT_DOWNLOAD_DIR` → `--download-dir` → 默认模板；逐级降级，非法值只记日志并继续下一级，全部失败才落临时目录
+- 面板配置页「下载」分组（`frontend/src/index.html` / `index.ts`）：输入框预填 `/api/download-dir` 的 `dir`，提供「保存」（`set`）/「恢复默认」（`reset`）/「打开文件夹」（Tauri `panel_open_download_dir`）；打开面板与切到配置页各拉一次最新值，失败信息以行内小字红色显示服务端原文
+
+### 面板命令与事件（Tauri IPC）
+
+| 名称 | 方向 | 说明 |
+|---|---|---|
+| `panel_show_downloads` | 前端 → Rust（invoke） | 先确保面板可见（复用 `ui::show_panel`：退出批注/截图模式 → 显示遮罩 → 展开面板；面板 webview 不存在时记日志并安全返回），再 `emit("downloads-view-requested", {})`。只广播、不自动切视图的业务由面板前端处理 |
+| `downloads-changed` | Rust → 面板 | 新下载开始 / 进行中 → 结束态的跃迁（`progress` 时带 `filename`，完成时带 `filename` + `path`）；面板未创建时静默跳过 |
+| `downloads-view-requested` | Rust → 面板 | 请求切到「下载」视图，payload 恒为 `{}` |
+
+### 分组与上限
+
+- 快照**按记录的存储目录分组**（`dir` 为记录登记时的目录，不是「当前目录」），组内按 `startedAt` 倒序；组间按最近活动时间倒序
+- 每组保留最近 `downloadHistoryLimit`（默认 **64**，env `BT_DOWNLOAD_HISTORY`）条**已完成**记录，**进行中不淘汰**；`--clear` 只清已结束记录
+- `--limit N` 只影响**返回条数**（`items.truncate(n)`），不改变存储
+
+### 插件侧实现要点
+
+- 纯逻辑 `src/util/downloads.ts`：`expandDownloadDir` / `sanitizeSessionName`（模板展开）、`buildDownloadsPayload` / `buildDownloadDirPayload`（参数透传，空 `cancel`/`delete`、`clear:false` 不下发）、`downloadsLimitIssue`（正整数校验）、`formatDownloads` / `formatDownloadRow`（分组文本；进度只对 `progress` 显示，`totalBytes=0` 如实标「不确定」，失败行末附原因）
+- 命令 `downloads` / `download_dir` 在 `src/index.ts:runDownloads` / `runDownloadDir`；失败时把 shell 原始错误**原样带回模型**（仅走 `sanitizeForModel` 脱敏），不做插件侧改写或白名单。`--delete <id>` 输出 `已删除 <filename>（记录与文件）`；`deleted:false` 时输出「记录已删、文件未删：原因」
+- 输出文案全部走 i18n（`cli.cmd.downloads`、`cli.cmd.download_dir`、`cli.out.downloads_*`、`cli.out.download_dir*`、`cli.err.download_dir*`、`cli.note.download_dir_not_persisted`），zh/en 同批；`buildHelp` / `DESC_INDEX` 由 `COMMANDS` 自动纳入
+- 单测 `tests/unit/downloads.test.mjs`：模板展开（含 `<sname>` 安全化/截断/回落）、请求体透传、`--limit` 校验、分组输出格式、错误文案透传、i18n 键 parity
 
 ## 待办
 

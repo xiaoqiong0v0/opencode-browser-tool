@@ -79,6 +79,16 @@
       .pane[hidden] { display: none; }
       #tab-ai-pane { flex: 1; }
       .pane-head { display: flex; align-items: center; justify-content: space-between; }
+      /* AI 功能页内的视图切换(记录 / 下载):段控件风格,外观复用面板按钮 */
+      .view-nav { display: flex; gap: 6px; flex-shrink: 0; }
+      .view-nav-btn {
+        flex: 1; min-width: 0; padding: 6px 0; font-size: 12px; font-weight: 600;
+        color: var(--fg-dim); white-space: nowrap;
+      }
+      .view-nav-btn.active { color: var(--fg); background: var(--accent-active); border-color: var(--accent); }
+      /* 视图容器:占满内容区剩余高度,同一时刻只有一个可见 */
+      .view-pane { display: flex; flex-direction: column; gap: 8px; flex: 1; min-height: 0; }
+      .view-pane[hidden] { display: none; }
       /* 顶部功能按钮:批注 + 截图 */
       #btn-shot.active { background: var(--accent-active); border-color: var(--accent-blue); }
       #records {
@@ -147,7 +157,82 @@
       #toast.ok { background: rgba(16, 163, 127, 0.92); }
       #toast.bad { background: rgba(245, 158, 11, 0.92); }
       #toast.err { background: rgba(220, 38, 38, 0.92); }
-    </style>
+      /* 下载视图:按目录分组、每组默认收起;组内每行文件名/进度/大小/状态/来源
+         (外层 #view-downloads-pane 已是 flex 列容器,列表占据剩余高度) */
+      .dl-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+      .dl-title { font-size: 13px; font-weight: 600; color: var(--fg-dim); }
+      .dl-count {
+        font-size: 11px; color: var(--muted); border: 1px solid var(--border);
+        border-radius: 9px; padding: 0 6px; background: var(--panel-bg);
+      }
+      .dl-list { display: flex; flex-direction: column; gap: 4px; flex: 1; min-height: 0; overflow-y: auto; }
+      .dl-empty { color: var(--empty); text-align: center; padding: 8px 0; font-size: 12px; }
+      .dl-group { border: 1px solid var(--rec-border); border-radius: 6px; background: var(--rec-bg); overflow: hidden; }
+      .dl-group-head {
+        width: 100%; padding: 6px 8px; background: transparent; border: none; border-radius: 0;
+        justify-content: flex-start; gap: 6px; font-size: 12px; color: var(--fg);
+      }
+      .dl-group-head:hover { background: var(--panel-hover); }
+      .dl-caret { width: 10px; flex-shrink: 0; color: var(--muted); transition: transform 0.15s; }
+      .dl-group.open .dl-caret { transform: rotate(90deg); }
+      .dl-dir { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; }
+      .dl-num { font-size: 11px; color: var(--muted); flex-shrink: 0; }
+      .dl-group-body { border-top: 1px solid var(--rec-border); }
+      .dl-group-body[hidden] { display: none; }
+      .dl-row { padding: 6px 8px; border-bottom: 1px solid var(--rec-border); display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+      .dl-row:last-child { border-bottom: none; }
+      .dl-row-top { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
+      .dl-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+      .dl-size { font-size: 11px; color: var(--muted); flex-shrink: 0; }
+      .dl-bar { height: 4px; border-radius: 2px; background: var(--border); overflow: hidden; }
+      .dl-bar-fill { height: 100%; width: 0; background: var(--accent-blue); transition: width 0.2s; }
+      .dl-bar.indeterminate .dl-bar-fill { width: 35%; animation: dl-slide 1.1s ease-in-out infinite; }
+      .dl-bar.done .dl-bar-fill { background: var(--accent); }
+      .dl-bar.failed .dl-bar-fill { background: #c0392b; }
+      @keyframes dl-slide {
+        0% { transform: translateX(-100%); }
+        100% { transform: translateX(300%); }
+      }
+      .dl-meta { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--muted); min-width: 0; }
+      .dl-state { flex-shrink: 0; }
+      .dl-state.failed { color: #e74c3c; }
+      .dl-host { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right; }
+      .dl-actions { display: flex; gap: 6px; }
+      .dl-actions button { padding: 3px 8px; font-size: 11px; border-radius: 4px; }
+      .dl-actions button:disabled { opacity: 0.5; cursor: default; }
+      /* 行内删除:trash 图标 + 文字;窄屏只留图标(title/aria-label 保留说明) */
+      .dl-del { display: inline-flex; align-items: center; gap: 4px; }
+      .dl-del svg { width: 12px; height: 12px; flex-shrink: 0; }
+      .dl-del:not(:disabled) { color: #e74c3c; }
+      /* 配置页「下载」:可编辑目录输入 + 操作按钮 + 行内提示(失败为小字红色) */
+      input[type="text"] {
+        width: 100%;
+        padding: 6px;
+        background: var(--panel-bg);
+        color: var(--fg);
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        font-size: 13px;
+        user-select: text;
+      }
+      .dl-dir-actions { display: flex; gap: 6px; }
+      .dl-dir-actions > button { flex: 1; min-width: 0; }
+      .dl-dir-msg { font-size: 11px; color: #e74c3c; word-break: break-all; }
+      .dl-dir-msg.ok { color: var(--accent); }
+      .dl-dir-msg[hidden] { display: none; }
+      /* 窄模式(窗口 < 480,与 Rust `ui::NARROW_MODE_MAX_W` 及 toolbar 的 479px 媒体查询一致):
+         视图导航只留图标、隐藏文字;下载行动作按钮允许换行,长文件名/路径不撑破面板 */
+      @media (max-width: 479px) {
+        .view-nav-label { display: none; }
+        .dl-row-top { flex-wrap: wrap; }
+        .dl-size { flex-shrink: 1; }
+        .dl-actions { flex-wrap: wrap; }
+        /* 删除按钮窄屏只留图标(说明走 title/aria-label) */
+        .dl-del-label { display: none; }
+        /* 目录操作按钮换行,不横向溢出;保存/恢复默认仍保留文字 */
+        .dl-dir-actions { flex-wrap: wrap; }
+        .dl-dir-actions > button { flex: 1 1 45%; }
+      }    </style>
   </head>
   <body>
     <div class="head">
@@ -158,11 +243,34 @@
       <button id="tab-ai" class="tab-btn active"><i data-lucide="bot"></i>AI 功能</button>
       <button id="tab-config" class="tab-btn"><i data-lucide="settings"></i>配置</button>
     </div>
-    <!-- Tab1:AI 功能区(记录列表 → 底部发送;批注/截图已移至工具栏) -->
+    <!-- Tab1:AI 功能区(视图切换:记录 / 下载;批注/截图已移至工具栏) -->
     <div id="tab-ai-pane" class="pane">
-      <div id="records"></div>
-      <button id="btn-send"><i data-lucide="send"></i>发送</button>
-      <div id="toast"></div>
+      <!-- 视图导航:记录(默认)/ 下载;窄屏只显示图标(title + aria-label 保可访问性) -->
+      <div id="view-nav" class="view-nav" role="tablist" aria-label="面板视图">
+        <button id="btn-view-records" class="view-nav-btn active" type="button" role="tab"
+          aria-selected="true" aria-controls="view-records-pane" title="记录" aria-label="记录">
+          <i data-lucide="list"></i><span class="view-nav-label">记录</span>
+        </button>
+        <button id="btn-view-downloads" class="view-nav-btn" type="button" role="tab"
+          aria-selected="false" aria-controls="view-downloads-pane" title="下载" aria-label="下载">
+          <i data-lucide="download"></i><span class="view-nav-label">下载</span>
+        </button>
+      </div>
+      <!-- 记录视图:批注/截图记录列表 + 发送(默认视图,行为与之前一致) -->
+      <div id="view-records-pane" class="view-pane" role="tabpanel">
+        <div id="records"></div>
+        <button id="btn-send"><i data-lucide="send"></i>发送</button>
+      </div>
+      <!-- 下载视图:按目录分组、每组默认收起;空态显示「暂无下载」 -->
+      <div id="view-downloads-pane" class="view-pane" role="tabpanel" hidden>
+        <div class="dl-head">
+          <span class="dl-title">下载</span>
+          <span id="dl-count" class="dl-count">0</span>
+        </div>
+        <div id="dl-list" class="dl-list">
+          <div class="dl-empty">暂无下载</div>
+        </div>
+      </div>
     </div>
     <!-- Tab2:配置区(外观放顶部) -->
     <div id="tab-config-pane" class="pane" hidden>
@@ -178,11 +286,28 @@
         <!-- 首项「默认」(value=特殊名,与 Rust devices::DEFAULT_DEVICE_NAME 一致);设备列表由 JS 追加 -->
         <option value="__default__">默认</option>
       </select>
+      <!-- 下载目录:输入框预填当前目录;保存=切换、恢复默认=清持久化并回默认目录 -->
+      <h3>下载</h3>
+      <input
+        id="download-dir-input"
+        type="text"
+        spellcheck="false"
+        autocomplete="off"
+        placeholder="下载保存目录（绝对路径）"
+      />
+      <div class="dl-dir-actions">
+        <button id="btn-download-dir-save" type="button"><i data-lucide="save"></i>保存</button>
+        <button id="btn-download-dir-reset" type="button"><i data-lucide="rotate-ccw"></i>恢复默认</button>
+        <button id="btn-download-dir-open" type="button"><i data-lucide="folder-open"></i>打开文件夹</button>
+      </div>
+      <div id="download-dir-msg" class="dl-dir-msg" hidden></div>
       <h3>工具</h3>
       <div class="row">
         <button id="btn-devtools"><i data-lucide="wrench"></i>开发者工具</button>
       </div>
     </div>
+    <!-- 统一 toast:放在两个 tab 之外,配置页也能看到(取消/删除下载的结果不受当前 tab 影响) -->
+    <div id="toast"></div>
     <script src="index.js"></script>
   </body>
 </html>

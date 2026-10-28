@@ -3,6 +3,7 @@ import { resolve, dirname, relative, isAbsolute, sep } from "path";
 import { homedir } from "os";
 import { tf } from "../i18n/index.js";
 import { log } from "../logger.js";
+import { DEFAULT_DOWNLOAD_DIR_TEMPLATE, DEFAULT_DOWNLOAD_HISTORY, expandDownloadDir } from "../util/downloads.js";
 
 const PLUGIN_NAME = "opencode-browser-tool";
 const CONFIG_FILE = "browser-tool.jsonc";
@@ -69,6 +70,10 @@ export interface PluginConfig {
   consoleInject?: boolean;
   /** WebView2 额外启动参数(Windows;默认抗 RDP/遮挡卡死的一组;空串=不加;等价 env `BT_WEBVIEW2_ARGS`) */
   webview2Args?: string;
+  /** 下载保存目录模板(默认 `<cache>/sessions/<profile>/<sid>/downloads`;等价 env `BT_DOWNLOAD_DIR`) */
+  downloadDir?: string;
+  /** 每个下载目录保留的已完成记录条数(默认 64;等价 env `BT_DOWNLOAD_HISTORY`) */
+  downloadHistoryLimit?: number;
 }
 
 const defaults: PluginConfig = {
@@ -79,6 +84,8 @@ const defaults: PluginConfig = {
   networkBurstWindowMs: DEFAULT_NETWORK_BURST_MS,
   consoleInject: DEFAULT_CONSOLE_INJECT,
   webview2Args: DEFAULT_WEBVIEW2_ARGS,
+  downloadDir: DEFAULT_DOWNLOAD_DIR_TEMPLATE,
+  downloadHistoryLimit: DEFAULT_DOWNLOAD_HISTORY,
 };
 let _config: PluginConfig = { ...defaults };
 let _worktree: string = "";
@@ -271,6 +278,12 @@ function applyConfigFile(config: PluginConfig, filePath: string): void {
     const burstMs = toPositiveInt(fileConfig.networkBurstWindowMs);
     if (burstMs !== undefined) config.networkBurstWindowMs = burstMs;
     if (typeof fileConfig.consoleInject === "boolean") config.consoleInject = fileConfig.consoleInject;
+    // 下载目录模板:空串视为未配置(回落默认模板);历史上限只收正整数
+    if (typeof fileConfig.downloadDir === "string" && fileConfig.downloadDir.trim()) {
+      config.downloadDir = fileConfig.downloadDir.trim();
+    }
+    const downloadLimit = toPositiveInt(fileConfig.downloadHistoryLimit);
+    if (downloadLimit !== undefined) config.downloadHistoryLimit = downloadLimit;
   } catch {}
 }
 
@@ -316,6 +329,11 @@ function applyEnv(config: PluginConfig): void {
   if (burstMs !== undefined) config.networkBurstWindowMs = burstMs;
   const inject = parseBoolFlag(process.env.BT_CONSOLE_INJECT);
   if (inject !== undefined) config.consoleInject = inject;
+  // 下载目录模板 / 每组历史上限(1.13.0):与传给 shell 的口径一致,env 优先于配置文件
+  const downloadDir = process.env.BT_DOWNLOAD_DIR?.trim();
+  if (downloadDir) config.downloadDir = downloadDir;
+  const downloadLimit = toPositiveInt(process.env.BT_DOWNLOAD_HISTORY);
+  if (downloadLimit !== undefined) config.downloadHistoryLimit = downloadLimit;
 }
 
 /**
@@ -377,6 +395,42 @@ export function getWebviewEnv(): Record<string, string> {
   return { WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: merged };
 }
 
+/** spawn 时的下载配置:展开后的目录 + 每组历史上限 + 需合并进子进程环境的变量 */
+export interface DownloadSpawnConfig {
+  /** `--download-dir` 的取值(模板已展开) */
+  dir: string;
+  /** 每个目录保留的已完成记录数 */
+  historyLimit: number;
+  /** 需合并进子进程环境的变量(仅 `BT_DOWNLOAD_HISTORY`) */
+  env: Record<string, string>;
+}
+
+/**
+ * 解析 spawn 时的下载配置(1.13.0)。
+ *
+ * 目录模板优先级:env `BT_DOWNLOAD_DIR` > 配置 `downloadDir` > 默认模板
+ * (env 已在 `applyEnv` 合并进 config)。占位符取值:`<cache>` = 插件缓存根、
+ * `<profile>` = 当前 profile、`<sid>` = 会话路由 key、`<sname>` = 会话标题(已安全化)。
+ *
+ * 只负责「算出传什么」;**是否下传由 spawn 分支决定**(附着模式不传,见 README)。
+ *
+ * @param sid 会话 id(归并后的浏览器 key)
+ * @param sessionName 会话标题(可为空,空则 `<sname>` 回退 `<sid>`)
+ * @returns 展开后的目录、历史上限与需下发的环境变量
+ */
+export function resolveDownloadSpawnConfig(sid: string, sessionName: string): DownloadSpawnConfig {
+  const cfg = getConfig();
+  const template = (cfg.downloadDir || "").trim() || DEFAULT_DOWNLOAD_DIR_TEMPLATE;
+  const dir = expandDownloadDir(template, {
+    cacheDir: getCacheDir(),
+    profile: getActiveProfile(),
+    sid,
+    sessionName,
+  });
+  const historyLimit = toPositiveInt(cfg.downloadHistoryLimit) ?? DEFAULT_DOWNLOAD_HISTORY;
+  return { dir, historyLimit, env: { BT_DOWNLOAD_HISTORY: String(historyLimit) } };
+}
+
 function isValidLang(lang: string): lang is Lang {
   return ["en", "zh"].includes(lang);
 }
@@ -416,6 +470,14 @@ function generateDefaultConfig(filePath: string): void {
 
   // 1.9.0 起「每会话独立浏览器实例」为唯一行为（原 sessionIsolation 开关从未生效，已移除）；
   // browserType 同理移除（--browser 从不被 bt-shell 解析）。旧配置里若仍写着这两项会被忽略。
+
+  // 下载保存目录模板（可选，默认 "<cache>/sessions/<profile>/<sid>/downloads"）
+  // 占位符：<cache> 插件缓存根 / <profile> 配置名 / <sid> 会话 id / <sname> 会话标题（已做文件名安全化）
+  // 必须展开成绝对路径；等价 BT_DOWNLOAD_DIR（env 优先）
+  // "downloadDir": "<cache>/sessions/<profile>/<sid>/downloads",
+
+  // 每个下载目录保留的已完成记录条数（可选，默认 64；进行中不淘汰；等价 BT_DOWNLOAD_HISTORY）
+  // "downloadHistoryLimit": 64,
 
   // Node.js 路径（可选，不设则从 PATH 查找 node）
   // "nodePath": "C:/Program Files/nodejs/node.exe",

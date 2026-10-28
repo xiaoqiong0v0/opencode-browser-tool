@@ -312,6 +312,9 @@ impl App {
             // 持久注入规则(1.12.0):规则 CRUD 与「只匹配不执行」自检
             "/api/inject/rules" => self.inject_rules(&body).await,
             "/api/inject/test" => self.inject_test(&body).await,
+            // 下载列表与下载目录(1.13.0;同步操作,不驱动页面)
+            "/api/downloads" => crate::downloads::api_downloads(&self.handle, &body),
+            "/api/download-dir" => crate::downloads::api_download_dir(&body),
             _ => Err(format!("Not found: POST {url}")),
         }
     }
