@@ -226,7 +226,7 @@ bt_cli({ args: "inject disable --id r1" })
 - **`inject list` 只给结构**：`id / order / enabled / match / items / last`（ok、failed + 最近错误首行），明细只显示每个 item 的 `name` + 字节数，**绝不回显脚本内容**
 - **与 `evaluate` 的区别**：`evaluate` 是**一次性**在当前页面执行并返回结果；`inject` 是**持久规则**，命中 URL 后每次加载都执行，结果只写回规则（不回模型），需用 `inject list` 查看
 
-### 命令参考（52 条，与 `COMMANDS` 一致）
+### 命令参考（55 条，与 `COMMANDS` 一致）
 
 > 唯一真源：`src/index.ts:521-757` 的 `COMMANDS`（本表与之逐条对应，条数、flag 名、可选性均以代码为准）。说明取自 `src/i18n/en.ts` 的 `cli.cmd.*`（`src/i18n/en.ts:49-100`，中文对照见 `src/i18n/zh.ts`）。参数列中**不带 `[]` 者为必填**；⏱ = 支持 `--timeout ms`。完整命令/参数/help 以 `bt_cli({ args: "help" })` 的实际输出为准。
 
@@ -238,7 +238,10 @@ bt_cli({ args: "inject disable --id r1" })
 | `clear` ⏱ | `--selector` 必填 | 清空输入框 |
 | `select` ⏱ | `--selector --value` 必填 | 选择下拉框选项 |
 | `hover` ⏱ | `--selector` 必填 | 悬停到元素 |
-| `drag` ⏱ | `--sourceSelector --targetSelector` 必填 | 拖拽元素到目标 |
+| `drag` ⏱ | `[--sourceSelector S \| --sourcePoint "x,y"] [--targetSelector T \| --targetPoint "x,y"] [--pointer mouse\|touch]` 或 `--actions '<json array>' [--pointer mouse\|touch]` | 拖拽（默认 `--pointer mouse`，`touch` 走触摸序列）：非批次取源/目标**可视中心**（元素矩形 ∩ 可滚动祖先 clientRect ∩ 视口），不可见直接报错且不发鼠标事件；批次支持 press/move/scroll/wait/release（详见「拖拽（drag）」） |
+| `touch` ⏱ | `--actions '<json array>'` 必填 | 多点触摸动作集：`down/move/up/wait`，最多 5 指，点可用 `x/y` 或 `selector`，支持 `radius`/`force` |
+| `tap` ⏱ | `[--selector S \| --x X --y Y] [--pointer touch\|mouse]` | 单指点击；默认触摸，`--pointer mouse` 走鼠标点击 |
+| `swipe` ⏱ | `--from "x,y" --to "x,y" [--steps N] [--duration ms]` | 单指滑动；`--steps` 默认 8，`--duration` 为总时长（毫秒） |
 | `press_key` ⏱ | `--key` 必填，`[--selector]` | 按下键盘按键；`--selector` 指定先聚焦的元素 |
 | `type` ⏱ | `--text <文本\|@file:<路径>>` 必填，`[--selector] [--enter]` | **向当前焦点插入文本（不清空已有内容）**；`--selector` 先聚焦该元素，`--enter` 插入后回车；`--text` 支持 `@file:`（与 `evaluate` 同一套 containment）。xterm/终端/contenteditable 用它，表单替换用 `fill` |
 | `upload_file` ⏱ | `--selector --filePath` 必填 | 上传文件到输入框 |
@@ -339,6 +342,43 @@ bt_cli({ args: "inject disable --id r1" })
 - Linux（含 WSLg）截图路径已实测通过（见 `docs/implementation.md`）；**真实 Linux 桌面（GNOME/KDE）仍待复验**
 - 折下懒加载图（`loading=lazy`）经 cache-bust 实测：滚动前 `complete=false`，自动滚动后加载完成、截图内容非空白
 
+### 拖拽（drag）
+
+**非批次**（选择器或视口坐标，source/target 各二选一）：
+
+```text
+drag --sourceSelector "#card" --targetSelector ".column"
+drag --sourceSelector "#card" --targetPoint "800,400"
+drag --sourcePoint "120,220" --targetSelector ".column"
+```
+
+- 抓取点 = **元素矩形 ∩ 所有可滚动祖先的 clientRect ∩ 视口**的交集中心；**不再自动滚动**。源或目标交集为空/宽高 ≤ 0 → `drag: source/target center not visible (<selector>)`，**不发任何鼠标事件**
+- `sourcePoint` 必须落在视口内（`0 <= x < innerWidth && 0 <= y < innerHeight`）；`targetPoint` 允许越界（拖出窗口/贴边）
+- 执行序列：`move(源) → press → N 步插值 move → release(目标)`
+
+**动作批次**（`--actions`，单次 HTTP 调用内顺序执行，无跨命令状态）：
+
+```text
+drag --actions '[{"press":{"selector":"#card"}},{"scroll":{"selector":".list","dy":300}},{"wait":{"ms":50}},{"move":{"selector":".item-5","steps":8}},{"release":{}}]'
+```
+
+- 动作：`move{selector|to,steps?,delay?}`（`steps` 默认 8）、`press{selector|to}`、`scroll{selector?,dx?,dy?}`、`wait{ms}`、`release{selector|to}`
+- 状态机：**press 前不能 move/scroll/release**；release 后不能再有动作；press 时已按下 → 报错。`release` 可省略，执行器 **try/finally 自动补释放**（中途失败也会先释放按键）
+- 每个 `selector` 同样取可视中心；不可见/找不到即报错并保证释放。`press` 坐标越界直接报错且不发事件；`move`/`release` 坐标允许越界
+- `scroll`：带 `selector` 时把该容器 `scrollLeft/scrollTop` 加上 `dx/dy`，并在滚动后于当前坐标重新派发 `dragOver`（不再额外注入 wheel，避免双倍滚动）；不带 `selector` 时仍注入 wheel。两种路径都在滚动后重新 `dragOver`
+
+**限制**：仅 Windows；iframe 内元素不支持；目标不在 DOM 的虚拟列表不会自动滚动查找。
+
+> ⚠️ **行为变更（v1.14.0）**：旧调用若源/目标不同屏（可视交集为空），现在会明确报 `not visible`；此前会静默取矩形中心导致落点偏移，不会报错。
+
+### 触摸输入（touch / tap / swipe）
+
+- 首次触摸命令会启用触摸仿真（`navigator.maxTouchPoints = 5`），之后保持启用；页面导航/重建后下次触摸会重新启用；不影响鼠标命令。
+- `touch --actions '<json>'`：点集动作 `down/move/up/wait`。`down`/`move` 的点可用 `{"x","y"}` 或 `{"selector","align":"center"}`（取可视中心）；`radius` 默认 1、`force` 默认 1.0。`move` 必须携带当前全部按下点，最多 5 指；`id` 按按下顺序分配并跨步骤保持。**批次必须以 `up` 收尾**（缺 `up` 直接报错，不会遗留按下状态）。长按 = `down → wait → up`；长按拖拽 = `down → wait → move → up`。
+- `tap [--selector|--x --y] [--pointer touch|mouse]`：默认触摸（`touchStart → touchEnd`），`--pointer mouse` 改为鼠标点击。
+- `swipe --from "x,y" --to "x,y" [--steps 8] [--duration ms]`：单指移动序列；`duration` 为总时长，按 steps 均分。
+- `drag --pointer touch`：复用 drag 的坐标/可见性/批次/scroll 语义，底层为 `touchStart → touchMove×N → touchEnd`，不启用鼠标拖拽拦截；默认 `--pointer mouse` 行为不变。
+- 限制：非 Windows 明确报未实现；触摸仅透传 radius/force 数值，不模拟真实压力/面积；超过 5 指报错。**触摸通道不会触发 HTML5 DnD**（原生拖拽走鼠标拦截通道；`drag --pointer touch` 是触摸序列，仅供监听 touch 事件的页面使用）。
 ## 设备预设 / 尺寸语义
 
 > ⚠️ **行为变更（v1.8.0）**：`resize` 与 `set_device` 的宽高一律指**页面内容区（视口）**尺寸，不再是 OS 窗口尺寸。窗口高 = 内容区高 + 工具栏 72px。**旧脚本若按窗口尺寸理解，高度会偏 72px**。API 返回同时给出 `content` 与 `window` 两组尺寸便于核对。

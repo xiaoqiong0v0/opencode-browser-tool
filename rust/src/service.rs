@@ -129,6 +129,9 @@ fn action_for_path(url: &str) -> Option<&'static str> {
         "/api/press-key" => "press_key",
         "/api/type" => "type",
         "/api/drag" => "drag",
+        "/api/touch" => "touch",
+        "/api/tap" => "tap",
+        "/api/swipe" => "swipe",
         "/api/upload-file" => "upload_file",
         "/api/navigate" => "navigate",
         "/api/go-back" => "go_back",
@@ -176,6 +179,131 @@ fn timeout_arg(body: &Value) -> Result<(Option<u64>, bool), String> {
             let c = n.clamp(TIMEOUT_MIN_MS, TIMEOUT_MAX_MS);
             Ok((Some(c), c != n))
         }
+    }
+}
+
+/// 字段是否为非空字符串(空白视为未提供)
+fn has_nonempty_str(body: &Value, key: &str) -> bool {
+    body.get(key)
+        .and_then(Value::as_str)
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// `actions` 键是否出现(任何类型都算「已提供」;非法类型交给解析阶段明确报错)
+fn drag_actions_present(body: &Value) -> bool {
+    body.get("actions").is_some()
+}
+
+/// 是否携带非空 source/target 选择器或坐标(用于与 actions 的互斥校验)
+fn has_drag_side_args(body: &Value) -> bool {
+    ["sourceSelector", "sourcePoint", "targetSelector", "targetPoint"]
+        .iter()
+        .any(|k| has_nonempty_str(body, k))
+}
+
+/// 解析 `--actions`(接受 JSON 字符串或数组)
+fn parse_actions_body(body: &Value) -> Result<Vec<control::drag::Action>, String> {
+    match body.get("actions") {
+        Some(Value::String(s)) => control::drag::parse_actions(s),
+        Some(v @ Value::Array(_)) => control::drag::parse_actions(&v.to_string()),
+        Some(other) => Err(format!(
+            "drag: actions must be a JSON array or string, got: {other}"
+        )),
+        None => Err("drag: actions is required".into()),
+    }
+}
+
+/// 解析拖拽一侧:选择器与坐标必须二选一
+fn drag_side(
+    body: &Value,
+    selector_key: &str,
+    point_key: &str,
+) -> Result<control::drag::DragTarget, String> {
+    let selector = has_nonempty_str(body, selector_key);
+    let point = has_nonempty_str(body, point_key);
+    match (selector, point) {
+        (true, true) => Err(format!(
+            "drag: {selector_key} and {point_key} are mutually exclusive"
+        )),
+        (true, false) => Ok(control::drag::DragTarget::Selector(
+            body[selector_key].as_str().unwrap_or("").trim().to_string(),
+        )),
+        (false, true) => {
+            let (x, y) = control::drag::parse_point(body[point_key].as_str().unwrap_or(""))?;
+            Ok(control::drag::DragTarget::Point(x, y))
+        }
+        (false, false) => Err(format!(
+            "drag: {selector_key} or {point_key} is required"
+        )),
+    }
+}
+
+/// 解析 `"x,y"` 参数
+fn point_arg(body: &Value, key: &str) -> Result<(f64, f64), String> {
+    let raw = body
+        .get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("swipe: --{key} \"x,y\" is required"))?;
+    control::drag::parse_point(raw).map_err(|e| e.replace("drag:", "swipe:"))
+}
+
+/// 解析 `pointer`(缺省由调用方决定;非法值明确报错)
+fn pointer_arg(
+    body: &Value,
+    default: control::drag::Pointer,
+) -> Result<control::drag::Pointer, String> {
+    match body.get("pointer") {
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::String(s)) if s.trim().is_empty() => Ok(default),
+        Some(Value::String(s)) => control::drag::Pointer::parse(s),
+        Some(v) => Err(format!("pointer must be a string, got: {v}")),
+    }
+}
+
+/// 读取可选浮点参数(兼容 JSON 数字与命令行字符串)
+fn num_f64(body: &Value, key: &str) -> Option<f64> {
+    body.get(key).and_then(|v| match v {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    })
+}
+
+/// 解析 touch actions(JSON 字符串或数组)
+fn parse_touch_actions(body: &Value) -> Result<Vec<control::touch::TouchAction>, String> {
+    match body.get("actions") {
+        Some(Value::String(s)) => control::touch::parse_actions(s),
+        Some(v @ Value::Array(_)) => control::touch::parse_actions(&v.to_string()),
+        Some(other) => Err(format!(
+            "touch: actions must be a JSON array or string, got: {other}"
+        )),
+        None => Err("touch: actions is required".into()),
+    }
+}
+
+/// tap 目标:selector 与 x/y 二选一
+fn tap_target(body: &Value) -> Result<control::touch::TouchTarget, String> {
+    let selector = body
+        .get("selector")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let x = num_f64(body, "x");
+    let y = num_f64(body, "y");
+    match (selector, x, y) {
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+            Err("tap: selector and x/y are mutually exclusive".into())
+        }
+        (Some(s), None, None) => Ok(crate::control::touch::TouchTarget::Selector(s.to_string())),
+        (None, Some(x), Some(y)) => {
+            if !x.is_finite() || !y.is_finite() {
+                return Err("tap: x/y must be finite numbers".into());
+            }
+            Ok(crate::control::touch::TouchTarget::Point(x, y))
+        }
+        (None, None, None) => Err("tap: selector or x/y is required".into()),
+        _ => Err("tap: both x and y are required".into()),
     }
 }
 
@@ -255,6 +383,9 @@ impl App {
             "/api/press-key" => self.press_key(&body).await,
             "/api/type" => self.type_text(&body).await,
             "/api/drag" => self.drag(&body).await,
+            "/api/touch" => self.touch(&body).await,
+            "/api/tap" => self.tap(&body).await,
+            "/api/swipe" => self.swipe(&body).await,
             "/api/upload-file" => self.upload_file(&body).await,
             "/api/screenshot" => self.screenshot(&body).await,
             "/api/evaluate" => self.evaluate(&body).await,
@@ -594,28 +725,150 @@ impl App {
         ))
     }
 
+    /// 拖拽:非批次(选择器/坐标)或 `actions` 批次;两类入参互斥
     async fn drag(&self, body: &Value) -> Result<Value, String> {
-        let from = body
-            .get("sourceSelector")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        if from.is_empty() {
-            return Err("sourceSelector is required".into());
-        }
-        let to = body
-            .get("targetSelector")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        if to.is_empty() {
-            return Err("targetSelector is required".into());
-        }
         let (t, tclamped) = timeout_arg(body)?;
+        let pointer = pointer_arg(body, control::drag::Pointer::Mouse)?;
         let handle = self.handle.clone();
-        // 原生 DnD:Windows 走 CDP 鼠标序列(真实发起 dragstart/dragover/drop);非 Windows 明确报错
-        tokio::task::block_in_place(|| control::drag::drag_with(&handle, &from, &to, t))?;
-        Ok(with_timeout(json!({ "dragged": true }), t, tclamped))
+        // 默认 mouse 路径零行为变化;pointer=touch 时底层换触摸序列
+        let done = if drag_actions_present(body) {
+            if has_drag_side_args(body) {
+                return Err(
+                    "drag: --actions cannot be combined with source/target selectors or points"
+                        .into(),
+                );
+            }
+            let actions = parse_actions_body(body)?;
+            tokio::task::block_in_place(|| {
+                control::drag::drag_actions_with(&handle, &actions, t, pointer)
+            })?
+        } else {
+            let source = drag_side(body, "sourceSelector", "sourcePoint")?;
+            let target = drag_side(body, "targetSelector", "targetPoint")?;
+            tokio::task::block_in_place(|| {
+                control::drag::drag_targets_with(&handle, source, target, t, pointer)
+            })?
+        };
+        Ok(with_timeout(
+            json!({
+                "dragged": true,
+                "steps": done.steps,
+                "elapsedMs": done.elapsed_ms
+            }),
+            t,
+            tclamped,
+        ))
+    }
+
+    /// 多点触摸动作集(`touch --actions`)
+    async fn touch(&self, body: &Value) -> Result<Value, String> {
+        let (t, tclamped) = timeout_arg(body)?;
+        let actions = parse_touch_actions(body)?;
+        let handle = self.handle.clone();
+        let done = tokio::task::block_in_place(|| {
+            control::touch::touch_actions_with(&handle, &actions, t)
+        })?;
+        Ok(with_timeout(
+            json!({ "touched": true, "steps": done.steps, "elapsedMs": done.elapsed_ms }),
+            t,
+            tclamped,
+        ))
+    }
+
+    /// 单指 tap(默认 touch;`pointer=mouse` 走鼠标点击)
+    async fn tap(&self, body: &Value) -> Result<Value, String> {
+        let (t, tclamped) = timeout_arg(body)?;
+        let pointer = pointer_arg(body, control::drag::Pointer::Touch)?;
+        let target = tap_target(body)?;
+        let handle = self.handle.clone();
+        match pointer {
+            control::drag::Pointer::Touch => {
+                let done = tokio::task::block_in_place(|| {
+                    control::touch::tap_touch_with(&handle, target, t)
+                })?;
+                Ok(with_timeout(
+                    json!({
+                        "tapped": true,
+                        "pointer": "touch",
+                        "steps": done.steps,
+                        "elapsedMs": done.elapsed_ms
+                    }),
+                    t,
+                    tclamped,
+                ))
+            }
+            control::drag::Pointer::Mouse => {
+                match target {
+                    crate::control::touch::TouchTarget::Selector(sel) => {
+                        tokio::task::block_in_place(|| {
+                            control::mouse::click_with(&handle, &sel, t)
+                        })?;
+                    }
+                    crate::control::touch::TouchTarget::Point(x, y) => {
+                        #[cfg(windows)]
+                        tokio::task::block_in_place(|| {
+                            control::mouse::mouse_event_with(
+                                &handle, "mouseMoved", x, y, "none", 0, 0, t,
+                            )?;
+                            control::mouse::mouse_event_with(
+                                &handle, "mousePressed", x, y, "left", 1, 1, t,
+                            )?;
+                            control::mouse::mouse_event_with(
+                                &handle, "mouseReleased", x, y, "left", 0, 1, t,
+                            )
+                        })?;
+                        #[cfg(not(windows))]
+                        {
+                            let _ = (x, y);
+                            return Err("tap: mouse point requires Windows".into());
+                        }
+                    }
+                }
+                Ok(with_timeout(
+                    json!({ "tapped": true, "pointer": "mouse", "steps": 1, "elapsedMs": 0 }),
+                    t,
+                    tclamped,
+                ))
+            }
+        }
+    }
+
+    /// 单指 swipe
+    async fn swipe(&self, body: &Value) -> Result<Value, String> {
+        let (t, tclamped) = timeout_arg(body)?;
+        let from = point_arg(body, "from")?;
+        let to = point_arg(body, "to")?;
+        let steps = match body.get("steps") {
+            None | Some(Value::Null) => u64::from(control::touch::DEFAULT_TOUCH_STEPS),
+            Some(_) => num_u64(body, "steps")
+                .ok_or("swipe: steps must be a positive integer")?,
+        };
+        if steps == 0 || steps > u64::from(control::touch::MAX_TOUCH_STEPS) {
+            return Err(format!(
+                "swipe: steps must be 1..={}, got: {steps}",
+                control::touch::MAX_TOUCH_STEPS
+            ));
+        }
+        let duration = match body.get("duration") {
+            None | Some(Value::Null) => None,
+            Some(_) => Some(
+                num_u64(body, "duration")
+                    .ok_or("swipe: duration must be a non-negative integer (ms)")?,
+            ),
+        };
+        let handle = self.handle.clone();
+        let done = tokio::task::block_in_place(|| {
+            control::touch::swipe_with(&handle, from, to, steps as u32, duration, t)
+        })?;
+        Ok(with_timeout(
+            json!({
+                "swiped": true,
+                "steps": done.steps,
+                "elapsedMs": done.elapsed_ms
+            }),
+            t,
+            tclamped,
+        ))
     }
 
     async fn upload_file(&self, body: &Value) -> Result<Value, String> {
@@ -1947,7 +2200,12 @@ fn str(body: &Value, key: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{phase_arg, tab_id_for_index, validate_reveal};
+    use super::{
+        drag_actions_present, drag_side, has_drag_side_args, parse_actions_body,
+        parse_touch_actions, phase_arg, point_arg, pointer_arg, tab_id_for_index, tap_target,
+        validate_reveal,
+    };
+    use crate::control::drag::DragTarget;
     use serde_json::json;
 
     /// `--tab` 为 0 基索引:按当前标签顺序映射到内部 id,越界明确报错
@@ -1974,6 +2232,111 @@ mod tests {
         assert!(phase_arg(&json!({"phase": "bogus"})).is_err());
         assert!(phase_arg(&json!({"phase": "action:"})).is_err());
         assert!(phase_arg(&json!({"phase": 1})).is_err());
+    }
+
+    /// drag 单侧:选择器与坐标二选一,坐标必须能解析
+    #[test]
+    fn drag_side_enforces_selector_point_exclusivity() {
+        assert_eq!(
+            drag_side(&json!({"sourceSelector": "#a"}), "sourceSelector", "sourcePoint").unwrap(),
+            DragTarget::Selector("#a".into())
+        );
+        assert_eq!(
+            drag_side(&json!({"sourcePoint": "10,20"}), "sourceSelector", "sourcePoint").unwrap(),
+            DragTarget::Point(10.0, 20.0)
+        );
+        assert!(
+            drag_side(
+                &json!({"sourceSelector": "#a", "sourcePoint": "1,2"}),
+                "sourceSelector",
+                "sourcePoint"
+            )
+            .is_err()
+        );
+        assert!(drag_side(&json!({}), "targetSelector", "targetPoint").is_err());
+        assert!(
+            drag_side(&json!({"targetPoint": "x,y"}), "targetSelector", "targetPoint").is_err()
+        );
+    }
+
+    /// actions 接受字符串与数组;空/非法直接报错
+    #[test]
+    fn drag_actions_accept_json_string_or_array() {
+        let s = json!({"actions": r#"[{"press":{"to":"1,1"}},{"release":{}}]"#});
+        assert_eq!(parse_actions_body(&s).unwrap().len(), 2);
+        let a = json!({"actions": [{"press": {"to": "1,1"}}]});
+        assert_eq!(parse_actions_body(&a).unwrap().len(), 1);
+        assert!(parse_actions_body(&json!({"actions": ""})).is_err());
+        assert!(parse_actions_body(&json!({"actions": []})).is_err());
+        assert!(parse_actions_body(&json!({})).is_err());
+    }
+
+    /// actions 出现即视为已提供:非法类型必须报错,不能降级成非批次拖拽
+    #[test]
+    fn drag_actions_invalid_type_is_rejected_instead_of_falling_back() {
+        for bad in [json!(1), json!(null), json!({}), json!(true)] {
+            let body = json!({ "actions": bad, "sourceSelector": "#a", "targetSelector": "#b" });
+            assert!(drag_actions_present(&body));
+            assert!(parse_actions_body(&body).is_err());
+        }
+        assert!(!drag_actions_present(&json!({})));
+    }
+
+    /// actions 与任一 source/target 参数同时出现 → 冲突
+    #[test]
+    fn drag_actions_conflict_with_every_side_argument() {
+        let actions = json!({"actions": "[]"});
+        assert!(!has_drag_side_args(&actions));
+        for key in ["sourceSelector", "sourcePoint", "targetSelector", "targetPoint"] {
+            let mut body = actions.clone();
+            body[key] = json!("#x");
+            assert!(has_drag_side_args(&body), "{key} should conflict");
+        }
+        assert!(!has_drag_side_args(&json!({"sourceSelector": "  "})));
+    }
+
+    /// pointer 解析与 tap 目标互斥
+    #[test]
+    fn touch_pointer_and_tap_target_are_validated() {
+        use crate::control::drag::Pointer;
+        assert_eq!(pointer_arg(&json!({}), Pointer::Mouse).unwrap(), Pointer::Mouse);
+        assert_eq!(
+            pointer_arg(&json!({"pointer": "touch"}), Pointer::Mouse).unwrap(),
+            Pointer::Touch
+        );
+        assert_eq!(
+            pointer_arg(&json!({"pointer": ""}), Pointer::Touch).unwrap(),
+            Pointer::Touch
+        );
+        assert!(pointer_arg(&json!({"pointer": "pen"}), Pointer::Mouse).is_err());
+        assert!(pointer_arg(&json!({"pointer": 1}), Pointer::Mouse).is_err());
+
+        assert_eq!(
+            tap_target(&json!({"selector": "#a"})).unwrap(),
+            crate::control::touch::TouchTarget::Selector("#a".into())
+        );
+        assert_eq!(
+            tap_target(&json!({"x": 10, "y": 20})).unwrap(),
+            crate::control::touch::TouchTarget::Point(10.0, 20.0)
+        );
+        assert!(tap_target(&json!({"selector": "#a", "x": 1, "y": 2})).is_err());
+        assert!(tap_target(&json!({})).is_err());
+        assert!(tap_target(&json!({"x": 1})).is_err());
+    }
+
+    /// touch actions 字符串/数组均可;swipe 坐标字符串可解析
+    #[test]
+    fn touch_actions_and_swipe_points_are_validated() {
+        let body = json!({"actions": r#"[{"down":[{"x":1,"y":2}]},{"up":[]}]"#});
+        assert_eq!(parse_touch_actions(&body).unwrap().len(), 2);
+        let arr = json!({"actions": [{"down": [{"x": 1, "y": 2}]}, {"up": []}]});
+        assert_eq!(parse_touch_actions(&arr).unwrap().len(), 2);
+        assert!(parse_touch_actions(&json!({"actions": 1})).is_err());
+        assert!(parse_touch_actions(&json!({})).is_err());
+
+        assert_eq!(point_arg(&json!({"from": "1,2"}), "from").unwrap(), (1.0, 2.0));
+        assert!(point_arg(&json!({"from": "bad"}), "from").is_err());
+        assert!(point_arg(&json!({}), "from").is_err());
     }
 
     /// revealSecrets 必须配合 includeHeaders

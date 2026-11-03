@@ -150,6 +150,22 @@ pub fn setup_page(app: &AppHandle, webview: &tauri::webview::Webview, label: &st
     }
 }
 
+/// 订阅 `Input.dragIntercepted`(Windows):返回订阅 id 与接收端。
+///
+/// 拖拽会话在 `Input.setInterceptDrags(true)` **之前**调用,避免事件先于订阅到达。
+#[cfg(windows)]
+pub(crate) fn drag_intercepted_subscribe(
+    tab: u32,
+) -> (u64, std::sync::mpsc::Receiver<serde_json::Value>) {
+    windows_cdp::drag_subscribe(tab)
+}
+
+/// 取消 `Input.dragIntercepted` 订阅
+#[cfg(windows)]
+pub(crate) fn drag_intercepted_unsubscribe(id: u64) {
+    windows_cdp::drag_unsubscribe(id);
+}
+
 /// 释放某 webview label 的 CDP 订阅持有(关闭/销毁 webview 后调用)
 pub fn release_webview(label: &str) {
     #[cfg(windows)]
@@ -166,7 +182,8 @@ pub fn release_webview(label: &str) {
 #[cfg(windows)]
 mod windows_cdp {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, mpsc};
 
     use webview2_com::Microsoft::Web::WebView2::Win32::{
         ICoreWebView2, ICoreWebView2DevToolsProtocolEventReceivedEventArgs,
@@ -189,6 +206,7 @@ mod windows_cdp {
         NetResponse,
         NetFailed,
         NetFinished,
+        DragIntercepted,
     }
 
     /// 持有事件接收器,否则 WebView2 可能回收后不再投递事件。
@@ -202,6 +220,11 @@ mod windows_cdp {
     unsafe impl Send for Holder {}
 
     static HOLDERS: Mutex<Vec<Holder>> = Mutex::new(Vec::new());
+
+    /// `Input.dragIntercepted` 的当前会话订阅(tab id 用于避免跨标签串台)
+    static DRAG_SUBS: Mutex<Vec<(u64, u32, mpsc::Sender<serde_json::Value>)>> =
+        Mutex::new(Vec::new());
+    static NEXT_DRAG_SUB: AtomicU64 = AtomicU64::new(1);
 
     /// 每个页面 webview 的主帧 id(首次 `Page.frameNavigated` 记录,用于区分 iframe 导航)
     static MAIN_FRAME_IDS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
@@ -224,7 +247,7 @@ mod windows_cdp {
             ] {
                 enable_method(&wv, method);
             }
-            let subs: [(&str, Kind); 9] = [
+            let subs: [(&str, Kind); 10] = [
                 ("Runtime.consoleAPICalled", Kind::ConsoleApi),
                 ("Log.entryAdded", Kind::LogEntry),
                 ("Runtime.exceptionThrown", Kind::Exception),
@@ -234,6 +257,7 @@ mod windows_cdp {
                 ("Network.responseReceived", Kind::NetResponse),
                 ("Network.loadingFailed", Kind::NetFailed),
                 ("Network.loadingFinished", Kind::NetFinished),
+                ("Input.dragIntercepted", Kind::DragIntercepted),
             ];
             let mut receivers = Vec::new();
             for (event, kind) in subs {
@@ -279,12 +303,52 @@ mod windows_cdp {
         });
     }
 
+    /// 注册一个 `Input.dragIntercepted` 接收端(拖拽开始前调用)
+    pub(super) fn drag_subscribe(tab: u32) -> (u64, mpsc::Receiver<serde_json::Value>) {
+        let id = NEXT_DRAG_SUB.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel();
+        let mut subs = DRAG_SUBS.lock().unwrap_or_else(|e| e.into_inner());
+        subs.push((id, tab, tx));
+        (id, rx)
+    }
+
+    /// 取消拖拽事件订阅
+    pub(super) fn drag_unsubscribe(id: u64) {
+        let mut subs = DRAG_SUBS.lock().unwrap_or_else(|e| e.into_inner());
+        subs.retain(|(sid, _, _)| *sid != id);
+    }
+
+    /// 关闭标签时清掉该 tab 的拖拽订阅(避免 sender 残留)
+    fn drag_unsubscribe_tab(tab: u32) {
+        let mut subs = DRAG_SUBS.lock().unwrap_or_else(|e| e.into_inner());
+        subs.retain(|(_, sub_tab, _)| *sub_tab != tab);
+    }
+
+    /// 把 `Input.dragIntercepted.data` 投递给同 tab 的拖拽会话
+    fn dispatch_drag_intercepted(tab: u32, data: &serde_json::Value) {
+        let subs = DRAG_SUBS.lock().unwrap_or_else(|e| e.into_inner());
+        for (_, sub_tab, tx) in subs.iter() {
+            if *sub_tab == tab {
+                let _ = tx.send(data.clone());
+            }
+        }
+    }
+
     /// 释放某 label 的订阅(关闭 webview 后)
     pub(super) fn release(label: &str) {
         let mut holders = HOLDERS.lock().unwrap_or_else(|e| e.into_inner());
         holders.retain(|h| h.label != label);
         let mut mains = MAIN_FRAME_IDS.lock().unwrap_or_else(|e| e.into_inner());
         mains.retain(|(l, _)| l != label);
+        // page-<id> → tab id,清掉该 tab 的 dragIntercepted 订阅
+        if let Some(id) = label
+            .strip_prefix(crate::ui::PAGE_WEBVIEW)
+            .and_then(|r| r.strip_prefix('-'))
+            .and_then(|s| s.parse::<u32>().ok())
+        {
+            drag_unsubscribe_tab(id);
+        }
+        crate::control::touch::invalidate_emulation(label);
     }
 
     /// `Page.frameNavigated` 是否来自主帧
@@ -415,8 +479,15 @@ mod windows_cdp {
             }
             Kind::LoadEvent => {
                 streams::phase_load_finished(tab);
+                // 导航后触摸仿真可能失效,下次触摸重新启用
+                crate::control::touch::invalidate_emulation(label);
                 // 持久注入规则(1.12.0):只起后台线程,不在 UI 线程做 eval
                 crate::inject::on_page_load(app, label);
+            }
+            Kind::DragIntercepted => {
+                if let Some(data) = v.get("data") {
+                    dispatch_drag_intercepted(tab, data);
+                }
             }
             Kind::NetRequest => {
                 let Some(request_id) = v.get("requestId").and_then(|r| r.as_str()) else {
@@ -594,7 +665,10 @@ mod windows_cdp {
 
     #[cfg(test)]
     mod tests {
-        use super::is_main_frame;
+        use super::{
+            dispatch_drag_intercepted, drag_subscribe, drag_unsubscribe, drag_unsubscribe_tab,
+            is_main_frame,
+        };
         use serde_json::json;
 
         /// 只有主帧(无 parentId / frameId == 已记录主帧 id)才置 load;iframe 导航不算
@@ -619,6 +693,31 @@ mod windows_cdp {
             ));
             assert!(is_main_frame(label, &json!({"frame": {"id": "C"}})));
             super::release(label);
+        }
+
+        /// dragIntercepted 只投递给同 tab 的订阅;取消后不再投递
+        #[test]
+        fn drag_intercepted_is_delivered_per_tab() {
+            let (id, rx) = drag_subscribe(7);
+            dispatch_drag_intercepted(6, &json!({"items": []}));
+            assert!(rx.try_recv().is_err(), "other tab must not receive data");
+
+            let data = json!({"items": [{"mimeType": "text/plain"}]});
+            dispatch_drag_intercepted(7, &data);
+            assert_eq!(rx.try_recv().unwrap(), data);
+
+            drag_unsubscribe(id);
+            dispatch_drag_intercepted(7, &json!({"items": []}));
+            assert!(rx.try_recv().is_err(), "unsubscribed receiver must not receive");
+        }
+
+        /// 关闭 tab 时按 tab id 清理订阅
+        #[test]
+        fn tab_close_clears_drag_subscribers() {
+            let (_id, rx) = drag_subscribe(9);
+            drag_unsubscribe_tab(9);
+            dispatch_drag_intercepted(9, &json!({"items": []}));
+            assert!(rx.try_recv().is_err(), "closed tab receiver must not receive");
         }
     }
 }

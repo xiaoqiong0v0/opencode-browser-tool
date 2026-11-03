@@ -2044,8 +2044,30 @@ pub fn eval_page(app: &AppHandle, js: &str) -> Result<String, String> {
 
 /// 同 `eval_page`,但由调用方指定超时(ms)
 pub fn eval_page_timeout(app: &AppHandle, js: &str, timeout_ms: u64) -> Result<String, String> {
-    let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
     let page = active_page_webview(app).ok_or("page webview not ready")?;
+    eval_webview_timeout(&page, js, timeout_ms)
+}
+
+/// 定向到指定 page webview 的 eval(拖拽会话固定目标页,避免切 tab 后串页)
+pub(crate) fn eval_page_label_timeout(
+    app: &AppHandle,
+    label: &str,
+    js: &str,
+    timeout_ms: u64,
+) -> Result<String, String> {
+    let page = app
+        .get_webview(label)
+        .ok_or_else(|| format!("page webview not ready ({label})"))?;
+    eval_webview_timeout(&page, js, timeout_ms)
+}
+
+/// 在给定 webview 上执行 JS 并等待结果
+fn eval_webview_timeout(
+    page: &tauri::webview::Webview,
+    js: &str,
+    timeout_ms: u64,
+) -> Result<String, String> {
+    let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
     page.eval_with_callback(js, move |result| {
         let _ = tx.send(Ok(result));
     })

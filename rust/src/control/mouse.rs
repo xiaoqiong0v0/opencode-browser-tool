@@ -24,7 +24,7 @@ const HOVER_POLL_MS: u64 = 250;
 const HOVER_POLL_INTERVAL_MS: u64 = 40;
 
 /// 视口坐标点(CSS 像素)
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Point {
     /// 视口 X(CSS 像素)
     pub x: f64,
@@ -61,7 +61,46 @@ pub fn mouse_event_with(
     click_count: i64,
     timeout_ms: Option<u64>,
 ) -> ControlResult<()> {
-    let params = serde_json::json!({
+    let params = mouse_params(event_type, x, y, button, buttons, click_count);
+    super::cdp::call_json_opt(app, "Input.dispatchMouseEvent", &params, timeout_ms)?;
+    Ok(())
+}
+
+/// 同 `mouse_event_with`,但定向到指定 page webview(拖拽会话固定目标页)
+#[cfg(windows)]
+pub(crate) fn mouse_event_label_with(
+    app: &AppHandle,
+    label: &str,
+    event_type: &str,
+    x: f64,
+    y: f64,
+    button: &str,
+    buttons: i64,
+    click_count: i64,
+    timeout_ms: Option<u64>,
+) -> ControlResult<()> {
+    let params = mouse_params(event_type, x, y, button, buttons, click_count);
+    super::cdp::call_json_label_opt(
+        app,
+        label,
+        "Input.dispatchMouseEvent",
+        &params,
+        timeout_ms,
+    )?;
+    Ok(())
+}
+
+/// 鼠标事件 JSON 参数
+#[cfg(windows)]
+fn mouse_params(
+    event_type: &str,
+    x: f64,
+    y: f64,
+    button: &str,
+    buttons: i64,
+    click_count: i64,
+) -> String {
+    serde_json::json!({
         "type": event_type,
         "x": x,
         "y": y,
@@ -69,9 +108,63 @@ pub fn mouse_event_with(
         "buttons": buttons,
         "clickCount": click_count,
     })
-    .to_string();
+    .to_string()
+}
+
+/// 发送一次 CDP 滚轮事件(拖拽批次的 `scroll` 动作使用;调用时左键处于按下状态)
+///
+/// 参数:`x`/`y` 视口 CSS 像素;`delta_x`/`delta_y` 滚动量(正 Y = 向下);
+/// `timeout_ms` 为该步 CDP 等待预算。`buttons=1` 表示滚轮事件发生时左键仍按下。
+#[cfg(windows)]
+pub fn mouse_wheel_with(
+    app: &AppHandle,
+    x: f64,
+    y: f64,
+    delta_x: f64,
+    delta_y: f64,
+    timeout_ms: Option<u64>,
+) -> ControlResult<()> {
+    let params = wheel_params(x, y, delta_x, delta_y);
     super::cdp::call_json_opt(app, "Input.dispatchMouseEvent", &params, timeout_ms)?;
     Ok(())
+}
+
+/// 同 `mouse_wheel_with`,但定向到指定 page webview(拖拽会话固定目标页)
+#[cfg(windows)]
+pub(crate) fn mouse_wheel_label_with(
+    app: &AppHandle,
+    label: &str,
+    x: f64,
+    y: f64,
+    delta_x: f64,
+    delta_y: f64,
+    timeout_ms: Option<u64>,
+) -> ControlResult<()> {
+    let params = wheel_params(x, y, delta_x, delta_y);
+    super::cdp::call_json_label_opt(
+        app,
+        label,
+        "Input.dispatchMouseEvent",
+        &params,
+        timeout_ms,
+    )?;
+    Ok(())
+}
+
+/// 滚轮事件 JSON 参数(buttons=1:发生时左键仍按下)
+#[cfg(windows)]
+fn wheel_params(x: f64, y: f64, delta_x: f64, delta_y: f64) -> String {
+    serde_json::json!({
+        "type": "mouseWheel",
+        "x": x,
+        "y": y,
+        "deltaX": delta_x,
+        "deltaY": delta_y,
+        "button": "none",
+        "buttons": 1,
+        "clickCount": 0,
+    })
+    .to_string()
 }
 
 /// 点击元素中心:Windows 可信路径;否则降级到 `el.click()`(untrusted,返回标注)

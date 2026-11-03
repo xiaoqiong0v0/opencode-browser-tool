@@ -18,13 +18,13 @@
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
 use crate::ui;
 
 /// CDP 调用总超时(ms):覆盖 `CallDevToolsProtocolMethod` 发起到回调送达的全过程
 /// 默认 15s(1.9.0 批次4:不卡 UI 的前提下放宽默认,长任务请显式传 `--timeout`)
-const CDP_TIMEOUT_MS: u64 = 15_000;
+pub(crate) const CDP_TIMEOUT_MS: u64 = 15_000;
 /// 轮询间隔(ms):外层线程每隔多久检查一次结果/超时(短轮询保证即使踢消息失败也能按时返回)
 const CDP_POLL_MS: u64 = 15;
 
@@ -42,6 +42,31 @@ pub fn call_json_timeout(
     timeout_ms: u64,
 ) -> Result<String, String> {
     let page = ui::active_page_webview(app).ok_or("page webview not ready")?;
+    call_json_on_webview(&page, method_name, params_json, timeout_ms)
+}
+
+/// 定向到指定 page webview 的 CDP 调用(拖拽会话固定目标页,避免切 tab 后串页)
+pub(crate) fn call_json_label_opt(
+    app: &AppHandle,
+    label: &str,
+    method_name: &str,
+    params_json: &str,
+    timeout_ms: Option<u64>,
+) -> Result<String, String> {
+    let page = app
+        .get_webview(label)
+        .ok_or_else(|| format!("page webview not ready ({label})"))?;
+    let budget = timeout_ms.unwrap_or(CDP_TIMEOUT_MS);
+    call_json_on_webview(&page, method_name, params_json, budget)
+}
+
+/// 在给定 webview 上调用 CDP 并等待结果
+fn call_json_on_webview(
+    page: &tauri::webview::Webview,
+    method_name: &str,
+    params_json: &str,
+    timeout_ms: u64,
+) -> Result<String, String> {
     let (tx, rx) = mpsc::channel::<Result<String, String>>();
     let tx2 = tx.clone();
     let method_str = method_name.to_string();

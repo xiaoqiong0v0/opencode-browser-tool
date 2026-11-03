@@ -38,6 +38,8 @@ import {
   formatDownloads, buildDownloadsPayload, buildDownloadDirPayload, downloadsLimitIssue,
   type DownloadsLabels, type DownloadsSnapshot, type DownloadDeleteResult,
 } from "./util/downloads.js";
+import { dragArgIssue } from "./util/drag.js";
+import { parsePointer, parseTouchActions, swipeIssue, tapIssue } from "./util/touch.js";
 import { tool, type Plugin } from "@opencode-ai/plugin";
 import { log } from "./logger.js";
 import { createSessionIDCache, extractSessionIDFromEvent } from "./session-id.js";
@@ -544,7 +546,65 @@ const COMMANDS: Record<string, CmdDef> = {
   clear: { usage: "--selector [--timeout ms]", descKey: "cli.cmd.clear", args: [{ flag: "selector" }, { flag: "timeout" }], run: async (a) => { const tn = timeoutNote(a); const r = await service.clear(a); return _t("cli.out.clear") + degradedNote(r) + tn; } },
   select: { usage: "--selector --value [--timeout ms]", descKey: "cli.cmd.select", args: [{ flag: "selector" }, { flag: "value" }, { flag: "timeout" }], run: async (a) => { const tn = timeoutNote(a); const r = await service.select(a); return _t("cli.out.select") + degradedNote(r) + tn; } },
   hover: { usage: "--selector [--timeout ms]", descKey: "cli.cmd.hover", args: [{ flag: "selector" }, { flag: "timeout" }], run: async (a) => { const tn = timeoutNote(a); const r = await service.hover(a); return _t("cli.out.hover") + degradedNote(r) + tn; } },
-  drag: { usage: "--sourceSelector --targetSelector [--timeout ms]", descKey: "cli.cmd.drag", args: [{ flag: "sourceSelector" }, { flag: "targetSelector" }, { flag: "timeout" }], run: async (a) => { const tn = timeoutNote(a); await service.drag(a); return _t("cli.out.drag") + tn; } },
+  // drag:非批次用选择器或坐标(source/target 各二选一);或 --actions 单次调用内执行动作批次
+  drag: {
+    usage: "[--sourceSelector S | --sourcePoint \"x,y\"] [--targetSelector T | --targetPoint \"x,y\"] [--pointer mouse|touch] [--timeout ms] | [--actions '<json array>'] [--pointer mouse|touch] [--timeout ms]",
+    descKey: "cli.cmd.drag",
+    args: [
+      { flag: "sourceSelector" }, { flag: "sourcePoint" },
+      { flag: "targetSelector" }, { flag: "targetPoint" },
+      { flag: "actions" }, { flag: "pointer" }, { flag: "timeout" },
+    ],
+    run: async (a) => {
+      const tn = timeoutNote(a);
+      if (!parsePointer(a.pointer, "mouse").ok) return _t("cli.err.touch_pointer_invalid");
+      const issue = dragArgIssue(a);
+      if (issue) return _t(`cli.err.drag_${issue}`);
+      const r: any = await service.drag(a);
+      return _t("cli.out.drag", { steps: r?.steps ?? 0, ms: r?.elapsedMs ?? 0 }) + tn;
+    },
+  },
+  // touch:多点动作集(单次调用内顺序执行)
+  touch: {
+    usage: "--actions '<json array>' [--timeout ms]",
+    descKey: "cli.cmd.touch",
+    args: [{ flag: "actions" }, { flag: "timeout" }],
+    run: async (a) => {
+      const tn = timeoutNote(a);
+      const parsed = parseTouchActions(a.actions);
+      if (!parsed.ok) {
+        return _t(parsed.reason === "missing_up" ? "cli.err.touch_missing_up" : "cli.err.touch_actions_invalid");
+      }
+      const r: any = await service.touch(a);
+      return _t("cli.out.touch", { steps: r?.steps ?? 0, ms: r?.elapsedMs ?? 0 }) + tn;
+    },
+  },
+  // tap:单指点击(默认 touch;--pointer mouse 可走鼠标)
+  tap: {
+    usage: "[--selector S | --x X --y Y] [--pointer touch|mouse] [--timeout ms]",
+    descKey: "cli.cmd.tap",
+    args: [{ flag: "selector" }, { flag: "x" }, { flag: "y" }, { flag: "pointer" }, { flag: "timeout" }],
+    run: async (a) => {
+      const tn = timeoutNote(a);
+      const issue = tapIssue(a);
+      if (issue) return _t(`cli.err.tap_${issue}`);
+      const r: any = await service.tap(a);
+      return _t("cli.out.tap", { pointer: r?.pointer || "touch", steps: r?.steps ?? 0 }) + tn;
+    },
+  },
+  // swipe:单指滑动
+  swipe: {
+    usage: "--from \"x,y\" --to \"x,y\" [--steps N] [--duration ms] [--timeout ms]",
+    descKey: "cli.cmd.swipe",
+    args: [{ flag: "from" }, { flag: "to" }, { flag: "steps" }, { flag: "duration" }, { flag: "timeout" }],
+    run: async (a) => {
+      const tn = timeoutNote(a);
+      const issue = swipeIssue(a);
+      if (issue) return _t(`cli.err.swipe_${issue}`);
+      const r: any = await service.swipe(a);
+      return _t("cli.out.swipe", { steps: r?.steps ?? 0, ms: r?.elapsedMs ?? 0 }) + tn;
+    },
+  },
   press_key: { usage: "--key [--selector] [--timeout ms]", descKey: "cli.cmd.press_key", args: [{ flag: "key" }, { flag: "selector" }, { flag: "timeout" }], run: async (a) => { const tn = timeoutNote(a); await service.pressKey(a); return _t("cli.out.press_key", { key: a.key }) + tn; } },
   // type:向当前焦点插入文本(不清空);--text 支持 @file:<path>,--enter 插入后回车
   type: { usage: "--text <text|@file:path> [--selector] [--enter] [--timeout ms]", descKey: "cli.cmd.type", args: [{ flag: "text" }, { flag: "selector" }, { flag: "enter", type: "boolean" }, { flag: "timeout" }], run: async (a) => runType(a) },

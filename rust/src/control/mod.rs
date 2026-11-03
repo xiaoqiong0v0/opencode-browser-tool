@@ -20,7 +20,11 @@ pub mod keyboard;
 pub mod media;
 /// 可信鼠标注入(Windows:CDP Input.dispatchMouseEvent;点击/悬停/iframe 点击)
 pub mod mouse;
+/// 页面脚本/取值公共层(可视中心/滚动容器/视口/eval)
+pub mod page;
 pub mod screenshot;
+/// 触摸输入(Windows:CDP 触摸事件)
+pub mod touch;
 /// 文件上传(Windows:CDP DOM.setFileInputFiles)
 pub mod upload;
 
