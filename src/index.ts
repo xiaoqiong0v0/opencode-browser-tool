@@ -18,6 +18,7 @@ import {
 import { startNotifyServer } from "./notify-server.js";
 import { startDownload, getBinaryStatus, describeBinaryStatus } from "./binary.js";
 import { sanitizeForModel } from "./util/sanitize.js";
+import { usesOwnFileResolver } from "./util/file-resolver.js";
 import {
   EVAL_ITEM_MAX_BYTES, EVAL_TOTAL_MAX_BYTES, classifyEvalArgs, runEvalItems,
   type EvalFileRead, type EvalItem,
@@ -1027,9 +1028,10 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree, directory 
               for (const key of Object.keys(params)) {
                 const v = params[key];
                 if (typeof v === "string" && v.startsWith("@file:")) {
-                  // `type` 的 `--text` 自带 evaluate 同款解析（允许工作区目录 + 插件 tmp，且不删文件），
-                  // 故跳过这里的「仅插件 tmp」通用层，避免两套规则叠加（通用层还会删掉全局 tmp 文件）。
-                  if (cmdName === "type" && key === "text") continue;
+                  // `type --text` 与 `evaluate --script` 自带解析（工作区目录 + 插件 tmp，且不删文件），
+                  // 必须跳过这里的「仅插件 tmp」通用层：否则通用层会先把工作区内的文件拒掉
+                  // （1.14.0 及更早的缺陷：项目内脚本传 evaluate --script @file: 报 file_outside_tmp）。
+                  if (usesOwnFileResolver(cmdName, key)) continue;
                   const p = v.slice(6);
                   const abs = resolve(p);
                   if (!allowedTmpDirs.some((d) => isInsideDir(abs, d))) {

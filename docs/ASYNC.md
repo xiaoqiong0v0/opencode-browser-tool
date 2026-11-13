@@ -41,4 +41,4 @@
 - `startNotifyServer` 的幂等靠 `server && port` 置位，而置位发生在 `listen` 回调里：**settle 之前的并发调用会各建一个监听**（各自占一个随机端口）。现状调用点唯一（插件加载时 `setupAnnotateDelivery` 调一次），故未加 in-flight 去重；若将来出现多处调用，需按 binary 下载的做法共享同一个 Promise。
 - `acquireLock` 对「非 `EEXIST` 的建锁错误」直接返回 `true`（视为抢到，继续自己下载）：锁只是去重优化，不能因锁本身失败而让下载不可用；代价是这种场景下可能两个进程各下一次，最终仍由 `.part`→`rename` 保证文件合法。
 - `getActiveProfile()` 读取到非法值时回落到 `"default"`（启动路径不允许抛错），仅记录一次日志；写入口（`profile --set`）已做名字校验。
-- `@file:` 只允许全局 tmp 或当前会话 tmp 之内的文件；判定用 `path.relative` containment，不做符号链接解析（调用方只能传路径字符串）。
+- `@file:` 分两层：通用层只允许全局 tmp / 当前会话 tmp；`type --text` 与 `evaluate --script` 走命令自身解析（额外允许**工作区目录**，且不删文件）。判定统一用 `path.relative` containment，不做符号链接解析（调用方只能传路径字符串）。
