@@ -1,30 +1,42 @@
 /**
- * `@file:` 两层解析的分工判定（纯逻辑，便于单测）。
+ * `@file:` 通用层的解析模式判定（纯逻辑，便于单测）。
  *
- * 背景：`bt_cli` 的通用层只允许**插件 tmp**内的 `@file:`（读完还会删掉全局 tmp 文件），
- * 而部分命令自带更宽的解析规则（工作区目录 + 插件 tmp，且不删文件）：
- * - `type --text`（见 `resolveTypeText`）
- * - `evaluate --script`（见 `runEvalCommand`）
+ * 背景：`bt_cli` 的通用层对所有字符串参数先做一遍 `@file:` 处理。它原本只允许
+ * **插件 tmp**内的文件（读完还会删掉全局 tmp 里的文件），这对大多数命令是对的；
+ * 但有两类命令自带更宽的语义，需要区别对待：
  *
- * 若通用层先跑，工作区内的脚本会被直接拒掉（1.14.0 及更早的实际缺陷：项目内
- * `.tmp/xxx.js` 传 `evaluate --script @file:...` 报 file_outside_tmp）。
- * 故这些组合必须跳过通用层，交由命令自身判定。
+ * - `type --text`：命令自身解析（`resolveTypeText`），通用层必须整体跳过；
+ * - `evaluate --script`：脚本文件应当允许放在**工作区**（用户最常见用法），
+ *   但语义仍是"读出内容当脚本"，所以不能跳过，要按 workspace 模式读且**不删文件**。
+ *
+ * 1.14.0 及更早：`evaluate --script @file:<工作区>/x.js` 会被 tmp-only 规则直接拒掉
+ * （报 file_outside_tmp），工作区里的脚本永远跑不起来。
  */
 
-/** 自带文件解析的组合：命令名 → 需要放行的参数键。 */
-const OWN_RESOLVER_KEYS: Readonly<Record<string, readonly string[]>> = Object.freeze({
-  type: ["text"],
-  evaluate: ["script"],
+/** 通用层处理某个参数时的模式。 */
+export type FileResolutionMode =
+  /** 命令自己解析该参数，通用层不介入。 */
+  | "own"
+  /** 允许 工作区目录 + 插件 tmp，读内容但不删文件。 */
+  | "workspace"
+  /** 只允许插件 tmp（默认；读完会删掉全局 tmp 里的临时文件）。 */
+  | "tmp";
+
+/** 命令名 → 参数键 → 模式（未列出的一律 `tmp`）。 */
+const MODES: Readonly<Record<string, Readonly<Record<string, FileResolutionMode>>>> = Object.freeze({
+  type: { text: "own" },
+  evaluate: { script: "workspace" },
 });
 
 /**
- * 判断某个命令的某个参数是否走命令自身的 `@file:` 解析（应跳过仅插件 tmp 的通用层）。
+ * 判断通用层该如何处理某命令的某个 `@file:` 参数。
  *
  * @param cmd 命令名（如 `evaluate` / `type`）
  * @param key 参数键（如 `script` / `text`）
- * @returns 走自身解析返回 true；否则 false（由通用层处理）
+ * @returns 解析模式（`own` / `workspace` / `tmp`）
  */
-export function usesOwnFileResolver(cmd: string, key: string): boolean {
-  const keys = OWN_RESOLVER_KEYS[cmd];
-  return Array.isArray(keys) && keys.includes(key);
+export function fileResolutionMode(cmd: string, key: string): FileResolutionMode {
+  const perCmd = MODES[cmd];
+  const mode = perCmd ? perCmd[key] : undefined;
+  return mode ?? "tmp";
 }

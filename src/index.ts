@@ -18,7 +18,7 @@ import {
 import { startNotifyServer } from "./notify-server.js";
 import { startDownload, getBinaryStatus, describeBinaryStatus } from "./binary.js";
 import { sanitizeForModel } from "./util/sanitize.js";
-import { usesOwnFileResolver } from "./util/file-resolver.js";
+import { fileResolutionMode } from "./util/file-resolver.js";
 import {
   EVAL_ITEM_MAX_BYTES, EVAL_TOTAL_MAX_BYTES, classifyEvalArgs, runEvalItems,
   type EvalFileRead, type EvalItem,
@@ -1028,19 +1028,25 @@ export const opencodeBrowserTool: Plugin = async ({ client, worktree, directory 
               for (const key of Object.keys(params)) {
                 const v = params[key];
                 if (typeof v === "string" && v.startsWith("@file:")) {
-                  // `type --text` 与 `evaluate --script` 自带解析（工作区目录 + 插件 tmp，且不删文件），
-                  // 必须跳过这里的「仅插件 tmp」通用层：否则通用层会先把工作区内的文件拒掉
-                  // （1.14.0 及更早的缺陷：项目内脚本传 evaluate --script @file: 报 file_outside_tmp）。
-                  if (usesOwnFileResolver(cmdName, key)) continue;
+                  // 三类模式：own=命令自己解析（跳过本层）、workspace=允许工作区+插件 tmp、
+                  // tmp=只允许插件 tmp（默认，读完删全局 tmp 临时文件）。
+                  // 缺 workspace 会让 `evaluate --script @file:<工作区>/x.js` 永远被拒（1.14.0 缺陷）。
+                  const mode = fileResolutionMode(cmdName, key);
+                  if (mode === "own") continue;
+                  const workspaceDir = getAppDirectory();
+                  const allowedDirs =
+                    mode === "workspace" && workspaceDir ? [...allowedTmpDirs, workspaceDir] : allowedTmpDirs;
                   const p = v.slice(6);
-                  const abs = resolve(p);
-                  if (!allowedTmpDirs.some((d) => isInsideDir(abs, d))) {
-                    return _t("cli.err.file_outside_tmp", { path: p });
+                  const abs = workspaceDir && mode === "workspace" ? resolve(workspaceDir, p) : resolve(p);
+                  if (!allowedDirs.some((d) => isInsideDir(abs, d))) {
+                    return _t(mode === "workspace" ? "cli.err.eval_file_outside" : "cli.err.file_outside_tmp", {
+                      path: p,
+                    });
                   }
                   try {
                     params[key] = readFileSync(abs, "utf-8").replace(/\r?\n$/, "");
                     // 用完即删(仅限 lookup 生成的全局 tmp 临时密码文件;会话 tmp 内的截图等保留)
-                    if (isInsideDir(abs, globalTmpDir)) {
+                    if (mode !== "workspace" && isInsideDir(abs, globalTmpDir)) {
                       unlinkSync(abs);
                     }
                   } catch (e: any) {
