@@ -231,14 +231,35 @@ fn persist_auth_token(user_data_dir: Option<&str>, token: &str) {
 #[tauri::command]
 fn panel_records(state: State<ui::UiState>) -> Vec<AnnotationRecord> {
     // 面板列表只显示"未发送"记录(与参考实现一致:发送后列表清空;记录本身保留供工具读取)
-    state
-        .records
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|r| !r.sent)
-        .cloned()
-        .collect()
+    ui::unsent_records(&state.records.lock().unwrap())
+}
+
+/// 删除单条未发送记录(面板行内 `×`);删除后广播剩余未发送列表
+#[tauri::command]
+fn panel_delete_record(
+    app: tauri::AppHandle,
+    state: State<ui::UiState>,
+    index: u32,
+) -> Result<bool, String> {
+    // 锁作用域内完成删除,避免持锁发事件
+    let remaining = {
+        let mut records = state.records.lock().unwrap();
+        ui::remove_unsent_record(&mut records, index)?
+    };
+    ui::emit_records_changed(&app, remaining);
+    Ok(true)
+}
+
+/// 清空全部未发送记录(面板「清空」);返回删除条数
+#[tauri::command]
+fn panel_clear_records(app: tauri::AppHandle, state: State<ui::UiState>) -> usize {
+    let count = {
+        let mut records = state.records.lock().unwrap();
+        ui::clear_unsent_records(&mut records)
+    };
+    // 未发送记录已全部移除,广播空列表(已发送记录面板本就不显示)
+    ui::emit_records_changed(&app, Vec::new());
+    count
 }
 
 /// 更新批注说明(面板输入框 → Rust)
@@ -636,6 +657,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             panel_records,
             panel_set_note,
+            panel_delete_record,
+            panel_clear_records,
             panel_cmd,
             panel_mode,
             panel_service_port,

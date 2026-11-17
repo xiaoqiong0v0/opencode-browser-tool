@@ -140,6 +140,21 @@
       .rec-tag.annotate { background: #4a6d5a; }
       .rec-tag.screenshot { background: #3b5bdb; }
       .rec-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      /* 记录列表顶栏:清空按钮右对齐(小号,与下载行内动作按钮一致) */
+      .rec-bar { display: flex; justify-content: flex-end; flex-shrink: 0; }
+      .rec-clear { padding: 3px 10px; font-size: 11px; border-radius: 4px; color: #e74c3c; }
+      .rec-clear:disabled { opacity: 0.5; cursor: default; color: var(--muted); }
+      /* 二次确认态:加粗 + 底色反馈(颜色沿用 .rec-clear 现有红色与现有变量) */
+      .rec-clear.confirming {
+        font-weight: 600; border-color: currentColor; background: var(--panel-hover);
+      }
+      /* 行内删除:× 靠右,无边框;悬停变红(说明走 title / aria-label) */
+      .rec-del {
+        margin-left: auto; flex-shrink: 0; padding: 0 6px;
+        font-size: 16px; line-height: 1; color: var(--muted);
+        background: transparent; border: none; border-radius: 4px;
+      }
+      .rec-del:hover { color: #e74c3c; background: var(--panel-hover); }
       .rec-url { color: var(--muted); font-size: 11px; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .rec-note { color: var(--muted); font-size: 12px; margin-top: 2px; }
       .rec-thumb { max-width: 100%; border-radius: 4px; margin-top: 4px; border: 1px solid var(--rec-border); }
@@ -258,6 +273,9 @@
       </div>
       <!-- 记录视图:批注/截图记录列表 + 发送(默认视图,行为与之前一致) -->
       <div id="view-records-pane" class="view-pane" role="tabpanel">
+        <div class="rec-bar">
+          <button id="btn-clear-records" type="button" class="rec-clear" title="清空全部未发送记录" aria-label="清空全部未发送记录">清空</button>
+        </div>
         <div id="records"></div>
         <button id="btn-send"><i data-lucide="send"></i>发送</button>
       </div>

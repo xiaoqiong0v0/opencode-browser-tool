@@ -1441,6 +1441,16 @@ pub fn toolbar_webview(app: &AppHandle) -> Option<tauri::webview::Webview> {
     app.get_webview(TOOLBAR_WEBVIEW)
 }
 
+/// 广播面板记录列表变化(面板 webview 未创建时静默跳过)
+///
+/// 参数:`app` 应用句柄;`records` 面板应显示的完整列表(通常为未发送记录)
+pub fn emit_records_changed(app: &AppHandle, records: Vec<AnnotationRecord>) {
+    use tauri::Emitter;
+    if let Some(panel) = panel_webview(app) {
+        let _ = panel.emit("records-changed", records);
+    }
+}
+
 /// 同步激活标签的 URL/标题(页面导航后调用,保持工具栏显示一致);
 /// 走 apply_page_state 同一守卫:错误页/内部 scheme 不覆盖地址栏
 pub fn sync_active_tab(app: &AppHandle, url: &str, title: &str) {
@@ -1735,10 +1745,7 @@ pub fn send_all_records(app: &AppHandle) -> usize {
         append_sent_records(&mut queue, items);
     }
     // 面板刷新为空列表(记录仍在 Rust 侧保留,仅标记已发送)
-    use tauri::Emitter;
-    if let Some(panel) = panel_webview(app) {
-        let _ = panel.emit("records-changed", Vec::<AnnotationRecord>::new());
-    }
+    emit_records_changed(app, Vec::new());
     // 清空覆盖层批注/截图标记
     let _ = eval_overlay(
         app,
@@ -1749,6 +1756,40 @@ pub fn send_all_records(app: &AppHandle) -> usize {
         notify_plugin(app, count);
     }
     count
+}
+
+/// 面板列表口径:只保留未发送记录(面板拉取与删除后广播共用)
+pub fn unsent_records(records: &[AnnotationRecord]) -> Vec<AnnotationRecord> {
+    records.iter().filter(|r| !r.sent).cloned().collect()
+}
+
+/// 删除单条未发送记录(就地移除)
+///
+/// 找不到该 `index` → `Err("record #N not found")`;记录存在但已发送 →
+/// `Err("record #N already sent")`(面板本就不显示已发送记录);成功返回删除后的
+/// 未发送列表,便于调用方直接广播。
+pub fn remove_unsent_record(
+    records: &mut Vec<AnnotationRecord>,
+    index: u32,
+) -> Result<Vec<AnnotationRecord>, String> {
+    let found = records.iter().position(|r| r.index == index && !r.sent);
+    let pos = match found {
+        Some(pos) => pos,
+        // 存在但已发送:与「不存在」区分开,便于调用方/用户判断
+        None if records.iter().any(|r| r.index == index) => {
+            return Err(format!("record #{index} already sent"))
+        }
+        None => return Err(format!("record #{index} not found")),
+    };
+    records.remove(pos);
+    Ok(unsent_records(records))
+}
+
+/// 移除全部未发送记录(已发送记录保留,供工具侧继续读取);返回删除条数
+pub fn clear_unsent_records(records: &mut Vec<AnnotationRecord>) -> usize {
+    let before = records.len();
+    records.retain(|r| r.sent);
+    before - records.len()
 }
 
 /// 获取当前激活标签的页面地址(记录归属地址)
@@ -2086,7 +2127,61 @@ pub fn eval_overlay(app: &AppHandle, js: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SENT_QUEUE_MAX, append_sent_records, is_pool_label};
+    use super::{
+        AnnotationRecord, RECORD_ANNOTATE, SENT_QUEUE_MAX, append_sent_records,
+        clear_unsent_records, is_pool_label, remove_unsent_record, unsent_records,
+    };
+
+    /// 造一条记录(只关心 index / sent,其余字段取最小合法值)
+    fn record(index: u32, sent: bool) -> AnnotationRecord {
+        AnnotationRecord {
+            index,
+            typ: RECORD_ANNOTATE.into(),
+            url: "https://example.test/a".into(),
+            selector: "#a".into(),
+            rect: (1, 2, 3, 4),
+            note: String::new(),
+            image: None,
+            sent,
+        }
+    }
+
+    /// 记录列表的 index 序列(断言顺序与内容)
+    fn record_ids(records: &[AnnotationRecord]) -> Vec<u32> {
+        records.iter().map(|r| r.index).collect()
+    }
+
+    /// 删除指定 index:只移除该条未发送记录,其余(含已发送)保留
+    #[test]
+    fn delete_unsent_record_only_affects_target() {
+        let mut records = vec![record(1, false), record(2, false), record(3, true)];
+        let remaining = remove_unsent_record(&mut records, 2).unwrap();
+        assert_eq!(record_ids(&remaining), vec![1]);
+        // 内存中只剩 #1(未发送)+ #3(已发送)
+        assert_eq!(record_ids(&records), vec![1, 3]);
+    }
+
+    /// 已发送 / 不存在的记录不可删:返回错误且列表不变
+    #[test]
+    fn delete_sent_or_missing_record_is_rejected() {
+        let mut records = vec![record(1, true), record(2, false)];
+        let err = remove_unsent_record(&mut records, 1).unwrap_err();
+        assert_eq!(err, "record #1 already sent");
+        let err = remove_unsent_record(&mut records, 99).unwrap_err();
+        assert_eq!(err, "record #99 not found");
+        assert_eq!(record_ids(&records), vec![1, 2]);
+    }
+
+    /// 清空:只移除未发送记录,返回删除条数;已发送记录保留
+    #[test]
+    fn clear_removes_only_unsent_records() {
+        let mut records = vec![record(1, false), record(2, true), record(3, false)];
+        assert_eq!(clear_unsent_records(&mut records), 2);
+        assert_eq!(record_ids(&records), vec![2]);
+        assert!(unsent_records(&records).is_empty());
+        // 再清一次:已无可删,返回 0
+        assert_eq!(clear_unsent_records(&mut records), 0);
+    }
 
     /// 造一条最小待发送记录(只需 index 用于去重断言)
     fn rec(index: u64) -> serde_json::Value {

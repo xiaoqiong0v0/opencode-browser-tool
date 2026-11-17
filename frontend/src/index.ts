@@ -57,6 +57,9 @@ const VIEW_REQUEST_GRACE_MS = 1000;
 /** toast 停留时长(ms) */
 const TOAST_MS = 3000;
 
+/** 「清空」按钮二次确认的有效窗口(ms):超时自动复位 */
+const CLEAR_CONFIRM_MS = 3000;
+
 /** toast 元素上的内部状态(计时器) */
 type ToastElement = HTMLDivElement & { _t?: number };
 
@@ -87,6 +90,7 @@ interface PanelDoms {
   dlCount: HTMLSpanElement;
   btnViewRecords: HTMLButtonElement;
   btnViewDownloads: HTMLButtonElement;
+  btnClearRecords: HTMLButtonElement;
   recordsPane: HTMLDivElement;
   downloadsPane: HTMLDivElement;
 }
@@ -111,6 +115,10 @@ class Panel {
   private activeView: ViewName = "records";
   /** 当前顶部 tab(AI 功能区 / 配置区):非 AI 页时下载视图也不可见 */
   private activeTab: TabName = "ai";
+  /** 「清空」按钮二次确认的复位计时器(0 表示当前不在确认态) */
+  private clearConfirmTimer = 0;
+  /** 「清空」按钮进入确认态的时间戳(用于判定确认窗口是否过期) */
+  private clearConfirmAt = 0;
 
   /** 当前生效的下载目录(来自 `/api/download-dir`;用作「打开文件夹」的兜底) */
   private downloadDir = "";
@@ -132,6 +140,7 @@ class Panel {
       dlCount: document.getElementById("dl-count") as HTMLSpanElement,
       btnViewRecords: document.getElementById("btn-view-records") as HTMLButtonElement,
       btnViewDownloads: document.getElementById("btn-view-downloads") as HTMLButtonElement,
+      btnClearRecords: document.getElementById("btn-clear-records") as HTMLButtonElement,
       recordsPane: document.getElementById("view-records-pane") as HTMLDivElement,
       downloadsPane: document.getElementById("view-downloads-pane") as HTMLDivElement,
     };
@@ -156,6 +165,8 @@ class Panel {
     // 每次打开面板默认回到 AI 功能页 + 记录视图(tabs-changed 广播面板开关状态)
     void listen<{ panel_open: boolean }>("tabs-changed", (e) => {
       this.panelOpen = !!e.payload?.panel_open;
+      // 面板收起时离开「清空」二次确认态(避免收起期间计时残留)
+      if (!this.panelOpen) this.resetClearConfirm();
       if (this.panelOpen) {
         // 「切到下载视图」请求刚到达时保持下载视图(开面板事件与请求事件到达顺序不确定)
         const keepDownloads = Date.now() - this.downloadsViewRequestAt < VIEW_REQUEST_GRACE_MS;
@@ -185,6 +196,24 @@ class Panel {
           this.notify("无记录可发送", "bad");
         }
       });
+    });
+    // 记录列表顶部「清空」:面板内二次确认后删除全部未发送记录(发送仍是整批,语义不变)
+    // shell 面板里 native dialog 不显示,不能用 window.confirm:首次点击只进入确认态,
+    // CLEAR_CONFIRM_MS 内再次点击才真正执行
+    this.doms.btnClearRecords.addEventListener("click", () => {
+      if (!this.isClearConfirming()) {
+        this.armClearConfirm();
+        return;
+      }
+      this.resetClearConfirm();
+      void invoke<number>("panel_clear_records").then(
+        (removed) =>
+          this.notify(
+            removed > 0 ? `已清空 ${removed} 条记录` : "无记录可清空",
+            removed > 0 ? "ok" : "bad",
+          ),
+        (e) => this.notify(String(e), "err"),
+      );
     });
     // 设备切换(选择后应用预设,并关闭面板显示效果)
     // 注意:成功/失败都**不重建选项、不重置 value** —— 下拉保持显示当前所选项(含「默认」)
@@ -226,9 +255,12 @@ class Panel {
     this.doms.btnDownloadDirSave.addEventListener("click", () => void this.saveDownloadDir());
     this.doms.btnDownloadDirReset.addEventListener("click", () => void this.resetDownloadDir());
     this.doms.btnDownloadDirOpen.addEventListener("click", () => this.openDownloadDir());
-    // Rust 推送记录变更
+    // Rust 推送记录变更(列表变化时复位「清空」的二次确认态)
     void listen<AnnotationRecord[]>("records-changed", (e) => {
-      this.records = e.payload || [];
+      const next = e.payload || [];
+      const changed = this.recordsSignature(next) !== this.recordsSignature(this.records);
+      this.records = next;
+      if (changed) this.resetClearConfirm();
       this.render();
     });
     // Rust 推送模式状态(批注/截图按钮已移至工具栏,面板无需同步)
@@ -276,6 +308,8 @@ class Panel {
       this.dlSignature = "";
       void this.pollDownloads();
     }
+    // 切到配置页时离开「清空」二次确认态
+    if (which !== "ai") this.resetClearConfirm();
     // 切到配置页时拉一次最新下载目录(输入框始终预填当前生效值)
     if (which === "config") void this.loadDownloadDir();
   }
@@ -299,6 +333,8 @@ class Panel {
     if (which === "downloads") {
       this.dlSignature = "";
       void this.pollDownloads();
+      // 离开记录视图时离开「清空」二次确认态
+      this.resetClearConfirm();
     }
   }
 
@@ -369,11 +405,49 @@ class Panel {
     }, TOAST_MS);
   }
 
-  /** 渲染记录列表(区分批注/截图,截图带缩略图;点击弹出详情) */
+  /** 记录列表签名(用于判断 records-changed 是否真的改变了列表内容) */
+  private recordsSignature(list: AnnotationRecord[]): string {
+    return list
+      .map((r) => `${r.index}:${r.type}:${r.selector}:${r.note.length}:${(r.image || "").length}`)
+      .join("|");
+  }
+
+  /** 「清空」是否处于二次确认窗口内(过期则顺手复位) */
+  private isClearConfirming(): boolean {
+    if (!this.clearConfirmAt) return false;
+    if (Date.now() - this.clearConfirmAt >= CLEAR_CONFIRM_MS) {
+      this.resetClearConfirm();
+      return false;
+    }
+    return true;
+  }
+
+  /** 让「清空」按钮进入二次确认态:文案变「确认清空？」并加 .confirming,超时自动复位 */
+  private armClearConfirm(): void {
+    this.clearConfirmAt = Date.now();
+    this.doms.btnClearRecords.textContent = "确认清空？";
+    this.doms.btnClearRecords.classList.add("confirming");
+    window.clearTimeout(this.clearConfirmTimer);
+    this.clearConfirmTimer = window.setTimeout(() => this.resetClearConfirm(), CLEAR_CONFIRM_MS);
+  }
+
+  /** 复位「清空」按钮为初始文案与样式(幂等) */
+  private resetClearConfirm(): void {
+    if (this.clearConfirmTimer) window.clearTimeout(this.clearConfirmTimer);
+    this.clearConfirmTimer = 0;
+    this.clearConfirmAt = 0;
+    this.doms.btnClearRecords.textContent = "清空";
+    this.doms.btnClearRecords.classList.remove("confirming");
+  }
+
+  /** 渲染记录列表(区分批注/截图,截图带缩略图;行内 × 删除该条未发送记录) */
   private render(): void {
     const el = this.doms.records;
     el.innerHTML = "";
+    // 「清空」仅在有条目时可点(与列表状态保持一致);空列表同时复位二次确认态
+    this.doms.btnClearRecords.disabled = this.records.length === 0;
     if (this.records.length === 0) {
+      this.resetClearConfirm();
       const empty = document.createElement("div");
       empty.className = "empty";
       empty.textContent = "（无记录）";
@@ -393,6 +467,7 @@ class Panel {
       title.textContent = r.type === "screenshot" ? `#${r.index} 区域截图` : `#${r.index} ${r.selector}`;
       head.appendChild(tag);
       head.appendChild(title);
+      head.appendChild(this.renderRecordDeleteButton(r.index));
       item.appendChild(head);
       if (r.url) {
         const urlEl = document.createElement("div");
@@ -415,6 +490,30 @@ class Panel {
       }
       el.appendChild(item);
     }
+  }
+
+  /**
+   * 行内「×」删除按钮(靠右;`title`/`aria-label` 说明用途)
+   *
+   * 只删未发送记录,不弹确认(删错可重新标注);
+   * 成功由 Rust 广播 `records-changed` 刷新列表,失败 toast 原样显示错误。
+   *
+   * @param index 记录索引
+   * @returns 已绑定点击行为的按钮
+   */
+  private renderRecordDeleteButton(index: number): HTMLButtonElement {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "rec-del";
+    btn.textContent = "×";
+    btn.title = "删除该记录";
+    btn.setAttribute("aria-label", "删除该记录");
+    btn.addEventListener("click", () => {
+      void invoke<boolean>("panel_delete_record", { index }).catch((e) => {
+        this.notify(String(e), "err");
+      });
+    });
+    return btn;
   }
 
   /** 拉取下载列表(仅 AI 页的「下载」视图可见时轮询;切到下载视图/重新可见时立即拉一次) */

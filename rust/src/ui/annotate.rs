@@ -449,7 +449,7 @@ impl Annotator {
             eprintln!("[annotate] records overflow: dropped {dropped} oldest (cap {MAX_RECORDS})");
         }
         // 面板列表只推送"未发送"记录(发送后的记录仅保留在 records 里供工具读取)
-        let list: Vec<AnnotationRecord> = records.iter().filter(|r| !r.sent).cloned().collect();
+        let list = ui::unsent_records(&records);
         drop(records);
         if let Some(panel) = ui::panel_webview(app) {
             let _ = panel.emit("records-changed", list);
